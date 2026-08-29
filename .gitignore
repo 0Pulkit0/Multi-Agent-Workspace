@@ -1,0 +1,22 @@
+# Environment. 308 MB of third-party code; `requirements.txt` is the protocol.
+venv/
+
+# Byte-compiled output.
+__pycache__/
+*.pyc
+
+# Editor and OS droppings. The two stale vim swap files in this tree are the
+# user's; ignored, not deleted.
+.DS_Store
+*.swp
+
+# Machine-local permission settings, not project protocol.
+.claude/settings.local.json
+
+# Run output, not protocol. `runs/` is captured child stdout and `eval/results/`
+# is measurement data. Both are *outputs of* the thing this repository freezes,
+# and committing them alongside the protocol destroys the one property the
+# pre-registration exists to have: that the protocol provably predates the data.
+# Data gets committed deliberately and separately, once it exists.
+runs/
+eval/results/
