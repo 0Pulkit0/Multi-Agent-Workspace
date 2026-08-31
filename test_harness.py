@@ -3,6 +3,8 @@
     python3 test_harness.py
 """
 
+import json
+import os
 import sys
 
 import harness
@@ -534,17 +536,21 @@ def test_the_source_prologue_neutralises_annotations():
     check("the recorded source carries no prologue",
           harness._SOURCE_PROLOGUE not in result.source, repr(result.source[:80]))
 
-    # A future statement may be preceded by the module docstring, so line 1 is
-    # legal here too; the documented side effect is that the string stops being
-    # the docstring. Asserted rather than claimed.
+    # A future statement may be preceded by the module docstring, so the
+    # prologue goes *after* the docstring and the string stays the docstring.
+    # Sprint 10 put it at line 1 and this check asserted the resulting
+    # `__doc__ is None`; that was the defect being described as behaviour, so
+    # the assertion is inverted rather than kept. See
+    # `test_the_prologue_never_makes_a_legal_file_illegal` for the four
+    # arrangements that made line 1 untenable.
     doc = ('"""Median of a list."""\n\n'
            "def median(values: list) -> float | None:\n" + median_body +
            "\nprint('doc is %r' % (__doc__,))\n")
     result = harness.run_python_sandboxed(doc)
     check("a solution opening with a module docstring still runs",
           result.ok, (result.exit_code, result.stderr[-400:]))
-    check("PEP 563 is in force and the docstring is no longer __doc__",
-          "doc is None" in result.stdout, result.stdout[:200])
+    check("PEP 563 is in force and the docstring is still __doc__",
+          "doc is 'Median of a list.'" in result.stdout, result.stdout[:200])
 
     already = ("from __future__ import annotations\n\n"
                "def median(values: list) -> float | int:\n" + median_body)
@@ -575,6 +581,293 @@ def test_the_source_prologue_neutralises_annotations():
     result = harness.run_python_sandboxed(wrong, tests=SUITE)
     check("the suite gets no prologue and its line numbers are unshifted",
           result.failed_assertion_line == 3, result.failed_assertion_line)
+
+
+# The four arrangements the brief tabulates. Rows 1-2 were legal under Sprint
+# 10's line-1 prepend and must not regress; rows 3-4 were SyntaxErrors the
+# prologue itself created, and row 4 is why a fix that greps for the word
+# `annotations` is not enough -- *any* future statement is refused once the
+# docstring stops being the docstring.
+_FUTURE_SHAPES = (
+    ("a comment then the model's own future statement",
+     "# merge helper\nfrom __future__ import annotations\n"),
+    ("the model's own future statement as its first statement",
+     "from __future__ import annotations\n"),
+    ("a module docstring then the model's own future statement",
+     '"""Merge spans."""\n\nfrom __future__ import annotations\n'),
+    ("a module docstring then a different future statement",
+     '"""Merge spans."""\n\nfrom __future__ import division\n'),
+)
+
+# A PEP 604 union in the signature, so every row also proves PEP 563 is still in
+# force wherever the prologue ended up, and a report of what the module sees.
+_UNION_BODY = ("\n\ndef widen(x: int | None) -> int | None:\n"
+               "    return x\n\n"
+               "print('doc=%r out=%r' % (__doc__, widen(3)))\n")
+
+
+def test_the_prologue_never_makes_a_legal_file_illegal():
+    """The prologue may not be the reason a file does not compile.
+
+    Sprint 10 wrote it at line 1, which is legal on its own and stops being
+    legal in company: line 1 demotes a leading docstring to an ordinary
+    expression statement, and an ordinary expression statement may not precede a
+    future statement. One of the replay's 57 draws died of exactly that, having
+    written a shebang, a docstring and `from __future__ import annotations`
+    itself -- legal at line 6 of its own file, illegal at line 7 of ours.
+
+    The same demotion also emptied `solution.__doc__` for every solution that
+    opens with a docstring, which no check covered. Both are fixed by the one
+    change -- inserting after the docstring instead of above it -- so both are
+    checked here.
+    """
+    for label, head in _FUTURE_SHAPES:
+        result = harness.run_python_sandboxed(head + _UNION_BODY)
+        check("%s stays legal" % label, result.ok,
+              (result.exit_code, result.stderr[-300:]))
+        check("%s: the union annotation still cannot raise" % label,
+              "out=3" in result.stdout, result.stdout[:200])
+
+    # The second defect, on its own: no future statement anywhere, nothing that
+    # ever raised, and `__doc__` silently gone on every such solution.
+    plain = '"""Merge spans."""' + _UNION_BODY
+    result = harness.run_python_sandboxed(plain)
+    check("a docstring is still the module docstring after the prologue",
+          "doc='Merge spans.'" in result.stdout, result.stdout[:200])
+    check("and the prologue went after it, not above it",
+          harness.executed_source(plain).startswith('"""Merge spans."""\n'
+                                                    + harness._SOURCE_PROLOGUE),
+          repr(harness.executed_source(plain)[:70]))
+
+    # Deliberate non-change: with nothing to displace, line 1 is still line 1.
+    bare = "def widen(x: int | None):\n    return x\n"
+    check("a source with no prelude still gets the prologue at line 1",
+          harness.executed_source(bare) == harness._SOURCE_PROLOGUE + bare,
+          repr(harness.executed_source(bare)[:60]))
+
+    # Line 1 could not promise this: an encoding declaration is only honoured on
+    # the first two lines, and prepending pushed a two-line preamble off the end
+    # of that window.
+    coded = "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n" + bare
+    executed = harness.executed_source(coded)
+    check("an encoding declaration keeps its line, and the comments above it "
+          "are unshifted",
+          executed.splitlines()[:2] == coded.splitlines()[:2]
+          and executed.splitlines()[2] == harness._SOURCE_PROLOGUE.rstrip("\n"),
+          repr(executed[:90]))
+
+    # The scanner's own bail-out. A leading string it cannot find the end of is
+    # the one shape where falling back to line 1 could recreate the SyntaxError,
+    # so nothing is inserted -- that costs PEP 563 for one draw and cannot cost
+    # a compile error we caused.
+    unresolved = '"""unterminated\nfrom __future__ import division\n'
+    offset, ambiguous = harness._prelude_end(unresolved)
+    check("an unresolvable leading string is reported as ambiguous, not guessed",
+          ambiguous and offset == 0, (offset, ambiguous))
+    check("and a future statement behind it means no prologue is written at all",
+          harness.executed_source(unresolved) == unresolved,
+          repr(harness.executed_source(unresolved)[:60]))
+    check("ambiguity alone does not suppress the prologue when there is no "
+          "future statement to break",
+          harness.executed_source('"""unterminated\nx = 1\n')
+          == harness._SOURCE_PROLOGUE + '"""unterminated\nx = 1\n', "")
+
+    # The position is variable now, so `_SOURCE_PROLOGUE + source` is no longer
+    # the executed text and the comment at the constant no longer claims it is.
+    # What replaces the claim is this: the executed text is `executed_source`
+    # of the recorded bytes, and deleting the one inserted line gives those
+    # bytes back exactly. Checked over every shape above, not just one.
+    shapes = [head + _UNION_BODY for _label, head in _FUTURE_SHAPES]
+    shapes += [plain, bare, coded, unresolved]
+    rebuilt = []
+    for source in shapes:
+        executed = harness.executed_source(source)
+        if executed == source:
+            rebuilt.append(True)
+            continue
+        cut = executed.index(harness._SOURCE_PROLOGUE)
+        rebuilt.append(
+            executed[:cut] + executed[cut + len(harness._SOURCE_PROLOGUE):]
+            == source)
+    check("deleting the inserted line from the executed text gives the model's "
+          "bytes back, for every shape above",
+          all(rebuilt), rebuilt)
+    grew = [len(harness.executed_source(s)) - len(s) for s in shapes]
+    check("the file grows by exactly one prologue, never two -- three of these "
+          "shapes contain the identical line already",
+          grew == [len(harness._SOURCE_PROLOGUE)] * (len(shapes) - 1) + [0],
+          grew)
+    result = harness.run_python_sandboxed(shapes[2])
+    check("ExecResult.source is still the model's bytes when the prologue moved",
+          result.source == shapes[2], repr(result.source[:60]))
+    check("so the executed file is reconstructable from the record alone",
+          harness.executed_source(result.source)
+          == harness.executed_source(shapes[2]), "")
+
+    # The check that would have caught this: the bytes that actually died, from
+    # the replay's own ledger, rather than a fixture written to resemble them.
+    live = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval",
+                        "results", "pin-replay-1", "ledger.jsonl")
+    if not os.path.exists(live):
+        check("the replay ledger is not on this checkout, so the shapes above "
+              "are the whole check", True)
+        return
+    died = None
+    with open(live, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if (record.get("kind") == "draw"
+                    and record.get("grade_failure") == "import"
+                    and record.get("failed_code")):
+                died = record
+    check("the replay's one remaining import death is on record with the code "
+          "that caused it",
+          died is not None and "from __future__ imports must occur"
+          in died.get("failed_stderr", ""),
+          None if died is None else died.get("failed_stderr", "")[-90:])
+    result = harness.run_python_sandboxed(died["failed_code"])
+    check("and those exact bytes import cleanly under the fixed prologue "
+          "(%s/%s)" % (died["task_id"], died["candidate"].split("/")[-1]),
+          result.ok, (result.exit_code, result.stderr[-300:]))
+
+
+# Four more arrangements, every one of them legal Python, none of them
+# resolvable by a line scan. Sprint 11's scan cut at the first closing quote and
+# called what followed safe, which is the end of the docstring only when the
+# docstring is one literal on one line. An implicit concatenation continues past
+# it -- by backslash, or inside parentheses the scan never even matched -- so the
+# verdict was "nothing to displace", the fallback was offset 0, and offset 0 is
+# the line-1 prepend the sprint was supposed to have retired. Each row carries
+# the model's own future statement, because that is what turns a demoted
+# docstring into a SyntaxError instead of a merely empty `__doc__`.
+_AMBIGUOUS_SHAPES = (
+    ("a backslash-continued concatenated docstring",
+     '"""Merge spans."""  \\\n"""Second half."""\n'
+     "from __future__ import annotations\n"),
+    ("a parenthesised concatenated docstring",
+     '("""Merge spans."""\n """Second half.""")\n'
+     "from __future__ import division\n"),
+    ("a single-quoted concatenated docstring",
+     "'Merge spans.' \\\n'Second half.'\n"
+     "from __future__ import annotations\n"),
+    ("a parenthesised docstring on one line",
+     '("""Merge spans.""")\nfrom __future__ import division\n'),
+)
+
+# No PEP 604 union in this one: these four get no prologue at all, on purpose, so
+# a union would raise on 3.9 and the check would be measuring the wrong thing.
+# `__doc__` is printed because nothing was inserted -- the docstring the scan
+# could not parse is still the docstring.
+_PLAIN_BODY = ("\n\ndef widen(x):\n    return x\n\n"
+               "print('doc=%r out=%r' % (__doc__, widen(3)))\n")
+
+
+def test_the_prologue_survives_a_docstring_the_scan_cannot_parse():
+    """An unresolvable leading string may cost PEP 563. It may not cost a compile.
+
+    Sprint 11 moved the prologue below the docstring and closed the shape it was
+    measured against: one literal, one line. Three shapes it did not close are
+    legal before the prologue and a SyntaxError after it, which is the same
+    defect at a different offset -- the scan reported `ambiguous=False` for all
+    of them, so the bail-out that exists for exactly this could never fire.
+    """
+    doc_seen = []
+    for label, head in _AMBIGUOUS_SHAPES:
+        source = head + _PLAIN_BODY
+        try:
+            compile(source, "<check>", "exec")
+            legal = True
+        except SyntaxError as exc:
+            legal = (False, exc.msg)
+        check("%s is legal Python before the prologue" % label,
+              legal is True, legal)
+        offset, ambiguous = harness._prelude_end(source)
+        check("%s is reported ambiguous, so no line is inserted" % label,
+              ambiguous and harness.executed_source(source) == source,
+              (offset, ambiguous,
+               repr(harness.executed_source(source)[:40])))
+        result = harness.run_python_sandboxed(source)
+        check("%s is still legal once the harness has written it" % label,
+              result.ok, (result.exit_code, result.stderr[-300:]))
+        doc_seen.append("doc=None" not in result.stdout)
+    check("and the docstring the scan could not resolve is still the module "
+          "docstring in all four", all(doc_seen), doc_seen)
+
+    # The cost, stated: `"""doc""" + x` is a genuine expression and demotes
+    # nothing, so calling it ambiguous suppresses a prologue that would have been
+    # safe. It suppresses nothing that ever ran: a first statement like that with
+    # a future statement behind it is a SyntaxError the model wrote itself, which
+    # is why the conservative branch is free here.
+    expression = '"""doc""" + "x"\nfrom __future__ import annotations\n' \
+                 + _PLAIN_BODY
+    refused = None
+    try:
+        compile(expression, "<check>", "exec")
+    except SyntaxError as exc:
+        refused = exc.msg
+    check("a string-leading expression plus a future statement was already "
+          "illegal, so treating it as ambiguous costs nothing",
+          refused is not None
+          and harness.executed_source(expression) == expression, refused)
+
+
+# A byte-order mark is prelude to CPython and an ordinary character to a scan, so
+# it hides a docstring behind it and cannot survive being moved off byte 0. The
+# whole shape is invisible to `compile`, which refuses the mark at any position:
+# only a file distinguishes "runs" from "SyntaxError", and `run_python_sandboxed`
+# writing utf-8 is the file this ships with.
+_BOM = "\ufeff"
+
+
+def test_a_byte_order_mark_is_prelude_and_not_a_statement():
+    """The mark stays on the first byte, and the docstring behind it stays a docstring.
+
+    Measured through a real utf-8 file on purpose. `compile` of the same text
+    raises `invalid non-printable character U+FEFF` before and after, so a
+    str-level check cannot see this defect at all -- it would report the marked
+    source as broken either way and never notice that the prologue was what broke
+    the file on disk.
+    """
+    marked = _BOM + '"""Merge spans."""' + _UNION_BODY
+    both = []
+    for text in (marked, harness.executed_source(marked)):
+        try:
+            compile(text, "<check>", "exec")
+            both.append("compiled")
+        except SyntaxError as exc:
+            both.append(exc.msg)
+    check("a str-level compile cannot see this shape, which is why it is "
+          "measured through a file",
+          both == ["invalid non-printable character U+FEFF"] * 2, both)
+
+    result = harness.run_python_sandboxed(marked)
+    check("a marked source with a docstring runs from a real utf-8 file",
+          result.ok, (result.exit_code, result.stderr[-300:]))
+    check("the docstring behind the mark is still the module docstring",
+          "doc='Merge spans.'" in result.stdout, result.stdout[:200])
+    check("and the prologue was placed, so the union annotation cannot raise",
+          "out=3" in result.stdout, result.stdout[:200])
+
+    bare = _BOM + _UNION_BODY.lstrip("\n")
+    result = harness.run_python_sandboxed(bare)
+    check("a marked source with no docstring runs too, and gets the prologue",
+          result.ok and "out=3" in result.stdout,
+          (result.exit_code, result.stdout[:120], result.stderr[-200:]))
+    check("the mark keeps the first byte, and takes no line of its own",
+          harness.executed_source(bare)
+          == _BOM + harness._SOURCE_PROLOGUE + bare[len(_BOM):],
+          repr(harness.executed_source(bare)[:60]))
+    rebuilt = []
+    for source in (marked, bare):
+        executed = harness.executed_source(source)
+        cut = executed.index(harness._SOURCE_PROLOGUE)
+        rebuilt.append(
+            executed[:cut] + executed[cut + len(harness._SOURCE_PROLOGUE):]
+            == source)
+    check("deleting the inserted line gives the marked bytes back exactly, "
+          "mark included", all(rebuilt), rebuilt)
 
 
 def test_vacuous_tests_are_caught():
@@ -1449,6 +1742,9 @@ def main():
         test_tests_passing_is_approved, test_wrong_answer_that_runs_is_revised,
         test_import_failure_is_distinguished, test_vacuous_tests_are_caught,
         test_the_source_prologue_neutralises_annotations,
+        test_the_prologue_never_makes_a_legal_file_illegal,
+        test_the_prologue_survives_a_docstring_the_scan_cannot_parse,
+        test_a_byte_order_mark_is_prelude_and_not_a_statement,
         test_executor_cannot_supply_its_own_tests,
         test_runaway_output_is_killed, test_filesystem_jail,
         test_destructive_calls_cannot_be_spelled_around_the_guard,

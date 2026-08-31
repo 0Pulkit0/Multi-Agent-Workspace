@@ -84,15 +84,21 @@ PROVIDERS = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
     },
     "groq": {
-        # RETIRED. This slug 404s with `model_not_found` for the project's key as
-        # of 2026-08-30, and Groq is the Executor in all four arms, so every arm
-        # currently points at a dead model. Choosing the replacement is a
-        # registration decision and is deliberately not made here: point the role
-        # at a live slug through the configuration below (`MAW_MODELS`, or
-        # `models.json`), and `eval/models.py --list groq` will say what the key
-        # can actually reach. The preflight refuses to spend anything until the
-        # configured pair answers.
-        "model": "llama-3.3-70b-versatile",
+        # PINNED 2026-09-01 as the Executor for all four arms, per D-6's method
+        # and registered as D-13 in `eval/prereg/DECISIONS_R3_ADDENDUM_D.md`.
+        # The previous slug here, `llama-3.3-70b-versatile`, 404s with
+        # `model_not_found` for this project's key.
+        #
+        # What the number behind this is, so the constant does not read as more
+        # than it is: 18 of 19 hidden-suite passes in the D-9 pin re-run, against
+        # 16 of 19 for both `openai/gpt-oss-20b` and `qwen/qwen3.8-27b`. Paired
+        # over the same 19 specs that is a 2-0 discordant split, exact McNemar
+        # p = 0.50 -- the three candidates are *not* statistically distinguishable
+        # at this n. Tier 3 of the task set was never reached, and this model
+        # spends ~3.5x qwen's completion tokens. The addendum states all of that
+        # and why the pin was still made; nothing here should be read as "the
+        # best model won".
+        "model": "openai/gpt-oss-120b",
         "base_url": "https://api.groq.com/openai/v1",
     },
 }

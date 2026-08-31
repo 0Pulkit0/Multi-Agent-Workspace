@@ -15,8 +15,9 @@ it cannot call, so `--preflight` makes a real completion.
 
 Configuration comes from `MAW_MODELS` (inline JSON, or a path) or `models.json`
 beside `agents_core.py`. With neither, the source defaults stand. Example, and
-the model ID here is a placeholder rather than a recommendation -- which slug
-replaces the retired Groq one is a registration decision:
+the model ID here is a placeholder rather than a recommendation -- the Executor
+slug is pinned in the source defaults by D-13, and overriding it here is a
+departure from the registration, not a configuration convenience:
 
     MAW_MODELS='{"roles": {"executor": {"model": "example-model-id"}}}'
 """

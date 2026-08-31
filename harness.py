@@ -95,11 +95,154 @@ SOLUTION_MODULE = "solution"
 # on a model obeying an instruction. It does NOT cover `match` statements or a
 # runtime `isinstance(x, int | str)` -- those are the prompt's job.
 #
-# Written ahead of SCRIPT_NAME only. `ExecResult.source` keeps the model's
-# original bytes: the record says what the model wrote, and the executed text is
-# recoverable as `_SOURCE_PROLOGUE + source` because the prologue is a constant.
+# Written into SCRIPT_NAME only, after the module docstring when there is one --
+# see `executed_source` and the note at the write site for why the position is
+# not line 1. `ExecResult.source` keeps the model's original bytes: the record
+# says what the model wrote, and the executed text is recoverable from the record
+# as `executed_source(source)`, a pure function of exactly those bytes. It is no
+# longer `_SOURCE_PROLOGUE + source`: the position varies with the source, so
+# that concatenation is right only for a source with no leading prelude.
 # Nothing is prepended to TEST_NAME -- see the note at the write site.
 _SOURCE_PROLOGUE = "from __future__ import annotations\n"
+
+# A future statement may be preceded only by comments, blank lines, the module
+# docstring and other future statements. Line 1 meets that on its own, which is
+# what Sprint 10 assumed, but it also *demotes* a leading docstring: the first
+# statement becomes our import, so the model's string is an ordinary expression
+# statement. Two consequences, one cause:
+#
+#   1. an ordinary expression statement may not precede a future statement, so
+#      `docstring` + the model's own `from __future__ import ...` -- any future
+#      import, not only `annotations` -- became a SyntaxError the model did not
+#      write. One of 57 replay draws died this way.
+#   2. `solution.__doc__` became None for every solution opening with a
+#      docstring.
+#
+# Inserting after the docstring fixes both, and needs no future-statement
+# detection at all: our line is then itself in the prelude, and a future
+# statement may precede other future statements.
+_FUTURE_STATEMENT = re.compile(r"^from[ \t]+__future__[ \t]+import\b", re.M)
+_LEADING_STRING = re.compile(r"""^([rRuU]?)('''|\"\"\"|'|")""")
+
+# A byte-order mark is prelude to the tokenizer -- CPython strips it when it
+# opens the file -- and an ordinary character to everything here: `str.strip`
+# does not consider it whitespace and `_LEADING_STRING` will not match through
+# it. Left in place it hides a docstring behind it, so the scan cuts at 0 and
+# moves the mark off the first byte, where it stops being a mark and becomes
+# `invalid non-printable character U+FEFF`. A `compile` of the same text cannot
+# see this either way -- it refuses the mark at any position -- so only a real
+# utf-8 file distinguishes the two, which is how it was measured. Spelled as an
+# escape: the character itself is invisible in an editor.
+_BOM = "\ufeff"
+
+
+def _prelude_end(source):
+    """Index just past ``source``'s leading comment/blank/docstring prelude.
+
+    Returns ``(offset, ambiguous)``. `ambiguous` is True when the scan met a
+    leading string literal whose extent it could not establish, which is where
+    inserting at `offset` could demote a docstring as line 1 did; the caller
+    treats that as "do not place the prologue" rather than guessing. Three
+    shapes reach it, and the last two are legal Python that a line scan cannot
+    resolve without tokenising:
+
+      * a leading string with no closing quote in the file at all;
+      * a parenthesised docstring -- `('a'` newline `'b')` -- which
+        `_LEADING_STRING` cannot even match, the first character being `(`;
+      * a string whose line continues, by backslash or operator. That is either
+        a genuine expression (`'doc' + x`, which is not a docstring and demotes
+        nothing) or an implicit concatenation that *is* the docstring (`'a' \\`
+        newline `'b'`). Both look identical to a scan that stops at the first
+        closing quote, and the second is legal before the prologue and a
+        SyntaxError after it.
+
+    A line scan, deliberately, not a parse: `ast.parse` fails outright on a
+    `match` statement under 3.9 and a model that writes one would silently lose
+    the prologue. The only `compile` here is over the prelude slice itself --
+    comments and one string literal, which cannot contain 3.10-only syntax --
+    purely to confirm the cut lands on a statement boundary.
+    """
+    bom = len(_BOM) if source.startswith(_BOM) else 0
+    lines = source[bom:].splitlines(True)
+    start = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            break
+        start += 1
+    head = bom + sum(len(line) for line in lines[:start])
+    rest = source[head:]
+
+    if rest.startswith("("):
+        # A parenthesised leading string is still the docstring, and the closing
+        # paren can be any number of lines down. Ambiguous, not "the first
+        # statement is code": that verdict would place the prologue above a
+        # docstring again.
+        return head, True
+    match = _LEADING_STRING.match(rest)
+    if match is None:
+        # The first statement is code (or a future statement, which our line is
+        # allowed to precede). Nothing to displace, nothing to get wrong.
+        return head, False
+    quote = match.group(2)
+    pos, ambiguous = match.end(), True
+    while pos < len(rest):
+        if rest[pos] == "\\":       # escapes a quote in raw strings too
+            pos += 2
+            continue
+        if rest.startswith(quote, pos):
+            pos += len(quote)
+            ambiguous = False
+            break
+        if len(quote) == 1 and rest[pos] == "\n":
+            break                   # unterminated single-quoted literal
+        pos += 1
+    if ambiguous:
+        return head, True
+    trailer = rest[pos:].split("\n", 1)[0].strip()
+    if trailer and not trailer.startswith("#"):
+        # The line does not end at the closing quote. Either the string is part
+        # of a larger expression and nothing is being demoted, or it is the first
+        # piece of an implicit concatenation that is the docstring -- and a
+        # concatenated docstring demoted by a line-1 prologue breaks the model's
+        # own future statement exactly as a plain one did. Indistinguishable
+        # here, so ambiguous: this branch used to return "safe" and was the one
+        # path by which the prologue still created a SyntaxError.
+        return head, True
+    end = rest.find("\n", pos)
+    offset = head + (len(rest) if end < 0 else end + 1)
+    try:
+        # Without the mark: it is not part of the statement structure, and
+        # `compile` rejects it wherever it appears, which would fail every
+        # marked file into the ambiguous branch.
+        compile(source[bom:offset], "<prelude>", "exec")
+    except Exception:
+        return head, True
+    return offset, False
+
+
+def executed_source(source):
+    """Exactly the text `run_python_sandboxed` writes as SCRIPT_NAME.
+
+    Pure function of the recorded `ExecResult.source`, so the executed file is
+    reconstructable from a stored record without storing the position.
+    """
+    offset, ambiguous = _prelude_end(source)
+    if ambiguous and _FUTURE_STATEMENT.search(source):
+        # We cannot say where the model's first statement ends, and the source
+        # has a future statement to break. Skipping costs PEP 563 for this one
+        # draw; guessing costs a SyntaxError we caused.
+        return source
+    head, tail = source[:offset], source[offset:]
+    # A prelude that ends at EOF without a newline would otherwise be spliced
+    # into our line. A lone byte-order mark is the exception: it is not a line,
+    # it is stripped by whoever opens the file, and giving it one shifts every
+    # line number by one and stops the recorded bytes being recoverable by
+    # deleting the inserted line.
+    body = head[len(_BOM):] if head.startswith(_BOM) else head
+    if body and not body.endswith("\n"):
+        head += "\n"
+    return head + _SOURCE_PROLOGUE + tail
 
 # The child records how far it got here, so that a SIGKILLed process -- which
 # prints no traceback at all -- can still be explained.
@@ -1232,17 +1375,20 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
     try:
         script_path = os.path.join(workdir, SCRIPT_NAME)
         with open(script_path, "w", encoding="utf-8") as handle:
-            # The prologue goes ahead of the model's text, never over it. A
-            # future statement may be preceded only by comments, blank lines,
-            # the module docstring and other future statements, so line 1 is
-            # the only always-legal position -- and it stays legal when the
-            # model opens with a docstring or wrote the same import itself.
-            # Cost: solution.py line numbers in raw stderr are one higher than
-            # the model's own count, and that stderr becomes repair context.
+            # The prologue goes into the model's text, never over it, and after
+            # the module docstring rather than at line 1 -- `executed_source`
+            # says why, and says it about a case that was measured, not
+            # assumed. Line 1 is legal in isolation; line 1 *plus* a docstring
+            # plus the model's own future statement is not, and line 1 alone
+            # silently emptied `solution.__doc__`.
+            # Cost: in raw stderr, solution.py line numbers at and after the
+            # insertion point are one higher than the model's own count, and
+            # that stderr becomes repair context. Lines above it -- including an
+            # encoding declaration, which must stay on line 1 or 2 -- are not
+            # shifted at all, which line 1 could not promise.
             # `failed_assertion_line` is unaffected; it is only set for frames
             # in TEST_NAME, which gets no prologue.
-            handle.write(_SOURCE_PROLOGUE)
-            handle.write(source)
+            handle.write(executed_source(source))
 
         test_path = None
         if tests:

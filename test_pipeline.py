@@ -4378,13 +4378,13 @@ def test_the_resolved_mapping_reaches_the_run_json_and_both_manifests():
 def test_the_preflight_refuses_a_dead_pair_and_passes_a_live_one():
     """One call per pair before a sweep, and a refusal instead of a spend.
 
-    The negative control is the real retired slug, not a synthetic one: as of
-    2026-08-30 the Groq model in the provider table 404s for this project's key,
-    and it is the Executor in all four arms, so the *default* configuration is
-    exactly the configuration a preflight has to catch. `--live-models` tells the
-    stand-in which IDs the key can reach and every other ID 404s through the same
-    gate `--bad-slug` uses, so this is the real refusal path rather than an
-    imitation of it.
+    The negative control was the real retired Groq slug until D-13 pinned a live
+    one, so it is now built the same way `--bad-slug` builds it: `--live-models`
+    names only the Gemini model, so whatever the Executor is configured with does
+    not answer and 404s through the same gate. That keeps the check about the
+    preflight rather than about which slug happens to be in the table -- it reads
+    the configured model instead of naming one, and it would still fail if the
+    preflight stopped refusing.
     """
     out = tempfile.mkdtemp(prefix="preflight-")
     try:
@@ -4637,6 +4637,18 @@ def test_the_defaults_reproduce_todays_behaviour_exactly():
                                         "test_writer": "gemini",
                                         "executor": "groq"},
           agents_core.ROLE_PROVIDER)
+    # Hardcoded for the same reason the mapping above is: D-13 pins this exact
+    # slug, and a registered pin that nothing compares against the code is a
+    # document, not a commitment. If this line has to change, the Executor
+    # changed, and `d_t` measured on the old one describes no run on the new one.
+    # The two candidates it was chosen over are named so that a silent swap to
+    # either is a failing check rather than a diff nobody reads.
+    check("the Executor is the model D-13 pinned, not one of the two "
+          "candidates it was chosen over",
+          agents_core.model_for("executor") == "openai/gpt-oss-120b"
+          and agents_core.model_for("executor") not in (
+              "openai/gpt-oss-20b", "qwen/qwen3.8-27b"),
+          agents_core.model_for("executor"))
     check("sampling is still the two pinned values and nothing else",
           agents_core.sampling_for("executor") == {"temperature": 0.4,
                                                   "top_p": 1.0},
@@ -6432,6 +6444,419 @@ def test_the_replay_rehashes_a_suite_by_the_width_its_digest_claims():
           len([key for key in units if key[0] == pin.KIND_PLAN]))
 
 
+# ---------------------------------------------------------------------------
+# sprint 11, task 2: importing the paid-for specs into the calibration store
+#
+# The first probe bought 19 Planner specs with a full day of the Gemini free tier
+# and then a per-day quota killed the other 17. `calibrate.py` skips a Planner
+# call for any task whose plan file already holds a spec, so those 19 specs on
+# disk are 19 calls the D-1 calibration does not have to buy a second time.
+#
+# What has to be established is not that files appear. It is that an imported plan
+# is the same object a drawn plan is -- otherwise `d_t` is measured against
+# something D-1 does not describe -- and that the converter refuses rather than
+# guesses everywhere it cannot be sure of that.
+# ---------------------------------------------------------------------------
+
+def _import_import_pin_plans():
+    _import_run_eval()          # puts `eval/` on sys.path
+    import import_pin_plans
+    return import_pin_plans
+
+
+def _import_source_ledger(pin, task_ids, call=None, spec="Write f(x) -> x."):
+    """A source ledger with one importable plan per id, via `pin.append`.
+
+    The `calls` entry is derived from `agents_core`'s own resolution for the
+    `planner` role rather than typed out, so this fixture cannot pass a parity
+    check that a real ledger would fail: if the role's provider, model or
+    sampling parameters move, the fixture moves with them, and the refusal cases
+    below are what pin the comparison itself down.
+    """
+    provider = agents_core.ROLE_PROVIDER["planner"]
+    entry = {"role": "planner", "requested": provider, "used": provider,
+             "model": agents_core.model_for("planner"), "ok": True,
+             "at": "2026-08-31T12:00:00Z", "attempts": 1, "retried": 0,
+             "measurement_mode": True, "status": None, "exc_class": ""}
+    entry.update(agents_core.sampling_for("planner"))
+    entry.update(call or {})
+    root = tempfile.mkdtemp(prefix="import-src-")
+    path = pin.ledger_path(root)
+    for index, task_id in enumerate(task_ids):
+        pin.append(path, {
+            "kind": pin.KIND_PLAN, "task_id": task_id, "candidate": "",
+            "at": "2026-08-31T12:00:0%dZ" % index, "ok": True,
+            "spec": "%s (%s)" % (spec, task_id), "steps": 2,
+            "tests": "from solution import f\nassert f(1) == 1\n",
+            "tests_status": "generated", "tests_trusted": True,
+            "tests_sha256": "0" * 16, "planner_provider": provider,
+            "calls": [dict(entry)]})
+    return root, path
+
+def test_an_imported_spec_is_the_spec_the_sweep_then_measures():
+    """An imported plan has to be the object a drawn plan is, or `d_t` moves.
+
+    The cheapness is not the point and is not what can go wrong. What can go
+    wrong is a plan file that `calibrate.py` accepts and then measures something
+    else against: a spec digest over different bytes, a missing field read as an
+    empty one, or a stored spec quietly replaced on the next run. So the shape is
+    compared against `calibration_plan` itself, and then a real stub sweep is run
+    over the imported store to see which spec the draws actually answered.
+    """
+    imp = _import_import_pin_plans()
+    calibrate = _import_calibrate()
+    pin = _import_pin_executor()
+    gen_tasks = _import_gen_tasks()
+    tasks = gen_tasks.generate(limit=2)
+    ids = [task.task_id for task in tasks]
+
+    # Compared against the writer it has to match, not against a list of key
+    # names typed out here, which would agree with itself forever.
+    held = agents_core.call_role
+    try:
+        agents_core.call_role = lambda *args, **kwargs: (_PIN_PLAN, "gemini")
+        drawn = calibrate.calibration_plan(tasks[0], {})
+    finally:
+        agents_core.call_role = held
+    check("an imported plan mirrors the keys `calibration_plan` writes, checked "
+          "against the function rather than against a hardcoded list",
+          sorted(drawn) == sorted(imp.DRAWN_PLAN_KEYS), sorted(drawn))
+
+    src_root, src_path = _import_source_ledger(pin, ids)
+    out = tempfile.mkdtemp(prefix="import-out-")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            code = imp.main(["--ledger", src_path, "--out", out])
+        text = captured.getvalue()
+        written = [_read_json(calibrate.plan_path(out, 0, task_id))
+                   for task_id in ids]
+        extra = ("calls_by_provider", "imported_at", "imported_from",
+                 "imported_ledger_sha256", "imported_plan_sha256_absent",
+                 "imported_planner_call")
+        check("the two specs the ledger holds are written and the other 34 "
+              "locked tasks are skipped, not invented",
+              code == 0 and len(written) == 2
+              and len(glob.glob(os.path.join(out, "seed-0", "plans", "*.json")))
+              == 2, (code, text[-400:]))
+        check("and each one carries a drawn plan's keys plus its provenance, "
+              "with nothing else added",
+              all(sorted(record) == sorted(tuple(imp.DRAWN_PLAN_KEYS) + extra)
+                  for record in written), sorted(written[0]))
+        check("spec_sha256 is a full digest recomputed over the spec bytes that "
+              "were imported, not the suite digest the ledger happened to keep",
+              all(record["spec_sha256"]
+                  == agents_core.sha256_of(record["spec"])
+                  and len(record["spec_sha256"]) == 64
+                  for record in written),
+              [record["spec_sha256"] for record in written])
+        check("plan_sha256 is empty and says in the file itself why it cannot be "
+              "reconstructed, rather than holding a digest of other bytes",
+              all(record["plan_sha256"] == ""
+                  and "not reconstructable"
+                  in record["imported_plan_sha256_absent"]
+                  for record in written),
+              written[0]["imported_plan_sha256_absent"][:60])
+        check("the provenance names the source file and its real digest, so an "
+              "imported spec is one glance from the top of the file",
+              all(record["imported_from"].endswith(pin.LEDGER_NAME)
+                  and record["imported_ledger_sha256"]
+                  == imp.file_sha256(src_path)
+                  and record["imported_planner_call"]["role"] == "planner"
+                  for record in written),
+              written[0]["imported_ledger_sha256"])
+        check("the sweep's own reuse predicate accepts it, which is the whole "
+              "mechanism the import relies on",
+              all(record is not None and record.get("spec")
+                  for record in written), "")
+
+        # And now the only question that matters: run the sweep and see which
+        # spec the draws were graded against.
+        imported = [record["spec_sha256"] for record in written]
+        _code2, text2 = _with_scoped_runs(
+            os.path.join(out, "runs"),
+            lambda: _calibrate(["--stub", "sampled", "--limit", "2",
+                               "--out", out]))
+        manifest = _calibration_manifest(out)
+        drawn_digests = sorted(set(
+            _read_json(calibrate.draw_path(out, 0, task_id, index))["spec_sha256"]
+            for task_id in ids for index in range(1, 11)))
+        check("a sweep over the imported store spends nothing on the Planner, "
+              "and says so in the projection before it spends anything",
+              manifest["actual_calls_by_provider"].get("gemini", 0) == 0
+              and "gemini 0 call(s)" in " ".join(text2.split()),
+              manifest["actual_calls_by_provider"])
+        # Reading all 20 draw files is itself the check that all 20 exist. The
+        # sweep's exit code is deliberately not asserted: it is the gate verdict,
+        # and two stub tasks cannot clear a threshold of 15.
+        check("and every one of the 20 draws answered the imported spec, by "
+              "digest -- so d_t is a number about the spec that was paid for",
+              drawn_digests == sorted(set(imported)),
+              (drawn_digests, sorted(set(imported))))
+        check("the imported plans are still on disk unmodified afterwards, "
+              "markers and all",
+              [_read_json(calibrate.plan_path(out, 0, task_id))
+               for task_id in ids] == written, "")
+    finally:
+        shutil.rmtree(src_root, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+def test_the_import_refuses_everything_it_cannot_establish():
+    """A spec drawn from a different call is not the spec `d_t` registers.
+
+    Which makes every one of these a refusal and not a warning. The parity cases
+    are the four dimensions the import rests on -- role, provider, model,
+    sampling parameters -- each broken one at a time against a fixture that is
+    otherwise importable, so a case can only pass by being detected. The rest are
+    ways the store itself could be corrupted: a plan overwritten under draws that
+    already answered another spec, a spec filed against prompts it never saw, or
+    calibration data written where the grid's loader reads cells.
+    """
+    imp = _import_import_pin_plans()
+    calibrate = _import_calibrate()
+    pin = _import_pin_executor()
+    gen_tasks = _import_gen_tasks()
+    tasks = gen_tasks.generate(limit=2)
+    ids = [task.task_id for task in tasks]
+    broken = (
+        ("role", {"role": "test_writer"}),
+        ("provider used", {"used": "groq"}),
+        ("provider requested", {"requested": "groq"}),
+        ("model", {"model": "gemini-1.0-nope"}),
+        ("temperature", {"temperature": 0.7}),
+        ("a failed call", {"ok": False}),
+    )
+    for label, mutation in broken:
+        src_root, src_path = _import_source_ledger(pin, ids, call=mutation)
+        out = tempfile.mkdtemp(prefix="import-bad-")
+        try:
+            plan = imp.convert(src_path, out, 0, tasks)
+            check("a spec whose Planner call differs in %s is refused, and no "
+                  "file is written for it" % label,
+                  len(plan["refusals"]) == 2 and not plan["writes"]
+                  and not glob.glob(os.path.join(out, "seed-0", "plans", "*")),
+                  plan["refusals"][:1])
+        finally:
+            shutil.rmtree(src_root, ignore_errors=True)
+            shutil.rmtree(out, ignore_errors=True)
+
+    # A sampling parameter the ledger never recorded cannot be compared, and the
+    # direction to fail in is the one that does not import it.
+    src_root, src_path = _import_source_ledger(pin, ids)
+    held = dict(agents_core.ROLE_PARAMS)
+    out = tempfile.mkdtemp(prefix="import-param-")
+    try:
+        agents_core.ROLE_PARAMS["planner"] = {"top_k": 40}
+        plan = imp.convert(src_path, out, 0, tasks)
+        check("a sampling parameter this checkout would send and the ledger "
+              "never recorded is refused, not ignored",
+              len(plan["refusals"]) == 2
+              and "top_k" in plan["refusals"][0][1], plan["refusals"][:1])
+    finally:
+        agents_core.ROLE_PARAMS.clear()
+        agents_core.ROLE_PARAMS.update(held)
+        shutil.rmtree(out, ignore_errors=True)
+
+    run_eval = _import_run_eval()
+    out = tempfile.mkdtemp(prefix="import-guard-")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as dry:
+            code = imp.main(["--ledger", src_path, "--out", out, "--dry-run"])
+        check("--dry-run decides the same two imports and writes nothing at all",
+              code == 0 and "would" in dry.getvalue()
+              and not glob.glob(os.path.join(out, "seed-0", "plans", "*")),
+              dry.getvalue()[-200:])
+        with contextlib.redirect_stdout(io.StringIO()):
+            imp.main(["--ledger", src_path, "--out", out])
+        before = _read_json(calibrate.plan_path(out, 0, ids[0]))
+        with contextlib.redirect_stdout(io.StringIO()) as again:
+            code = imp.main(["--ledger", src_path, "--out", out])
+        check("a second import leaves every plan byte-identical: an existing "
+              "plan, drawn or imported, is never overwritten",
+              code == 0 and "already exists" in again.getvalue()
+              and _read_json(calibrate.plan_path(out, 0, ids[0])) == before, "")
+        plan = imp.convert(src_path, out, 0, tasks[:1])
+        check("a spec for a task the lock does not describe is refused -- it "
+              "answers a prompt this sweep will never send",
+              [task_id for task_id, _ in plan["refusals"]] == [ids[1]],
+              plan["refusals"])
+        os.remove(calibrate.plan_path(out, 0, ids[0]))
+        run_eval.save_record(calibrate.draw_path(out, 0, ids[0], 3),
+                             {"task_id": ids[0], "spec_sha256": "0" * 64})
+        plan = imp.convert(src_path, out, 0, tasks)
+        check("a task with draws on disk and no plan beside them is refused: "
+              "importing one now would give it two specs and one d_t",
+              [task_id for task_id, _ in plan["refusals"]] == [ids[0]]
+              and not plan["writes"], plan["refusals"])
+        stray = os.path.join(run_eval.RESULTS_DIR, "not-a-calibration-root")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            seeded = imp.main(["--ledger", src_path, "--out", out, "--seed", "1"])
+            in_grid = imp.main(["--ledger", src_path, "--out", stray])
+            absent = imp.main(["--ledger", os.path.join(out, "no.jsonl"),
+                               "--out", out])
+        check("a seed the lock does not record, an --out inside the grid's "
+              "results and an absent ledger are all refusals, and the grid "
+              "directory is not even created",
+              (seeded, in_grid, absent) == (2, 2, 2)
+              and not os.path.exists(stray), (seeded, in_grid, absent))
+    finally:
+        shutil.rmtree(src_root, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+    # The check that matters: the 19 records this was written for, from the
+    # ledger production actually wrote, read only. A fixture the converter was
+    # built alongside can agree with it by construction; these cannot.
+    live = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval",
+                        "results", "pin-executor", "ledger.jsonl")
+    if not os.path.exists(live):
+        check("the first probe's ledger is not on this checkout, so the fixtures "
+              "above are the whole check", True)
+        return
+    locked = pin.locked_tasks()
+    out = tempfile.mkdtemp(prefix="import-live-")
+    try:
+        plan = imp.convert(live, out, 0, locked)
+        records = [record for _path, record in plan["writes"]]
+        check("all 19 specs the first probe paid for import from the real "
+              "ledger with no refusal, and the 17 the quota killed are skipped",
+              len(plan["writes"]) == 19 and len(plan["skips"]) == 17
+              and not plan["refusals"],
+              (len(plan["writes"]), len(plan["skips"]), plan["refusals"][:2]))
+        check("every one of the 19 was drawn from the Planner call this sweep "
+              "makes -- role, provider, model and sampling parameters, checked "
+              "per record against this checkout's own config",
+              all(not imp.planner_call_parity(record) for record
+                  in pin.replayable_plans(pin.load_ledger(live)[0]).values()),
+              "")
+        digests = set(record["spec_sha256"] for record in records)
+        check("and the 19 carry 19 distinct full-width spec digests over "
+              "non-empty specs, so none is a copy of another",
+              len(digests) == 19
+              and all(len(digest) == 64 for digest in digests)
+              and all(record["spec"].strip() for record in records),
+              sorted(len(digest) for digest in digests)[:3])
+        check("convert itself wrote nothing: the plan of work is decided before "
+              "the first byte, so one refusal can abandon all 19",
+              not os.path.exists(os.path.join(out, "seed-0")), out)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# a record is written whole or not at all
+#
+# `save_record` was `open(path, "w")` plus `json.dump`, and every resume in this
+# repo is `os.path.exists` of the record's own path with no re-validation of what
+# it finds. Those two together turn an interrupt -- Ctrl-C, a full disk, a closed
+# lid -- into a permanent silent error: the truncated file exists, so the resumed
+# sweep never redraws it, and `calibrate.load_json` returns None for it at
+# aggregation, so `d_t` is computed over a denominator one smaller than the draws
+# that were paid for. Not a missing number, which is visible in `draws_stored`: a
+# wrong one. The fix is at the write, so what follows checks the write.
+# ---------------------------------------------------------------------------
+
+def _unserialisable_draw(task_id):
+    """A record `json.dump` starts writing and then refuses to finish.
+
+    `sort_keys` puts the good key first, so the encoder streams a valid prefix
+    into the file before it reaches the `set` and raises -- which is the shape of
+    an interrupted write, produced by an interruption rather than by writing
+    half a file on purpose.
+    """
+    return {"aaa_task_id": task_id, "draw": 1, "outcome": "graded",
+            "passed": True, "spec_sha256": "0" * 64,
+            "zzz_not_json": set([1, 2, 3])}
+
+
+def test_an_interrupted_record_is_not_a_completed_draw():
+    """A draw counts once its file parses, so the file may not exist until it does.
+
+    Written as one whole `d_t`: three real draws, then one write that dies
+    mid-encode. The claim is not that the fourth draw survives -- it did not
+    happen -- but that it is still *owed*, because a draw that is silently
+    forgotten shrinks the denominator `d_t` is a fraction of.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    gen_tasks = _import_gen_tasks()
+    tasks = gen_tasks.generate(limit=1)
+    out = tempfile.mkdtemp(prefix="calib-partial-")
+    try:
+        task_id = tasks[0].task_id
+        for index in (1, 2, 3):
+            run_eval.save_record(
+                calibrate.draw_path(out, 0, task_id, index),
+                {"task_id": task_id, "draw": index,
+                 "outcome": run_eval.OUTCOME_GRADED,
+                 "passed": index != 3, "spec_sha256": "0" * 64})
+        fourth = calibrate.draw_path(out, 0, task_id, 4)
+        raised = _raises(lambda: run_eval.save_record(
+            fourth, _unserialisable_draw(task_id)))
+        check("a write that cannot finish raises rather than reporting success",
+              raised.startswith("wrong type: TypeError"), raised)
+        check("and leaves nothing at the record's own path, which is the only "
+              "thing resume looks at",
+              not os.path.exists(fourth), sorted(os.listdir(
+                  os.path.dirname(fourth))))
+        leftover = fourth + run_eval.PARTIAL_SUFFIX
+        # "Does not parse" is spelled `load_json(...) is None` because that is
+        # the function aggregation actually reads with, rather than a JSON error
+        # type of my choosing -- and `_raises` would not report one anyway,
+        # `JSONDecodeError` being a `ValueError`.
+        with open(leftover, encoding="utf-8") as handle:
+            half = handle.read()
+        check("the half-encoded bytes are in a .partial sibling instead, and "
+              "they really are half a record: a prefix that starts the object, "
+              "names the task and never closes",
+              (calibrate.load_json(leftover) is None
+               and half.startswith("{") and task_id in half
+               and not half.rstrip().endswith("}")),
+              (sorted(os.listdir(os.path.dirname(fourth))), half[-30:]))
+        projected = calibrate.project_calls(tasks, out, 0, 4)
+        check("so the interrupted draw is still owed: the projection counts it "
+              "as a call this sweep has yet to spend",
+              projected["draws_needed"] == 1, projected["draws_needed"])
+        entry = calibrate.collect(tasks, out, 0, 4)[0]
+        check("d_t is over the three draws that exist and reports the fourth as "
+              "missing, rather than dividing by three and saying nothing",
+              (entry["d_t"], entry["draws_stored"], entry["draws_requested"],
+               entry["draw_passed"][3])
+              == (round(2.0 / 3.0, 3), 3, 4, None),
+              (entry["d_t"], entry["draws_stored"], entry["draw_passed"]))
+
+        # The .partial sits in a directory the grid loader also reads. It must be
+        # invisible there too, and invisible by name: `json.load` on it would
+        # raise and take the whole aggregation down with it.
+        arm = os.path.join(out, "seed-0", "arm-b")
+        run_eval.save_record(os.path.join(arm, "real.json"), {"task_id": "t"})
+        with open(os.path.join(arm, "half.json" + run_eval.PARTIAL_SUFFIX),
+                  "w") as handle:
+            handle.write('{"task_id": "t2", "spec')
+        loaded = run_eval.load_records(out, 0, ["b"])
+        check("a .partial in an arm directory is not loaded as a grid cell",
+              [record["task_id"] for record in loaded] == ["t"], loaded)
+
+        # And the residual, stated rather than left for someone to find: this
+        # fixes the write, not the read. A truncated file that is already at the
+        # record's own path -- from a sweep interrupted before today's change --
+        # is still trusted by resume, which is why the guard belongs where the
+        # bytes are written and not where they are counted.
+        with open(fourth, "w") as handle:
+            handle.write('{"task_id": "%s", "draw": 4, "outc' % task_id)
+        wanted = [index for index in range(1, 5)
+                  if not os.path.exists(calibrate.draw_path(out, 0, task_id,
+                                                            index))]
+        entry = calibrate.collect(tasks, out, 0, 4)[0]
+        check("a truncated file already at the record's path is still counted as "
+              "done by resume and still unreadable at aggregation -- the reason "
+              "the fix is at the write",
+              wanted == [] and entry["draws_stored"] == 3
+              and calibrate.load_json(fourth) is None,
+              (wanted, entry["draws_stored"]))
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def main():
     for fn in (
         test_pipeline_is_explicit, test_mode_2_skips_execution,
@@ -6549,6 +6974,11 @@ def main():
         test_a_preflight_validates_the_parameters_the_role_will_actually_send,
         test_replaying_stored_plans_spends_nothing_on_the_planner,
         test_the_replay_rehashes_a_suite_by_the_width_its_digest_claims,
+        # sprint 11, task 2: importing the paid-for specs into calibration
+        test_an_imported_spec_is_the_spec_the_sweep_then_measures,
+        test_the_import_refuses_everything_it_cannot_establish,
+        # sprint 11 follow-up: an interrupted write is not a completed draw
+        test_an_interrupted_record_is_not_a_completed_draw,
     ):
         print("\n-- %s" % fn.__name__)
         try:

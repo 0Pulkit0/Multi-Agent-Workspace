@@ -93,6 +93,12 @@ OUTCOME_GRADED = "graded"
 OUTCOME_INFRA_LOSS = "infra_loss"
 OUTCOME_ERROR = "error"
 
+# What `save_record` writes before it renames. Named because two other places
+# depend on the choice: `load_records` selects on `.json`, so this must not end
+# in it, and every resume in this repo asks `os.path.exists` about the record's
+# own path, so this must not be that path.
+PARTIAL_SUFFIX = ".partial"
+
 # ------------------------------------------------------------------- governor
 
 class RateGovernor(object):
@@ -964,12 +970,33 @@ def _outcome_label(record):
 
 
 def save_record(path, record):
+    """Write `record` at `path` as JSON, atomically.
+
+    Via a sibling temp file and `os.replace`, because every resume in this repo
+    is `os.path.exists` of the record's own path and nothing re-validates what it
+    finds. A plain `open(path, "w")` interrupted between the truncate and the end
+    of `json.dump` -- Ctrl-C on a sweep, a full disk, a laptop lid -- leaves a
+    file that exists and does not parse. `calibrate.main` then skips that draw
+    for good, `calibrate.load_json` returns None for it at aggregation, and `d_t`
+    is computed over a denominator one smaller than the draws that were paid for.
+    That is the failure this guards: not a lost draw, which is visible, but a
+    quietly wrong number. `os.replace` is atomic on POSIX and on Windows, so the
+    path either does not exist or holds a whole record.
+
+    The suffix is deliberately not `.json`: `load_records` reads every `*.json`
+    in an arm directory, and a leftover from an interrupted write must not be
+    loaded as a grid cell. Nor is a leftover deleted here -- a temp file that
+    survived is the only evidence that a write was interrupted, and it costs
+    nothing, being overwritten by the next attempt at the same path.
+    """
     directory = os.path.dirname(path)
     if not os.path.isdir(directory):
         os.makedirs(directory)
-    with open(path, "w") as handle:
+    partial = path + PARTIAL_SUFFIX
+    with open(partial, "w") as handle:
         json.dump(record, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    os.replace(partial, path)
 
 # ---------------------------------------------------------------- summarising
 
@@ -1248,6 +1275,13 @@ def load_records(root, seed, arms):
         if not os.path.isdir(directory):
             continue
         for name in sorted(os.listdir(directory)):
+            if name.endswith(PARTIAL_SUFFIX):
+                # An interrupted `save_record`, not a grid cell. Skipped by name
+                # rather than by relying on `.partial` not ending in `.json`, so
+                # the exclusion survives a change to either suffix -- and skipped
+                # rather than parsed, because a half-written record would take
+                # the whole aggregation down with a JSONDecodeError.
+                continue
             if name.endswith(".json"):
                 with open(os.path.join(directory, name)) as handle:
                     records.append(json.load(handle))
