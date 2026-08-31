@@ -35,10 +35,21 @@ marker, and this probe draws exactly one sample per key. Nothing here can hand a
 old sample back as a freshly drawn one -- see the standing prohibition in
 `agents_core._attempt_provider`. Do not add a key that includes the prompt.
 
-Keys are read with `input()`. Never argv, never an environment dump, never a log.
+    python3 eval/pin_executor.py --replay-plans <old ledger> --out <new dir>
+
+re-draws against the specs an earlier ledger already holds: zero Planner calls,
+no Gemini key asked for, the suite and its digest carried over and re-verified.
+It is not a cheaper way to run the probe -- it is the only way to re-measure the
+Executor on the *same* specs after a harness fix, which a fresh Planner draw
+would make impossible. Tasks with no stored spec are skipped and named, never
+planned.
+
+Keys are read with `getpass.getpass`. Never argv, never echoed to the screen,
+never an environment dump, never a log.
 """
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -64,6 +75,13 @@ LEDGER_NAME = "ledger.jsonl"
 
 KIND_PLAN = "plan"
 KIND_DRAW = "draw"
+
+# A failing draw keeps its code and the child's stderr tail. Bounded, because the
+# ledger is append-only and read by hand: enough to see a traceback and the
+# signature that raised it, not enough for one pathological reply to dominate the
+# file. `clamp` elides the middle visibly rather than cutting the end off.
+MAX_KEPT_CODE_CHARS = 4000
+STDERR_TAIL_CHARS = 900
 
 
 # ------------------------------------------------------------------ the ledger
@@ -187,12 +205,18 @@ def configure(candidate):
 
 
 def ask_keys(providers, reader=None):
-    """provider -> key, read from the terminal. Never argv, never logged.
+    """provider -> key, read from the terminal. Never argv, never echoed.
 
     argv is in the process table, in the shell history and in any crash report
-    that dumps the command line. `input()` is not.
+    that dumps the command line. `input()` is in none of those -- but it echoes
+    the key to the screen and leaves it in the scrollback of a terminal that may
+    be shared, recorded or screen-shared, which is how a key was exposed here
+    once. `getpass.getpass` reads the same line without echoing it.
+
+    ``reader`` stays injectable so the offline checks can drive this without a
+    tty; only the default changed.
     """
-    reader = input if reader is None else reader
+    reader = getpass.getpass if reader is None else reader
     keys = {}
     for provider in providers:
         keys[provider] = (reader("Paste the %s API key (%s): "
@@ -201,7 +225,7 @@ def ask_keys(providers, reader=None):
     return keys
 
 
-def preflight(keys, candidates=CANDIDATES, call=None):
+def preflight(keys, candidates=CANDIDATES, call=None, include_planner=True):
     """One cheap call per pair before any generation. Returns a list of records.
 
     Every candidate slug *and* the Planner's pair, because a probe that validated
@@ -212,10 +236,19 @@ def preflight(keys, candidates=CANDIDATES, call=None):
 
     A missing key is a failure, not a skip. A 404 here costs one second; the same
     404 at unit 1 of 144 costs the run.
+
+    `include_planner=False` is for `--replay-plans`, which reuses stored specs and
+    therefore has no Planner pair to validate and no Gemini key to validate it
+    with. Validating one anyway would demand a key the mode does not use, and a
+    mode that asks for a key it will not spend teaches the habit of pasting keys
+    into runs that do not need them.
     """
     records = []
     planner_provider = agents_core.ROLE_PROVIDER["planner"]
-    pairs = [(planner_provider, agents_core.model_for("planner"), ["planner"])]
+    pairs = []
+    if include_planner:
+        pairs.append((planner_provider, agents_core.model_for("planner"),
+                      ["planner"]))
     pairs += [("groq", slug, ["executor"]) for slug in candidates]
     for provider, model, roles in pairs:
         key = (keys or {}).get(provider)
@@ -224,8 +257,13 @@ def preflight(keys, candidates=CANDIDATES, call=None):
                             "model": model, "ok": False, "status": None,
                             "detail": "no API key for provider %r" % provider})
             continue
-        ok, status, detail = agents_core.preflight_pair(provider, model, key,
-                                                       call=call)
+        # With the Executor's own parameters, `reasoning_format` included. That
+        # extension is the reason this probe exists in its current form, and a
+        # preflight that validated the pair without it would have declared a
+        # candidate reachable while the shape every real draw sends was untested.
+        ok, status, detail = agents_core.preflight_pair(
+            provider, model, key, call=call,
+            params=agents_core.sampling_for(roles[0]))
         records.append({"roles": roles, "provider": provider, "model": model,
                         "ok": ok, "status": status, "detail": detail})
     return records
@@ -283,6 +321,12 @@ def plan_unit(task, keys):
     try:
         with CaptureDetail() as detail:
             plan = run_eval.make_plan(task, keys)
+    except agents_core.DailyQuotaExhausted:
+        # Deliberately not recorded as this task's failure and not swallowed. The
+        # first probe recorded 17 of these as ordinary unit failures and kept
+        # going, which is how a 20-request ceiling cost 104 requests. The ledger
+        # is already fsynced up to here, so aborting loses nothing.
+        raise
     except Exception as exc:                                    # noqa: BLE001
         record["error"] = agents_core._redact(exc, keys)
         record["exc_class"] = type(exc).__name__
@@ -298,10 +342,107 @@ def plan_unit(task, keys):
         "tests_trusted": bool(plan["tests_trusted"]),
         "tests_sha256": plan["tests_sha256"],
         "planner_provider": plan["planner_provider"],
+        # Report-only, and the reason this field exists: the artifact that ended
+        # the first probe was diagnosed by hand-reading spec text afterwards.
+        "spec_runtime_syntax": plan["spec_runtime_syntax"],
         "calls": _calls_since(start),
         "replies": [_reply_summary(reply) for reply in detail.replies],
     })
     return record
+
+
+# ------------------------------------------------------- replaying stored plans
+
+# The roles a replay must not call. `test_writer` is in here beside `planner`
+# because `make_plan` calls it when the audit rejects the plan's own TESTS block:
+# a replay that avoided the Planner and still resolved a suite would have drawn
+# against a suite the first probe never used, which is the whole thing being
+# avoided.
+REPLAY_ROLES = ("planner", "test_writer")
+
+
+def planner_calls_since(start):
+    """Any Planner-side call in `CALL_LOG[start:]`. Empty is the invariant."""
+    return [entry for entry in agents_core.CALL_LOG[start:]
+            if entry.get("role") in REPLAY_ROLES]
+
+
+def replayed_plan_unit(record, source_path):
+    """A plan reused verbatim from an earlier ledger. Zero calls, by construction.
+
+    Why this mode exists: the first probe's 57 draws were answered against specs
+    that cost 19 Gemini calls out of a 20-per-day ceiling. Re-drawing them under
+    the fixed harness must not re-spend that, and -- more importantly -- must not
+    re-generate them. A fresh Planner call would produce a different spec and a
+    different suite, and the comparison "same spec, better harness" would silently
+    become "different spec, different harness", which measures nothing.
+
+    So the spec, the suite, its digest, its status and its trust flag are copied
+    byte for byte and the digest is re-derived from the copied text before any draw
+    is made. A ledger whose suite and digest disagree cannot be replayed at all:
+    which of the two gated the first probe is exactly the unknown that would make
+    the second one unreadable, so it refuses rather than picking one.
+
+    The two union-bearing specs are copied like the rest. They are the reason for
+    the sprint: replaying them under the prologue is the measurement.
+    """
+    tests = record.get("tests") or ""
+    claimed = record.get("tests_sha256") or ""
+    rehashed = agents_core.sha256_of(tests)
+    if rehashed != claimed:
+        raise SystemExit(
+            "REFUSING TO REPLAY %s: the source ledger's suite does not hash to "
+            "its own tests_sha256\n  recorded %s\n  rehashed %s\n  source %s"
+            % (record.get("task_id"), claimed or "(none)", rehashed,
+               source_path))
+    return {
+        "kind": KIND_PLAN,
+        "task_id": record.get("task_id"),
+        "candidate": "",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ok": True,
+        "spec": record.get("spec"),
+        "steps": record.get("steps"),
+        "tests": tests,
+        "tests_status": record.get("tests_status"),
+        "tests_trusted": bool(record.get("tests_trusted")),
+        "tests_sha256": claimed,
+        "planner_provider": record.get("planner_provider"),
+        # Recomputed rather than copied: the scanner postdates the source ledger,
+        # so copying the field would leave every replayed record unscanned. The
+        # scan is a pure function of the spec text that was copied, so this cannot
+        # disagree with what the source would have recorded had it had one.
+        "spec_runtime_syntax": agents_core.scan_runtime_syntax(
+            record.get("spec") or ""),
+        # Provenance. Without these three the new ledger would look like a run
+        # that planned 19 tasks itself, and the reused suite would be unauditable.
+        "replayed_from": source_path,
+        "replayed_at": record.get("at"),
+        "replayed_tests_sha256": claimed,
+        # Empty on purpose, and asserted elsewhere: a replayed plan makes no call,
+        # so there is no usage to account for and no reply to summarise.
+        "calls": [],
+        "replies": [],
+    }
+
+
+def replayable_plans(source_units):
+    """`task_id -> plan record` for the plans an earlier ledger can actually lend.
+
+    A plan record that failed, or that completed without a spec, is not a plan.
+    The first probe holds 36 plan records and only 19 specs -- the other 17 are the
+    per-day quota being hit -- so this returning fewer tasks than the lock is the
+    expected case, not a fault, and the caller skips those tasks rather than
+    planning them.
+    """
+    plans = {}
+    for key, record in (source_units or {}).items():
+        if key[0] != KIND_PLAN or not is_done(record):
+            continue
+        if not (record.get("spec") or "").strip():
+            continue
+        plans[record.get("task_id")] = record
+    return plans
 
 
 # ------------------------------------------------------------------ the summary
@@ -360,6 +501,17 @@ def summarise(units, candidates=CANDIDATES):
             "finish_reasons": finishes,
             "usage": usage,
         }
+    # Post hoc, over the records as they were already written -- no field was added
+    # to a draw to make this computable, and it therefore scores ledgers that
+    # predate it. The rule lives in `run_eval` because the same question is asked
+    # of A'@3's stored candidates there; two copies of it would drift.
+    #
+    # Here a task's draws are one per candidate, so "every draw" means every
+    # candidate agreed with the hidden suite and the visible gate rejected all of
+    # them. That is a statement about the suite, not about the three models.
+    summary["wrong_suite"] = run_eval.wrong_suite_report(
+        [record for key, record in units.items()
+         if key[0] == KIND_DRAW and key[2] in candidates])
     return summary
 
 
@@ -422,11 +574,16 @@ def draw_unit(task, plan_record, candidate, keys):
     try:
         with CaptureDetail() as detail:
             drawn = run_eval._draw(plan_record["spec"], keys)
+    except agents_core.DailyQuotaExhausted:
+        raise
     except Exception as exc:                                    # noqa: BLE001
         record["error"] = agents_core._redact(exc, keys)
         record["exc_class"] = type(exc).__name__
         record["status"] = getattr(exc, "status", None)
         record["calls"] = _calls_since(start)
+        # No code to keep: the call raised, so nothing was ever returned to
+        # extract from. The error, its class and its status are the diagnosis
+        # here, and they are already above.
         return record
     code = drawn["code"] or ""
     plan = {"tests": plan_record["tests"],
@@ -451,6 +608,19 @@ def draw_unit(task, plan_record, candidate, keys):
         "calls": _calls_since(start),
         "replies": [_reply_summary(reply) for reply in detail.replies],
     })
+    if not graded["passed"]:
+        # The code and the child's stderr, for failures only. `code_sha256` alone
+        # made the first probe's root cause unrecoverable: three candidates failed
+        # one task at *import* and the reason had to be inferred from spec text
+        # and a natural experiment, because the ledger had kept a hash of the
+        # thing that failed. A probe whose purpose is choosing a model has to be
+        # able to answer "why did this draw fail" from its own ledger. Only on
+        # failures, so a green run does not carry 57 programs it will never be
+        # asked about.
+        stderr, _capped = graded.get("grade_stderr") or ("", False)
+        record["failed_code"] = agents_core.clamp(code, MAX_KEPT_CODE_CHARS)
+        record["failed_stderr"] = stderr[-STDERR_TAIL_CHARS:]
+        record["failed_assertion"] = graded.get("grade_assertion", "")
     return record
 
 
@@ -492,6 +662,22 @@ def print_report(summary, total_units):
 
 def _print_notes(summary, total_units):
     """The ways this table can be misread, said out loud rather than left in JSON."""
+    wrong = summary.get("wrong_suite") or {}
+    if wrong.get("graded_draws"):
+        print("\nwrong-suite: %d/%d task(s) = %.1f%%  (trusted suite, every "
+              "graded draw passes the\n  hidden suite, gate approved none)%s"
+              % (wrong.get("count", 0), wrong.get("tasks_with_a_graded_draw", 0),
+                 wrong.get("rate_of_graded_tasks", 0.0),
+                 "" if not wrong.get("tasks")
+                 else "\n  " + ", ".join(wrong["tasks"])))
+    if wrong.get("count"):
+        print("  Three candidates agreeing with the hidden suite while the "
+              "visible suite rejects all\n  three is evidence about the SUITE. "
+              "The `gate` column undercounts by that much, and it\n  is not a "
+              "candidate's failure. Recorded and named, not repaired: the suite "
+              "is what the\n  gate's own error rate is measured from, so "
+              "loosening it here would erase the "
+              "measurement.")
     leaked = sorted(name for name, row in summary["candidates"].items()
                     if row["reasoning_leaked"])
     if leaked:
@@ -540,6 +726,12 @@ def _parse_args(argv):
     parser.add_argument("--report", action="store_true",
                         help="read the ledger and print the report; no calls, "
                              "no key needed")
+    parser.add_argument("--replay-plans", default=None, metavar="LEDGER",
+                        help="reuse the specs and suites already in LEDGER "
+                             "instead of calling the Planner. Zero Planner "
+                             "calls, no Gemini key, and the suite is carried "
+                             "over with its digest re-checked. Tasks with no "
+                             "spec in LEDGER are skipped, not planned.")
     parser.add_argument("--json", action="store_true",
                         help="print the summary as JSON as well")
     return parser.parse_args(argv)
@@ -562,6 +754,42 @@ def main(argv=None):
         os.makedirs(root)
     path = ledger_path(root)
     units, malformed = load_ledger(path)
+
+    replay_path, replay_plans = None, None
+    if args.replay_plans:
+        replay_path = os.path.abspath(args.replay_plans)
+        if os.path.abspath(path) == replay_path:
+            # Reading and appending to one file while resuming from it is a
+            # question about ordering nobody should have to answer. Refuse.
+            print("--replay-plans must name a DIFFERENT ledger than --out; %s "
+                  "is both" % replay_path, file=sys.stderr)
+            return 2
+        source_units, source_malformed = load_ledger(replay_path)
+        if not source_units:
+            print("no records to replay in %s" % replay_path, file=sys.stderr)
+            return 2
+        replay_plans = replayable_plans(source_units)
+        if source_malformed:
+            print("source ledger: %d incomplete line(s) ignored"
+                  % source_malformed)
+        # Named here, before anything runs, because a replay that silently
+        # skipped 17 of 36 tasks would produce a ledger whose task set differs
+        # from the lock's with nothing on the record saying why.
+        missing = [task.task_id for task in tasks
+                   if task.task_id not in replay_plans]
+        print("replaying plans from %s" % replay_path)
+        print("  %d task(s) have a stored spec; %d will be skipped%s"
+              % (len(tasks) - len(missing), len(missing),
+                 "" if not missing else ": " + ", ".join(missing)))
+        # The tasks that can be drawn are the ones with a spec. Skipped tasks are
+        # excluded from the denominator too, so "all units complete" means what it
+        # says instead of standing at 19/36 forever.
+        tasks = [task for task in tasks if task.task_id in replay_plans]
+        if not tasks:
+            print("nothing to replay: no stored spec matches the locked tasks",
+                  file=sys.stderr)
+            return 2
+
     total_units = {KIND_PLAN: len(tasks),
                    KIND_DRAW: len(tasks) * len(candidates)}
     if malformed:
@@ -596,13 +824,21 @@ def main(argv=None):
     print("ledger:      %s" % path)
     print("tasks:       %d (locked)" % len(tasks))
     print("candidates:  %s" % ", ".join(candidates))
-    print("spend:       %d plan unit(s) x 1-2 Gemini calls + %d Groq call(s)"
-          % (len([t for t in tasks
-                  if not is_done(units.get((KIND_PLAN, t.task_id, "")))]),
-             len([1 for t in tasks for c in candidates
-                  if not is_done(units.get((KIND_DRAW, t.task_id, c)))])))
-    print("             (1-2 because the Test Writer is called only when the "
-          "audit rejects\n              the plan's own TESTS block)")
+    if replay_plans is None:
+        print("spend:       %d plan unit(s) x 1-2 Gemini calls + %d Groq call(s)"
+              % (len([t for t in tasks
+                      if not is_done(units.get((KIND_PLAN, t.task_id, "")))]),
+                 len([1 for t in tasks for c in candidates
+                      if not is_done(units.get((KIND_DRAW, t.task_id, c)))])))
+        print("             (1-2 because the Test Writer is called only when the "
+              "audit rejects\n              the plan's own TESTS block)")
+    else:
+        print("spend:       0 Gemini calls (plans replayed) + %d Groq call(s)"
+              % len([1 for t in tasks for c in candidates
+                     if not is_done(units.get((KIND_DRAW, t.task_id, c)))]))
+        print("             (the Planner and the Test Writer are not called in "
+              "this mode; the\n              specs and suites come from the "
+              "source ledger)")
     print("pacing:      %s"
           % "  ".join("%s>=%gs" % (name, agents_core.PACER.interval_for(name))
                       for name in sorted(agents_core.PROVIDERS)))
@@ -616,8 +852,12 @@ def main(argv=None):
              json.dumps(agents_core.sampling_for("executor"), sort_keys=True)))
     print("measurement mode: on (no silent failover)\n")
 
-    keys = ask_keys(sorted({agents_core.ROLE_PROVIDER["planner"], "groq"}))
-    records = preflight(keys, candidates)
+    # A replay draws from Groq only, so it asks for the Groq key and nothing else.
+    providers = (["groq"] if replay_plans is not None
+                 else sorted({agents_core.ROLE_PROVIDER["planner"], "groq"}))
+    keys = ask_keys(providers)
+    records = preflight(keys, candidates,
+                        include_planner=replay_plans is None)
     for record in records:
         print("  %-4s %s -> %s/%s%s"
               % ("OK" if record["ok"] else "FAIL", "+".join(record["roles"]),
@@ -630,21 +870,58 @@ def main(argv=None):
             print("  %s" % line, file=sys.stderr)
         return 1
 
-    _run(tasks, candidates, keys, path, units)
+    aborted = None
+    try:
+        _run(tasks, candidates, keys, path, units,
+             replay_plans=replay_plans, replay_path=replay_path)
+    except agents_core.DailyQuotaExhausted as exc:
+        # Reported, not raised as a traceback: everything drawn so far is fsynced
+        # in the ledger and a resume will pick up exactly here, so the useful
+        # output is the summary plus the quota's name, not a stack.
+        aborted = exc
     summary = summarise(units, candidates)
     print_report(summary, total_units)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
+    if aborted is not None:
+        print("\nABORTED: %s" % aborted, file=sys.stderr)
+        print("Nothing above is lost -- re-run the same command once the quota "
+              "window has reset and it resumes from the ledger.", file=sys.stderr)
+        return 3
     return 0
 
 
-def _run(tasks, candidates, keys, path, units):
-    """Draw every outstanding unit, persisting each one as it completes."""
+def _run(tasks, candidates, keys, path, units, replay_plans=None,
+         replay_path=None):
+    """Draw every outstanding unit, persisting each one as it completes.
+
+    With `replay_plans` the plan step is a copy from another ledger rather than a
+    Planner call, and that is asserted rather than trusted: `planner_calls_since`
+    is checked after every plan step, before the draws that follow it. An assertion
+    that only ran at the end would fire after the Groq spend it was meant to
+    protect -- and the failure it guards against is exactly the silent one, a
+    refactor that reintroduces `make_plan` on some branch nobody re-reads.
+    """
+    calls_at_start = len(agents_core.CALL_LOG)
     for index, task in enumerate(tasks, 1):
         key = (KIND_PLAN, task.task_id, "")
         if is_done(units.get(key)):
             print("[%2d/%d] %-22s plan  resumed" % (index, len(tasks),
                                                     task.task_id))
+        elif replay_plans is not None:
+            source = replay_plans.get(task.task_id)
+            if source is None:
+                # Skipped, not planned. Planning it here would spend the Gemini
+                # call the mode exists to avoid, and would put a spec in this
+                # ledger that the source ledger's draws never answered.
+                print("[%2d/%d] %-22s plan  skipped: no spec in the source "
+                      "ledger" % (index, len(tasks), task.task_id))
+                continue
+            record = append(path, replayed_plan_unit(source, replay_path))
+            units[key] = record
+            print("[%2d/%d] %-22s plan  replayed %s suite %s"
+                  % (index, len(tasks), task.task_id, record["tests_status"],
+                     (record["tests_sha256"] or "")[:12]))
         else:
             record = append(path, plan_unit(task, keys))
             units[key] = record
@@ -652,6 +929,15 @@ def _run(tasks, candidates, keys, path, units):
                 index, len(tasks), task.task_id,
                 "%s suite" % record["tests_status"] if is_done(record)
                 else "FAILED %s" % record.get("exc_class")))
+        if replay_plans is not None:
+            leaked = planner_calls_since(calls_at_start)
+            if leaked:
+                raise SystemExit(
+                    "REFUSING TO CONTINUE: --replay-plans made %d Planner-side "
+                    "call(s) (%s). The specs would no longer be the ones the "
+                    "source ledger's draws answered."
+                    % (len(leaked),
+                       ", ".join(sorted(set(e.get("role") for e in leaked)))))
         plan_record = units.get(key)
         if not is_done(plan_record):
             print("        no plan, so no draws for this task")

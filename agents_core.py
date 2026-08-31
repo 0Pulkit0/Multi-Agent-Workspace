@@ -550,6 +550,29 @@ class ProviderError(Exception):
         self.retry_after = retry_after
 
 
+class DailyQuotaExhausted(Exception):
+    """A per-day quota is spent. Not retryable, and not one task's failure.
+
+    Deliberately **not** a `ProviderError`. Every `except ProviderError` in this
+    codebase means "this call failed, record it and carry on", which is the right
+    posture for a 404 or a per-minute 429 and exactly the wrong one here: the
+    counter resets on the provider's daily boundary, so carrying on spends the
+    rest of the run's requests against a wall. The pin probe did that -- 17 units
+    at 5 attempts each, 85 requests and nine minutes of backoff sleep against a
+    20-request ceiling. Not being a `ProviderError` is what makes the abort
+    reach the runner instead of being absorbed one unit at a time.
+    """
+
+    def __init__(self, message, quota_id="", model="", provider="", role="",
+                 retry_after=None):
+        Exception.__init__(self, message)
+        self.quota_id = quota_id or ""
+        self.model = model or ""
+        self.provider = provider or ""
+        self.role = role or ""
+        self.retry_after = retry_after
+
+
 def _status_of(exc):
     """The HTTP status on an SDK exception, or None.
 
@@ -777,31 +800,55 @@ PREFLIGHT_USER = "1"
 PREFLIGHT_PARAMS = {"max_tokens": 1, "temperature": 0.0}
 
 
-def preflight_pair(provider, model, api_key, call=None):
+def preflight_params(params=None):
+    """What one preflight call sends: the role's own parameters under a cheap floor.
+
+    The role's parameters first, `PREFLIGHT_PARAMS` last, so `max_tokens=1` and
+    `temperature=0` always win and a preflight cannot become expensive because a
+    role was configured with a large budget. Everything else the role would send
+    survives -- which is the point: `reasoning_format` is a provider extension
+    that a provider is entitled to reject with a 400, and a preflight that omitted
+    it would validate a call shape the run never makes.
+    """
+    sent = dict(params or {})
+    sent.update(PREFLIGHT_PARAMS)
+    return sent
+
+
+def preflight_pair(provider, model, api_key, call=None, params=None):
     """Validate one ``(provider, model)`` pair with one cheap call.
 
     Returns ``(ok, status, detail)``. Any exception is a failure: this runs
     before anything has been spent, so the useful bias is to refuse.
 
-    ``call`` takes ``(provider, api_key, model, system, user)`` -- the model
-    explicitly, not a role, because a preflight validates a *pair* and an offline
-    stand-in has to be able to check the exact slug that would go on the wire.
+    ``call`` takes ``(provider, api_key, model, system, user, params)`` -- the
+    model explicitly, not a role, because a preflight validates a *pair* and an
+    offline stand-in has to be able to check the exact slug that would go on the
+    wire; and the resolved parameters explicitly, because the pair is only half of
+    what a call can be rejected for. `params` is the merged dict, and the default
+    implementation splits it into keyword arguments and `extra_body` exactly as
+    `call_model_detailed` does, so what is validated is the call shape the run
+    will actually send.
     """
+    sent = preflight_params(params)
     if call is None:
-        def call(provider_name, key, slug, system, user):
+        def call(provider_name, key, slug, system, user, sent_params):
             from openai import OpenAI
 
             client = OpenAI(api_key=key,
                             base_url=PROVIDERS[provider_name]["base_url"],
                             timeout=30)
+            keywords, extra = split_params(sent_params)
+            if extra:
+                keywords["extra_body"] = extra
             resp = client.chat.completions.create(
                 model=slug,
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}],
-                **PREFLIGHT_PARAMS)
+                **keywords)
             return (resp.choices[0].message.content or "")
     try:
-        call(provider, api_key, model, PREFLIGHT_SYSTEM, PREFLIGHT_USER)
+        call(provider, api_key, model, PREFLIGHT_SYSTEM, PREFLIGHT_USER, sent)
     except Exception as exc:
         return False, _status_of(exc), _redact(exc, {provider: api_key})
     return True, None, ""
@@ -819,6 +866,11 @@ def preflight(keys, roles=None, call=None):
 
     A missing key is a failure here rather than a skip. A run that cannot call a
     role is not a run, and discovering that at task 1 of 144 is the whole point.
+
+    Each pair is validated with the parameters its own roles will send. Where two
+    roles share a pair -- `planner` and `test_writer` today -- their parameter sets
+    are merged in role order, which is exact whenever they agree and is why a
+    disagreement would show up here as a 400 rather than at task 1.
     """
     records = []
     for provider, model, role_names in resolved_pairs(roles):
@@ -828,7 +880,11 @@ def preflight(keys, roles=None, call=None):
                             "model": model, "ok": False, "status": None,
                             "detail": "no API key for provider %r" % provider})
             continue
-        ok, status, detail = preflight_pair(provider, model, key, call=call)
+        params = {}
+        for role in role_names:
+            params.update(sampling_for(role))
+        ok, status, detail = preflight_pair(provider, model, key, call=call,
+                                            params=params)
         records.append({"roles": role_names, "provider": provider,
                         "model": model, "ok": ok, "status": status,
                         "detail": detail})
@@ -905,6 +961,70 @@ def is_retryable_status(status):
     if status == RETRY_STATUS:
         return True
     return status >= RETRY_STATUS_FLOOR
+
+
+# A 429 says "wait"; it does not say "wait until tomorrow". Google's body does,
+# in a `QuotaFailure` violation, and that string is the only place the window
+# appears -- the status is 429 either way. Parsed out of the message text rather
+# than off a typed SDK object for the same reason `_status_of` is: this module and
+# both offline suites have to load without the SDK installed.
+DAILY_QUOTA_MARK = "perday"
+_QUOTA_ID = re.compile(r"""['"]?quotaId['"]?\s*[:=]\s*['"]([^'"]+)['"]""")
+_RETRY_DELAY = re.compile(
+    r"""['"]?retryDelay['"]?\s*[:=]\s*['"]?(\d+(?:\.\d+)?)\s*s""")
+
+
+def quota_id_of(message):
+    """The provider's own ``quotaId`` out of a 429 body, or ``""``."""
+    found = _QUOTA_ID.search(message or "")
+    return found.group(1) if found else ""
+
+
+def retry_delay_of(message):
+    """The body's ``retryDelay`` in seconds, or None. Not the header.
+
+    `_retry_after_of` reads the header and clamps it to what we are willing to
+    sleep. This one is unclamped on purpose: it is being used to decide whether
+    the wait is longer than the whole retry budget, and clamping it first would
+    hide exactly the case it is asked about.
+    """
+    found = _RETRY_DELAY.search(message or "")
+    if not found:
+        return None
+    try:
+        return float(found.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def daily_quota_violation(message, remaining_seconds=None):
+    """``(quota_id, why)`` when a 429 body says a *per-day* quota is spent.
+
+    ``("", "")`` otherwise, which includes every per-minute limit -- that layer
+    works, the run should sleep and continue, and nothing here changes it.
+
+    Two rules, in order:
+
+    1. The `quotaId` names the window. `...PerDayPerProjectPerModel...` is a day.
+       If a `quotaId` is present and does **not** say per-day, it is believed: the
+       provider named its own window and a per-minute limit must keep retrying.
+    2. With no `quotaId` at all, fall back to `RESOURCE_EXHAUSTED` plus a
+       `retryDelay` longer than the backoff budget that is left. A wait we cannot
+       outlast is not a wait, whatever the counter behind it is called.
+    """
+    text = message or ""
+    quota_id = quota_id_of(text)
+    if quota_id:
+        if DAILY_QUOTA_MARK in quota_id.replace("-", "").replace("_", "").lower():
+            return quota_id, "quotaId names a per-day quota"
+        return "", ""
+    if "RESOURCE_EXHAUSTED" not in text:
+        return "", ""
+    delay = retry_delay_of(text)
+    if delay is None or remaining_seconds is None or delay <= remaining_seconds:
+        return "", ""
+    return "", ("RESOURCE_EXHAUSTED and a retryDelay of %gs, longer than the "
+                "%.1fs of retry budget left" % (delay, remaining_seconds))
 
 
 def backoff_schedule(run_id, attempts=MAX_PROVIDER_ATTEMPTS):
@@ -1503,6 +1623,33 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
             record["error"] = _redact(exc, keys)
             record["status"] = exc.status
             record["exc_class"] = exc.exc_class
+            # The body is the only place the quota's name appears and it was
+            # being dropped, so the last exhaustion had to be diagnosed from a
+            # raw error string pasted into a report. Read off the *redacted*
+            # message, so this cannot become a second path a key travels on.
+            quota_id = quota_id_of(record["error"])
+            if quota_id:
+                record["quota_id"] = quota_id
+            if exc.status == RETRY_STATUS:
+                # What is left to sleep if we did keep retrying: the schedule
+                # from here to the last attempt, which never sleeps after itself.
+                remaining = sum(delays[attempt:max(attempt, attempts - 1)])
+                named, why = daily_quota_violation(record["error"], remaining)
+                if why:
+                    record["quota_daily"] = True
+                    record["quota_id"] = named or quota_id
+                    _emit_call_event(record)
+                    raise DailyQuotaExhausted(
+                        "per-day quota exhausted on %s/%s for %s%s: %s. Not "
+                        "retried -- the counter resets on the provider's daily "
+                        "boundary, not after a backoff, so every further attempt "
+                        "spends a request against a wall. Re-run when it has "
+                        "reset." % (provider, record["model"], role,
+                                    " (quota %s)" % record["quota_id"]
+                                    if record["quota_id"] else "", why),
+                        quota_id=record["quota_id"], model=record["model"],
+                        provider=provider, role=role,
+                        retry_after=getattr(exc, "retry_after", None))
             if not is_retryable_status(exc.status) or attempt == attempts - 1:
                 break
             # The server's own number wins when it sent one; ours is a guess and
@@ -1565,6 +1712,30 @@ _INTERFACE_RULE = (
     "step, never the tests. If the SPEC does not pin the interface, the "
     "Executor and the tests will disagree on names and every run will fail on "
     "import.\n"
+    "Annotate those signatures with 3.9-legal syntax or omit the annotations "
+    "entirely -- the names are what must be pinned, and a 3.10-only annotation "
+    "in the SPEC causes the same import failure this rule exists to prevent.\n"
+)
+
+# The runtime the child interpreter actually is. Stated because it was stated
+# nowhere: the Planner wrote PEP 604 unions into specs, Executors copied them or
+# invented them unprompted, and six of 57 pin-probe draws died at import on a
+# language version rather than on the task. Shared by every prompt that asks for
+# code, including the repair rungs, which reuse `PROMPTS["executor"]`.
+#
+# This is the instruction half of the fix and model compliance with it is
+# unmeasured by construction; `harness._SOURCE_PROLOGUE` is the half that does
+# not depend on a model obeying anything. Neither one covers `match` or a runtime
+# `isinstance(x, int | str)`, which is why both clauses below are spelled out.
+_RUNTIME_RULE = (
+    "RUNTIME: the code runs on CPython 3.9. Anything newer is a syntax or "
+    "runtime error, not a style choice.\n"
+    "- No PEP 604 unions: `int | None` is 3.10+. It fails at `def` time as a "
+    "TypeError in an annotation, and at call time in `isinstance(x, int | str)`. "
+    "Use `typing.Optional[int]` / `typing.Union[int, str]`, or no annotation.\n"
+    "- No `match`/`case` statements.\n"
+    "- No 3.10+ standard library additions.\n"
+    "- `list[int]`, `dict[str, int]` and `tuple[int, ...]` are fine (3.9, PEP 585).\n"
 )
 
 PROMPTS = {
@@ -1584,6 +1755,7 @@ PROMPTS = {
         "- Every step's program must expose the full interface named in the "
         "SPEC, because the same acceptance suite is run against each step.\n\n"
         + _TEST_RULES +
+        "\n" + _RUNTIME_RULE +
         "\nOutput format, with all three headers present:\n"
         "SPEC: <one paragraph, naming the exact functions and signatures>\n"
         "STEPS:\n1. ...\n2. ...\n"
@@ -1594,6 +1766,7 @@ PROMPTS = {
         "rejected previous attempt at an acceptance suite. Produce a suite "
         "that genuinely verifies the spec.\n\n"
         + _TEST_RULES +
+        "\n" + _RUNTIME_RULE +
         "\nOutput ONLY the ```python block. No prose, no headers.\n"
     ),
     "executor": (
@@ -1612,9 +1785,120 @@ PROMPTS = {
         # Taken from the harness rather than restated, so the prompt cannot
         # promise a limit the sandbox does not enforce or omit one it does.
         + harness._SANDBOX_RULES + "\n\n"
+        + _RUNTIME_RULE + "\n"
         "Do not ask questions. Do not explain at length. Produce the program."
     ),
 }
+
+
+UNION_FLAG = "pep604-union"
+MATCH_FLAG = "match-statement"
+RUNTIME_SYNTAX_KINDS = (UNION_FLAG, MATCH_FLAG)
+
+# Base names on both sides of a `|` before it counts as a PEP 604 union. Prose
+# contains bare pipes -- tables, alternatives, shell snippets -- and a set
+# expression `a | b` is legal 3.9. Requiring a type name on each side is what
+# separates `int | None` from both of those without needing to parse the spec.
+_TYPE_NAMES = frozenset((
+    "int", "float", "complex", "bool", "str", "bytes", "bytearray",
+    "list", "tuple", "dict", "set", "frozenset", "range",
+    "None", "NoneType", "object", "type", "callable",
+    # typing spellings, which are 3.9-legal on their own but not either side of
+    # a `|`: `Optional[int] | str` is still a 3.10 construct.
+    "Any", "Optional", "Union", "List", "Tuple", "Dict", "Set", "FrozenSet",
+    "Sequence", "Mapping", "MutableMapping", "Iterable", "Iterator",
+    "Callable", "Literal",
+))
+
+# One level of subscript, so `list[int] | None` and `dict[str, int] | None` are
+# seen. Nested past one level is not, and that is a stated limit rather than a
+# claim of completeness -- the inner `int | float` of
+# `dict[str, int | float | None]` is what this catches there, which is enough to
+# flag the spec.
+_ATOM = r"[A-Za-z_][\w.]*(?:\[[^\[\]]*\])?"
+_UNION_PAIR = re.compile(r"(%s)[ \t]*\|[ \t]*(%s)" % (_ATOM, _ATOM))
+_MATCH_LINE = re.compile(r"(?m)^[ \t`]*match[ \t]+(?P<subject>[^\n:]+?)[ \t]*:")
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+
+
+def _base_name(atom):
+    """`dict[str, int]` -> `dict`. The subscript is 3.9-legal; the base decides."""
+    return atom.split("[", 1)[0].strip()
+
+
+def _is_expression_like(text):
+    """Whether `match X:`'s X reads as an expression rather than as prose.
+
+    `match len(values):` is a statement. "match numbers to names:" is a
+    sentence that happens to start with the soft keyword. The distinguishing
+    property available without a parser is whitespace outside brackets.
+    """
+    if not text:
+        return False
+    if not (text[0].isalpha() or text[0] in "_(["):
+        return False
+    depth = 0
+    for char in text:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char.isspace() and depth <= 0:
+            return False
+    return True
+
+
+def scan_runtime_syntax(text):
+    """3.10-only Python syntax found in ``text``. Report-only, never a gate.
+
+    A pure function over a string: it costs nothing, has no side effects, and
+    can be run over a ledger that was written months ago, which is the point.
+    It never rejects a spec and never triggers regeneration -- rejection was
+    considered as the fix for the PEP 604 artifact and deliberately not adopted,
+    because a rejected spec is a re-planned spec and Planner calls are the
+    binding constraint. `harness._SOURCE_PROLOGUE` is what actually removes the
+    failure mode; this only measures how often the Planner needed it.
+
+    Returns a list of ``{"kind", "snippet"}`` dicts, JSON-ready, empty when
+    clean. `kind` is one of `RUNTIME_SYNTAX_KINDS`.
+
+    Deliberately a heuristic over prose, not a parse: a spec is not a Python
+    file. It answers "did the Planner write 3.10 syntax into the interface it is
+    pinning", and it cannot see syntax an Executor invents on its own -- that is
+    the majority case and only the harness prologue covers it.
+    """
+    text = text or ""
+    found = []
+    for match in _UNION_PAIR.finditer(text):
+        left, right = match.group(1), match.group(2)
+        if _base_name(left) in _TYPE_NAMES and _base_name(right) in _TYPE_NAMES:
+            found.append({"kind": UNION_FLAG, "snippet": match.group(0).strip()})
+
+    # Line-anchored, plus the backticked spans hoisted onto lines of their own so
+    # an inline `match x:` inside a sentence is still seen.
+    seen = set()
+    hoisted = "\n".join(_BACKTICKED.findall(text))
+    for candidate in (text, hoisted):
+        for match in _MATCH_LINE.finditer(candidate):
+            subject = match.group("subject")
+            snippet = "match %s:" % subject.strip()
+            if _is_expression_like(subject.strip()) and snippet not in seen:
+                seen.add(snippet)
+                found.append({"kind": MATCH_FLAG, "snippet": snippet})
+    return found
+
+
+def runtime_syntax_note(found):
+    """One line for a human, or "" when the scan was clean."""
+    if not found:
+        return ""
+    kinds = []
+    for flag in found:
+        if flag["kind"] not in kinds:
+            kinds.append(flag["kind"])
+    return "3.10-only syntax in the spec (%s): %s" % (
+        ", ".join(kinds),
+        "; ".join(flag["snippet"] for flag in found[:4]))
 
 
 def clamp(text, limit):
@@ -1829,6 +2113,10 @@ class RunResult:
     steps: List[StepResult] = field(default_factory=list)
     deliverable: str = ""
 
+    # Report-only flags from `scan_runtime_syntax(spec)`. Empty means the scan
+    # was clean, which is a measurement and not an assumption.
+    spec_runtime_syntax: List[dict] = field(default_factory=list)
+
     @property
     def verified_count(self):
         return sum(1 for step in self.steps if step.verified)
@@ -1926,6 +2214,13 @@ def _run_workspace(user_prompt, keys, mode, stages, memory, on_event,
     emit("planner", plan)
     run.plan = plan
     run.spec = extract_spec(plan)
+    # Report-only. Recorded, said once in the transcript, and it changes nothing
+    # about what runs next -- see `scan_runtime_syntax` for why rejecting was not
+    # chosen.
+    run.spec_runtime_syntax = scan_runtime_syntax(run.spec)
+    if run.spec_runtime_syntax:
+        emit("system", runtime_syntax_note(run.spec_runtime_syntax)
+             + " -- recorded, not rejected; the harness neutralises annotations")
     steps = extract_steps(plan) or [user_prompt]
     if len(steps) == 1 and steps[0] == user_prompt:
         emit("system", "No numbered steps found in the plan; treating the "

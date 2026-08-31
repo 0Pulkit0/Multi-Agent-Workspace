@@ -779,5 +779,25 @@ def main(argv=None):
     return 0 if verdict["go"] else 1
 
 
+def cli(argv=None):
+    """`main`, plus the one failure that is not a per-cell outcome.
+
+    A per-day quota is a fact about the day. `run_one` re-raises it rather than
+    scoring it as `infra_loss`, so it arrives here, and here it is a message and
+    an exit code instead of a traceback. Every cell that completed is already
+    written to disk by `save_record`, so a re-run after the window resets resumes
+    from them; the summary is deliberately not written, because the sweep did not
+    finish and a summary over a truncated grid is the thing nobody should find
+    later and mistake for a result.
+    """
+    try:
+        return main(argv)
+    except agents_core.DailyQuotaExhausted as exc:
+        print("\nABORTED: %s" % exc, file=sys.stderr)
+        print("Completed cells are on disk. Re-run the same command once the "
+              "quota window has reset and it resumes from them.", file=sys.stderr)
+        return 3
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

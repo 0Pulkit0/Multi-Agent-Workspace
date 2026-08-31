@@ -1915,6 +1915,206 @@ def test_the_no_gate_rate_is_a_first_class_diagnostic_before_the_grid():
           and "attenuates the blind gate-loss term" not in quiet, quiet[:400])
 
 
+def test_the_no_approval_rate_is_surfaced_beside_the_no_gate_rate():
+    """Two fallbacks to draw 1, two causes, and only one of them was ever printed.
+
+    `SELECTION_NO_GATE` and `SELECTION_NO_APPROVAL` both return draw 1 by position
+    and both attenuate the blind gate-loss term, so a report that surfaces the
+    first and not the second reads as full gate availability on a run where the
+    gate rejected every draw it saw. The rate is asserted in the JSON *and* in the
+    printed block, because the printed block is what gets read before the grid.
+    """
+    run_eval = _import_run_eval()
+    records = []
+    for task_id, status, trusted, selection in (
+            ("task-01", "generated", True, run_eval.SELECTION_GATE_WIN),
+            ("task-02", "unusable", False, run_eval.SELECTION_NO_GATE),
+            ("task-03", "generated", True, run_eval.SELECTION_NO_APPROVAL),
+            ("task-04", "generated", True, run_eval.SELECTION_NO_APPROVAL)):
+        for arm in ("a_prime", "a_prime3", "b"):
+            records.append(_summary_record(
+                arm, trusted, task_id=task_id, status=status,
+                selection=selection if arm == "a_prime3" else None))
+    gate = run_eval.summarise(records)["gate_availability"]
+    check("the no-approval rate is over the same A'@3 denominator as no-gate",
+          (gate["selection_no_approval"], gate["a_prime3_cells"]) == (2, 4)
+          and abs(gate["selection_no_approval_rate"] - 50.0) < 1e-9,
+          (gate["selection_no_approval"], gate["a_prime3_cells"],
+           gate["selection_no_approval_rate"]))
+    check("and it names its tasks, the way the no-gate rate does",
+          gate["selection_no_approval_task_ids"] == ["task-03", "task-04"],
+          gate["selection_no_approval_task_ids"])
+    check("the two fallbacks are counted separately, not pooled",
+          gate["selection_no_gate_task_ids"] == ["task-02"],
+          gate["selection_no_gate_task_ids"])
+
+    text = _summary_text(records)
+    lines = text.splitlines()
+    no_gate_line = next(index for index, line in enumerate(lines)
+                        if "SELECTION_NO_GATE:" in line)
+    no_approval_line = next(index for index, line in enumerate(lines)
+                            if "SELECTION_NO_APPROVAL:" in line)
+    check("it prints in the same block, immediately under the no-gate line",
+          no_approval_line == no_gate_line + 1,
+          (no_gate_line, no_approval_line))
+    check("the printed rate matches the computed one",
+          "SELECTION_NO_APPROVAL: 2/4 = 50.0%" in text, text[:800])
+    check("and the block explains that a rejected-everything gate is not the "
+          "same event as an absent one",
+          "indistinguishable from three" in text, text[-900:])
+
+    quiet = _summary_text([
+        _summary_record("a_prime3", True, task_id="task-01", status="generated",
+                        selection=run_eval.SELECTION_GATE_WIN)])
+    check("the no-approval line prints when it is zero, for the same reason the "
+          "no-gate line does",
+          "SELECTION_NO_APPROVAL: 0/1 = 0.0%" in quiet
+          and "indistinguishable from three" not in quiet, quiet[:600])
+
+
+def _draw_row(task_id, trusted, passed, gate_approved, **extra):
+    """One draw-level row in the shape both ledgers already store."""
+    row = {"task_id": task_id, "tests_trusted": trusted, "passed": passed,
+           "gate_approved": gate_approved}
+    row.update(extra)
+    return row
+
+
+def test_a_suite_that_rejects_every_hidden_pass_is_counted_as_a_wrong_suite():
+    """The post-hoc separator between "the models were bad" and "the suite was wrong".
+
+    A trustworthy suite that rejects draws the hidden suite accepts is testing
+    something the task never asked for. `grouping-02` is the worked example -- three
+    candidates, three hidden passes, three gate rejections, all from `==` on a
+    float mean -- and without this count it is indistinguishable in the summary
+    from a task where three models genuinely failed.
+
+    Report-only by construction: the rule is a pure function over rows that were
+    already being written, so it scores ledgers that predate it and adds nothing
+    to the arm. What it must NOT do is fire on an untrusted suite, where there was
+    no gate to be wrong, or on a task whose draws actually failed.
+    """
+    run_eval = _import_run_eval()
+    fires = [_draw_row("grouping-02", True, True, False) for _ in range(3)]
+    check("it fires when a trusted suite rejects three hidden passes",
+          run_eval.wrong_suite_tasks(fires) == ["grouping-02"],
+          run_eval.wrong_suite_tasks(fires))
+    check("an untrusted suite is not a wrong suite -- there was no gate to be "
+          "wrong",
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", False, True, False) for _ in range(3)]) == [],
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", False, True, False) for _ in range(3)]))
+    check("a task whose draws fail the hidden suite is a model failure, not a "
+          "suite failure",
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", True, False, False)] * 3) == [], "fired")
+    check("one gate approval anywhere clears the suite",
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", True, True, False),
+               _draw_row("t", True, True, True)]) == [], "fired")
+    check("a single mixed draw is enough to withhold the flag",
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", True, True, False),
+               _draw_row("t", True, False, False)]) == [], "fired")
+    check("an ungraded draw is skipped rather than read as a failure to pass",
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", True, True, False),
+               {"task_id": "t", "ok": False}]) == ["t"],
+          run_eval.wrong_suite_tasks(
+              [_draw_row("t", True, True, False),
+               {"task_id": "t", "ok": False}]))
+    check("a task with no graded draw at all cannot be flagged",
+          run_eval.wrong_suite_tasks([{"task_id": "t", "ok": False}]) == [],
+          "fired")
+
+    mixed = fires + [_draw_row("aggregation-01", True, False, False)] * 3
+    report = run_eval.wrong_suite_report(mixed)
+    check("the report carries the denominators the count has to be read against",
+          (report["count"], report["tasks_with_a_graded_draw"],
+           report["graded_draws"]) == (1, 2, 6)
+          and abs(report["rate_of_graded_tasks"] - 50.0) < 1e-9, report)
+    check("and it names the flagged task", report["tasks"] == ["grouping-02"],
+          report["tasks"])
+
+
+def _pin_report_text(summary, total_units):
+    pin = _import_pin_executor()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        pin.print_report(summary, total_units)
+    return out.getvalue()
+
+
+def test_the_wrong_suite_count_runs_over_an_already_written_ledger():
+    """It has to score today's probe, which was written before it existed.
+
+    So: no new field on a draw, and the ledger's own records are the input. The
+    synthetic ledger below is written to disk and read back through
+    `pin.load_ledger` rather than passed in as dicts, because "runs over an
+    existing ledger" is the requirement and an in-memory list would not test it.
+    The live ledger is then scored too, read-only, when it is present.
+
+    The two zero-cases are distinguished in the printed line: "no task had a wrong
+    suite" and "nothing has been graded yet" are the same `0` and mean opposite
+    things.
+    """
+    pin = _import_pin_executor()
+    root = tempfile.mkdtemp(prefix="pin-wrong-suite-")
+    path = pin.ledger_path(root)
+    for task_id, passed in (("wrong-01", True), ("weak-01", False)):
+        for candidate in pin.CANDIDATES:
+            pin.append(path, {"kind": pin.KIND_DRAW, "task_id": task_id,
+                              "candidate": candidate, "ok": True,
+                              "tests_trusted": True, "tests_status": "generated",
+                              "passed": passed, "gate_approved": False})
+    for candidate in pin.CANDIDATES:
+        pin.append(path, {"kind": pin.KIND_DRAW, "task_id": "untrusted-01",
+                          "candidate": candidate, "ok": True,
+                          "tests_trusted": False, "tests_status": "unusable",
+                          "passed": True, "gate_approved": False})
+    units, malformed = pin.load_ledger(path)
+    wrong = pin.summarise(units)["wrong_suite"]
+    check("a ledger on disk is scored without being re-run or re-graded",
+          malformed == 0 and wrong["graded_draws"] == 9
+          and wrong["tasks_with_a_graded_draw"] == 3, (malformed, wrong))
+    check("the all-pass gate-rejected task is the only one flagged",
+          wrong["tasks"] == ["wrong-01"], wrong["tasks"])
+
+    text = _pin_report_text(pin.summarise(units),
+                            {pin.KIND_PLAN: 3, pin.KIND_DRAW: 9})
+    check("the count is printed, not left in the JSON",
+          "wrong-suite: 1/3" in text and "wrong-01" in text, text[-1200:])
+    check("the printed note says the suite is the thing at fault",
+          "evidence about the SUITE" in text, text[-1200:])
+
+    empty = pin.summarise({})
+    check("an unscored ledger says so instead of printing a clean zero",
+          empty["wrong_suite"]["graded_draws"] == 0
+          and empty["wrong_suite"]["count"] == 0, empty["wrong_suite"])
+    quiet = _pin_report_text(empty, {pin.KIND_PLAN: 0, pin.KIND_DRAW: 0})
+    check("and the note about the suite is silent when nothing was flagged",
+          "evidence about the SUITE" not in quiet
+          and "wrong-suite:" not in quiet, quiet[-600:])
+
+    live = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval",
+                        "results", "pin-executor", "ledger.jsonl")
+    if not os.path.exists(live):
+        check("today's probe is not on this checkout, so the synthetic ledger "
+              "above is the whole check", True)
+        return
+    units, _malformed = pin.load_ledger(live)
+    wrong = pin.summarise(units)["wrong_suite"]
+    check("today's probe scores as it stands, with nothing written back to it",
+          wrong["graded_draws"] == 57
+          and wrong["tasks_with_a_graded_draw"] == 19,
+          wrong)
+    check("grouping-02 is the task it finds in the live ledger",
+          wrong["tasks"] == ["grouping-02"], wrong["tasks"])
+    check("and aggregation-01 is not, because those three draws really did fail "
+          "the hidden suite",
+          "aggregation-01" not in wrong["tasks"], wrong["tasks"])
+
+
 # --------------------- sprint 6, task 1: surviving rate limits honestly
 
 class _Waits(object):
@@ -5614,7 +5814,8 @@ def _pin_harness(pin, counter, fail_on=None):
             pin.ask_keys, agents_core.MEASUREMENT_MODE, agents_core.PACER,
             dict(agents_core.ROLE_MODEL), dict(agents_core.ROLE_PARAMS))
     agents_core.call_model_detailed = _pin_stub(counter, fail_on)
-    agents_core.preflight_pair = lambda p, m, k, call=None: (True, None, "")
+    agents_core.preflight_pair = (
+        lambda p, m, k, call=None, params=None: (True, None, ""))
     pin.ask_keys = lambda providers, reader=None: dict(
         (name, "k" * 12) for name in providers)
 
@@ -5794,7 +5995,7 @@ def test_the_probe_refuses_a_dead_candidate_before_it_generates():
     agents_core.set_pacing(True, sleep=lambda seconds: None)
     try:
         dead = pin.CANDIDATES[1]
-        agents_core.preflight_pair = lambda p, m, k, call=None: (
+        agents_core.preflight_pair = lambda p, m, k, call=None, params=None: (
             (False, 404, "model_not_found: %s" % m) if m == dead
             else (True, None, ""))
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -5828,6 +6029,267 @@ def test_the_probe_refuses_a_dead_candidate_before_it_generates():
     finally:
         restore()
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_preflight_validates_the_parameters_the_role_will_actually_send():
+    """A pair is not the only thing one call can be rejected for.
+
+    `reasoning_format="hidden"` is a Groq extension, it rides in `extra_body`, and
+    it is on every Executor call this probe makes -- it is the reason the probe has
+    its present shape at all. A preflight that sent only the slug asked "does this
+    pair answer" when the question is "does this pair answer the call this run
+    sends", so a 400 on the extension would have arrived at unit 1 with the
+    preflight already green. Moving that failure earlier is the entire job of a
+    preflight.
+
+    The floor still wins: `max_tokens=1` and `temperature=0` are applied last, so
+    validating the real shape cannot make the validation expensive.
+    """
+    pin = _import_pin_executor()
+    sent = agents_core.preflight_params(
+        {"reasoning_format": "hidden", "temperature": 0.7, "top_p": 0.95,
+         "max_tokens": 4096})
+    check("the role's own parameters reach the preflight call",
+          sent.get("reasoning_format") == "hidden" and sent.get("top_p") == 0.95,
+          sent)
+    check("under a cheap floor, so a role configured with a large budget cannot "
+          "make a preflight expensive",
+          (sent["max_tokens"], sent["temperature"]) == (1, 0.0), sent)
+    check("and PREFLIGHT_PARAMS is not mutated by having been merged into",
+          agents_core.PREFLIGHT_PARAMS == {"max_tokens": 1, "temperature": 0.0},
+          agents_core.PREFLIGHT_PARAMS)
+    check("no params is the old behaviour exactly, so a caller that has none to "
+          "give sends the floor and nothing else",
+          agents_core.preflight_params() == agents_core.PREFLIGHT_PARAMS
+          and agents_core.preflight_params() is not agents_core.PREFLIGHT_PARAMS,
+          agents_core.preflight_params())
+
+    seen = []
+
+    def capture(provider, key, slug, system, user, params):
+        seen.append({"provider": provider, "model": slug, "params": params})
+        return "1"
+
+    ok, status, detail = agents_core.preflight_pair(
+        "groq", "some-slug", "k" * 12, call=capture,
+        params={"reasoning_format": "hidden", "temperature": 0.7})
+    check("the seam is handed the resolved parameters, not just the pair",
+          (ok, status, detail) == (True, None, "") and len(seen) == 1
+          and seen[0]["params"] == {"reasoning_format": "hidden",
+                                    "max_tokens": 1, "temperature": 0.0}, seen)
+    check("and the extension splits into extra_body rather than into a keyword "
+          "argument, which is the shape a real call sends",
+          agents_core.split_params(seen[0]["params"])
+          == ({"max_tokens": 1, "temperature": 0.0},
+              {"reasoning_format": "hidden"}),
+          agents_core.split_params(seen[0]["params"]))
+
+    held = (dict(agents_core.ROLE_MODEL), dict(agents_core.ROLE_PARAMS))
+    try:
+        pin.configure(pin.CANDIDATES[0])
+        planner_provider = agents_core.ROLE_PROVIDER["planner"]
+        keys = {planner_provider: "k" * 12, "groq": "k" * 12}
+        del seen[:]
+        records = agents_core.preflight(
+            keys, roles=("planner", "test_writer", "executor"), call=capture)
+        by_model = dict((entry["model"], entry["params"]) for entry in seen)
+        check("every pair a run would call is validated with its own roles' "
+              "parameters",
+              [record["ok"] for record in records] == [True] * len(records)
+              and len(by_model) == len(records), (records, seen))
+        check("the Executor's pair carries reasoning_format, because the "
+              "Executor's calls do",
+              by_model.get(pin.CANDIDATES[0], {}).get("reasoning_format")
+              == "hidden", by_model)
+        check("the Planner's pair does not, because the Planner's calls do not "
+              "-- a preflight sends what its own roles send and nothing more",
+              "reasoning_format" not in by_model.get(
+                  agents_core.model_for("planner"), {}), by_model)
+
+        del seen[:]
+        records = pin.preflight(keys, call=capture)
+        by_model = dict((entry["model"], entry["params"]) for entry in seen)
+        check("the probe's own preflight sends the Executor's parameters too, "
+              "so a candidate is never called reachable on a shape no draw uses",
+              [record["ok"] for record in records] == [True] * len(records)
+              and all(by_model[slug].get("reasoning_format") == "hidden"
+                      for slug in pin.CANDIDATES), by_model)
+        check("with the floor still applied per pair",
+              all((by_model[slug]["max_tokens"], by_model[slug]["temperature"])
+                  == (1, 0.0) for slug in by_model), by_model)
+
+        run_eval = _import_run_eval()
+        stub = run_eval.StubModel(live_models=[agents_core.model_for("planner")])
+        check("and the stub that stands in for a provider offline takes the "
+              "parameters as well, so --stub and --bad-slug exercise the same "
+              "signature a live preflight does",
+              stub.probe(planner_provider, None,
+                         agents_core.model_for("planner"),
+                         agents_core.PREFLIGHT_SYSTEM, agents_core.PREFLIGHT_USER,
+                         {"reasoning_format": "hidden"}) == "1")
+        stubbed = agents_core.preflight(
+            {planner_provider: "k" * 12, "groq": "k" * 12},
+            roles=("planner", "executor"), call=stub.probe)
+        check("and a stubbed preflight still refuses the dead slug through that "
+              "same widened seam",
+              [record["ok"] for record in stubbed] == [True, False]
+              or [record["ok"] for record in stubbed] == [False, True],
+              [(record["model"], record["ok"], record["status"])
+               for record in stubbed])
+    finally:
+        agents_core.ROLE_MODEL.clear()
+        agents_core.ROLE_MODEL.update(held[0])
+        agents_core.ROLE_PARAMS.clear()
+        agents_core.ROLE_PARAMS.update(held[1])
+
+
+def _replay_source_ledger(pin, task_ids):
+    """A source ledger holding one usable plan per id in `task_ids`.
+
+    Written through `pin.append` so it is a real ledger and not a fixture shaped
+    like one: the replay has to survive `load_ledger`, digest re-derivation and the
+    resume key, and a hand-built dict would skip all three.
+    """
+    root = tempfile.mkdtemp(prefix="pin-replay-src-")
+    path = pin.ledger_path(root)
+    suites = {}
+    for index, task_id in enumerate(task_ids):
+        tests = ("from solution import f\nassert f(%d) == %d\n"
+                 % (index, index))
+        suites[task_id] = tests
+        pin.append(path, {
+            "kind": pin.KIND_PLAN, "task_id": task_id, "candidate": "",
+            "at": "2026-08-30T00:00:0%dZ" % index, "ok": True,
+            # A PEP 604 union in the spec, deliberately: these are the specs the
+            # sprint exists to re-draw and the replay must not filter them out.
+            "spec": "Write f(x: int | None) -> int | None.",
+            "steps": ["write f"], "tests": tests,
+            "tests_status": "generated", "tests_trusted": True,
+            "tests_sha256": agents_core.sha256_of(tests),
+            "planner_provider": "gemini"})
+    return root, path, suites
+
+
+def test_replaying_stored_plans_spends_nothing_on_the_planner():
+    """`--replay-plans`: the same specs, a fixed harness, and no second Planner draw.
+
+    The point of the mode is that a re-measurement after a harness fix is only
+    interpretable if the specs are byte-identical to the ones the first ledger's
+    draws answered. A fresh Planner call would silently turn "same spec, better
+    harness" into "different spec, different harness", so zero Planner calls is
+    the invariant and it is asserted, not assumed. The suite is carried with it and
+    its digest re-derived from the copied text, because a suite that does not hash
+    to its recorded digest makes the first ledger's gate verdicts unreadable.
+    """
+    pin = _import_pin_executor()
+    tasks = pin.locked_tasks()[:3]
+    ids = [task.task_id for task in tasks]
+    src_root, src_path, suites = _replay_source_ledger(pin, ids[:2])
+    dst = tempfile.mkdtemp(prefix="pin-replay-out-")
+    counter, asked = [], []
+    restore = _pin_harness(pin, counter)
+    pin.ask_keys = lambda providers, reader=None: (
+        asked.extend(providers) or dict((name, "k" * 12) for name in providers))
+    agents_core.set_pacing(True, sleep=lambda seconds: None)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = pin.main(["--replay-plans", src_path, "--out", dst,
+                             "--limit", "3", "--candidate", pin.CANDIDATES[0]])
+        text = out.getvalue()
+        units, malformed = pin.load_ledger(pin.ledger_path(dst))
+        plans = dict((key[1], record) for key, record in units.items()
+                     if key[0] == pin.KIND_PLAN)
+        draws = dict((key[1], record) for key, record in units.items()
+                     if key[0] == pin.KIND_DRAW)
+        check("the replay completes", code == 0 and malformed == 0, (code, malformed))
+        check("not one Planner-side call was made, which is the whole invariant",
+              [role for role in counter
+               if role in pin.REPLAY_ROLES] == [], counter)
+        check("and it did spend Executor calls, so the check above is not vacuous",
+              counter == ["executor"] * 2, counter)
+        check("only the Groq key is asked for -- a replay has no Planner leg to "
+              "spend one on", asked == ["groq"], asked)
+        check("a plan record exists for each replayed task and for no other",
+              sorted(plans) == ids[:2], sorted(plans))
+        check("the third task is skipped rather than planned, and said out loud",
+              ids[2] not in plans and ids[2] not in draws
+              and "will be skipped" in text and ids[2] in text,
+              [line for line in text.splitlines() if "skip" in line])
+        for task_id in ids[:2]:
+            record = plans[task_id]
+            check("the suite is carried over byte for byte (%s)" % task_id,
+                  record["tests"] == suites[task_id], record["tests"])
+            check("its digest is copied intact and still describes the text (%s)"
+                  % task_id,
+                  record["tests_sha256"] == agents_core.sha256_of(suites[task_id])
+                  == record["replayed_tests_sha256"],
+                  (record["tests_sha256"], record["replayed_tests_sha256"]))
+            check("status and trust come across too, so the gate behaves as it "
+                  "did (%s)" % task_id,
+                  (record["tests_status"], record["tests_trusted"])
+                  == ("generated", True),
+                  (record["tests_status"], record["tests_trusted"]))
+            check("the source ledger is named in the record (%s)" % task_id,
+                  record["replayed_from"] == os.path.abspath(src_path)
+                  and record["replayed_at"] == "2026-08-30T00:00:0%dZ"
+                  % ids.index(task_id), record.get("replayed_from"))
+            check("and the record shows it cost nothing (%s)" % task_id,
+                  record["calls"] == [] and record["replies"] == [],
+                  (record["calls"], record["replies"]))
+            check("the union-bearing spec is replayed, not filtered out (%s)"
+                  % task_id,
+                  "int | None" in record["spec"]
+                  and [flag["kind"] for flag in record["spec_runtime_syntax"]]
+                  == [agents_core.UNION_FLAG], record["spec_runtime_syntax"])
+        check("the draw was gated by the replayed suite, so the digest in the "
+              "draw matches the plan's",
+              all(draws[task_id]["tests_status"] == "generated"
+                  and draws[task_id]["tests_trusted"] is True
+                  for task_id in ids[:2]),
+              [(k, v["tests_status"]) for k, v in draws.items()])
+
+        # The guard inside `_run`, on the branch `main` normally filters away.
+        # Checked directly because "never plan in replay mode" has to hold for
+        # every caller, not only for the one that pre-filters the task list.
+        before = len(counter)
+        with contextlib.redirect_stdout(io.StringIO()) as guard_out:
+            pin._run(tasks[2:], (pin.CANDIDATES[0],), {"groq": "k" * 12},
+                     pin.ledger_path(dst), {}, replay_plans={},
+                     replay_path=src_path)
+        check("a task with no stored spec is skipped by the runner too, and "
+              "spends nothing",
+              len(counter) == before
+              and "no spec in the source ledger" in guard_out.getvalue(),
+              guard_out.getvalue())
+    finally:
+        restore()
+        shutil.rmtree(src_root, ignore_errors=True)
+        shutil.rmtree(dst, ignore_errors=True)
+
+    bad = {"kind": pin.KIND_PLAN, "task_id": "tampered-01", "ok": True,
+           "spec": "s", "tests": "assert True\n", "tests_status": "generated",
+           "tests_trusted": True, "tests_sha256": "0" * 64}
+    try:
+        pin.replayed_plan_unit(bad, src_path)
+        check("a suite that does not hash to its recorded digest is refused, "
+              "not replayed", False, "no refusal")
+    except SystemExit as exc:
+        check("a suite that does not hash to its recorded digest is refused, "
+              "not replayed",
+              "tampered-01" in str(exc) and "REFUSING TO REPLAY" in str(exc),
+              str(exc))
+
+    check("a source ledger lends only the plans that actually hold a spec",
+          sorted(pin.replayable_plans({
+              (pin.KIND_PLAN, "with", ""): {"task_id": "with", "ok": True,
+                                            "spec": "s"},
+              (pin.KIND_PLAN, "empty", ""): {"task_id": "empty", "ok": True,
+                                             "spec": "  "},
+              (pin.KIND_PLAN, "failed", ""): {"task_id": "failed", "ok": False,
+                                              "spec": "s"},
+              (pin.KIND_DRAW, "with", "m"): {"task_id": "with", "ok": True}}))
+          == ["with"],
+          sorted(pin.replayable_plans({})))
 
 
 def main():
@@ -5876,6 +6338,9 @@ def main():
         test_a_trusted_suite_still_records_a_gate_win,
         test_untrusted_suites_are_counted_and_explained,
         test_the_no_gate_rate_is_a_first_class_diagnostic_before_the_grid,
+        test_the_no_approval_rate_is_surfaced_beside_the_no_gate_rate,
+        test_a_suite_that_rejects_every_hidden_pass_is_counted_as_a_wrong_suite,
+        test_the_wrong_suite_count_runs_over_an_already_written_ledger,
         # sprint 6, task 1: surviving rate limits honestly
         test_a_rate_limit_retries_to_the_bound_and_stays_infrastructure,
         test_the_servers_own_retry_after_beats_our_guess,
@@ -5941,6 +6406,8 @@ def main():
         test_the_executor_probe_resumes_without_redrawing,
         test_the_probe_records_the_accounting_that_hidden_makes_invisible,
         test_the_probe_refuses_a_dead_candidate_before_it_generates,
+        test_a_preflight_validates_the_parameters_the_role_will_actually_send,
+        test_replaying_stored_plans_spends_nothing_on_the_planner,
     ):
         print("\n-- %s" % fn.__name__)
         try:

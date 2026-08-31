@@ -90,6 +90,17 @@ SCRIPT_NAME = "solution.py"
 TEST_NAME = "test_solution.py"
 SOLUTION_MODULE = "solution"
 
+# PEP 563 makes every annotation a string, so a PEP 604 union in a signature
+# cannot be evaluated and cannot raise on 3.9. One line, and it does not depend
+# on a model obeying an instruction. It does NOT cover `match` statements or a
+# runtime `isinstance(x, int | str)` -- those are the prompt's job.
+#
+# Written ahead of SCRIPT_NAME only. `ExecResult.source` keeps the model's
+# original bytes: the record says what the model wrote, and the executed text is
+# recoverable as `_SOURCE_PROLOGUE + source` because the prologue is a constant.
+# Nothing is prepended to TEST_NAME -- see the note at the write site.
+_SOURCE_PROLOGUE = "from __future__ import annotations\n"
+
 # The child records how far it got here, so that a SIGKILLed process -- which
 # prints no traceback at all -- can still be explained.
 PHASE_NAME = "_harness_phase"
@@ -1221,12 +1232,25 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
     try:
         script_path = os.path.join(workdir, SCRIPT_NAME)
         with open(script_path, "w", encoding="utf-8") as handle:
+            # The prologue goes ahead of the model's text, never over it. A
+            # future statement may be preceded only by comments, blank lines,
+            # the module docstring and other future statements, so line 1 is
+            # the only always-legal position -- and it stays legal when the
+            # model opens with a docstring or wrote the same import itself.
+            # Cost: solution.py line numbers in raw stderr are one higher than
+            # the model's own count, and that stderr becomes repair context.
+            # `failed_assertion_line` is unaffected; it is only set for frames
+            # in TEST_NAME, which gets no prologue.
+            handle.write(_SOURCE_PROLOGUE)
             handle.write(source)
 
         test_path = None
         if tests:
             test_path = os.path.join(workdir, TEST_NAME)
             with open(test_path, "w", encoding="utf-8") as handle:
+                # Deliberately no prologue: the artifact lives in the solution
+                # module, the baked suites carry no annotations, and editing
+                # suite text would put the task lock in question.
                 handle.write(tests)
 
         entry_path = test_path or script_path

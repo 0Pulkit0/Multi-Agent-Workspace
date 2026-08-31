@@ -393,7 +393,7 @@ class StubModel(object):
             lines.append("assert %s is not None" % name)
         return "\n".join(lines) + "\n"
 
-    def probe(self, provider, api_key, model, system, user):
+    def probe(self, provider, api_key, model, system, user, params=None):
         """The 404 gate alone -- no task, no completion. The preflight's call.
 
         A preflight validates a `(provider, model)` pair, and validating one
@@ -402,6 +402,11 @@ class StubModel(object):
         which a preflight legitimately does not have; sharing this gate with
         `__call__` is what makes `--bad-slug` a real negative control for the
         preflight rather than a second, separately-wrong imitation of it.
+
+        `params` is what the pair would be sent, `reasoning_format` and all. This
+        stub does not reject on it -- a stub cannot know which extension a provider
+        refuses -- but it takes it, so the seam carries what a real call carries
+        and a stubbed sweep exercises the same signature.
         """
         if self.live_models is not None and model not in self.live_models:
             raise agents_core.ProviderError(
@@ -504,6 +509,10 @@ def make_plan(task, keys):
             "planner_provider": provider,
             "spec": scratch.spec,
             "steps": len(agents_core.extract_steps(text)),
+            # Report-only: whether the Planner obeyed `_RUNTIME_RULE`. Recorded
+            # per plan so calibration output carries the compliance rate as a
+            # number. Nothing downstream reads it.
+            "spec_runtime_syntax": agents_core.scan_runtime_syntax(scratch.spec),
             "tests": scratch.tests,
             "tests_status": scratch.tests_status,
             "tests_trusted": scratch.tests_trusted,
@@ -866,6 +875,12 @@ def run_one(task, arm, keys, instrument, repeat, stub=None, plan=None):
         record.update(grade(outcome.pop("code", ""), task))
         record["error"] = ""
         record["outcome"] = OUTCOME_GRADED
+    except agents_core.DailyQuotaExhausted:
+        # Not a cell outcome. A per-day ceiling is a fact about the day, not about
+        # this task or this arm, and recording it as `infra_loss` here would let
+        # the sweep march through every remaining cell spending requests that
+        # cannot succeed. Straight out to the caller.
+        raise
     except agents_core.ProviderError as exc:
         # No answer came back, so there is nothing to grade and nothing this cell
         # can say about a model. It gets `outcome: infra_loss` and NO `passed` and
@@ -1040,6 +1055,82 @@ def _infra_summary(records, excluded):
     }
 
 
+def wrong_suite_tasks(draws):
+    """Task ids where every graded draw passed the hidden suite and the gate rejected all of them.
+
+    The signature of a suite that is wrong rather than a model that is weak. If a
+    task's suite is trustworthy and three independent draws all satisfy the hidden
+    acceptance criteria, and the visible suite approves none of them, the visible
+    suite is testing something the task never asked for. `grouping-02` is the
+    worked example: three candidates, three hidden passes, three gate rejections,
+    all from `==` on a float mean.
+
+    Report-only, and deliberately so. The alternative -- treating this as licence
+    to loosen the gate or re-generate the suite -- would make the gate's own error
+    rate unmeasurable, which is the one quantity A'@3 exists to measure.
+
+    Input is DRAW-level rows, any mapping with `task_id`, `tests_trusted`,
+    `passed` and `gate_approved`. Both ledgers already store exactly that, so this
+    runs over records written before it existed; nothing is instrumented in the
+    arm to feed it.
+
+    Ungraded rows are skipped rather than counted as failures to pass. A draw that
+    never came back has no `passed` field and is not evidence in either direction,
+    the same reason `_infra_summary` excludes infra losses instead of scoring them
+    zero. A task with no graded draw at all cannot be flagged.
+    """
+    by_task = {}
+    for row in draws:
+        if row.get("ok") is False or row.get("passed") is None:
+            continue
+        by_task.setdefault(row.get("task_id"), []).append(row)
+    return sorted(
+        task_id for task_id, rows in by_task.items()
+        if all(row.get("tests_trusted") for row in rows)
+        and all(row.get("passed") for row in rows)
+        and not any(row.get("gate_approved") for row in rows))
+
+
+def wrong_suite_report(draws):
+    """`wrong_suite_tasks` plus the denominators needed to read it."""
+    rows = [row for row in draws
+            if row.get("ok") is not False and row.get("passed") is not None]
+    tasks = sorted(set(row.get("task_id") for row in rows))
+    flagged = wrong_suite_tasks(rows)
+    return {
+        "graded_draws": len(rows),
+        "tasks_with_a_graded_draw": len(tasks),
+        "tasks": flagged,
+        "count": len(flagged),
+        "rate_of_graded_tasks": _pct(len(flagged), len(tasks)),
+    }
+
+
+def _a_prime3_draw_rows(records):
+    """Draw-level rows for `wrong_suite_report`, from stored A'@3 candidates.
+
+    Only candidates that carry a hidden grade. `run_arm_a_prime3` stores every
+    draw's code and gate verdict but grades none of them -- the cold grading pass
+    over stored candidates is separate on purpose -- so today this yields nothing
+    and the block below honestly reports zero graded draws. When that pass runs
+    and annotates candidates with `passed`, this starts reporting without a second
+    definition of the rule appearing anywhere.
+
+    `gate_approved` is reconstructed from the record's `gate_approved_draws`,
+    which is the field that actually stores it; the candidate entries keep only
+    the verdict string.
+    """
+    for record in records:
+        approved = set(record.get("gate_approved_draws") or ())
+        for candidate in record.get("candidates") or ():
+            if "passed" not in candidate:
+                continue
+            yield {"task_id": record.get("task_id"),
+                   "tests_trusted": record.get("tests_trusted"),
+                   "passed": candidate.get("passed"),
+                   "gate_approved": candidate.get("draw") in approved}
+
+
 def _gate_availability(records):
     """Where the gate existed at all: `tests_status` per suite, and the no-gate rate.
 
@@ -1061,8 +1152,17 @@ def _gate_availability(records):
     extracted and asserted nothing real, `unusable` means the Test Writer's output
     had no extractable code block at all. Reported separately, because collapsing
     them would hide which half of the mechanism is failing.
+
+    `SELECTION_NO_APPROVAL` is reported beside `SELECTION_NO_GATE` because it has
+    the same consequence and a different cause. Both return draw 1 by position, so
+    both attenuate the blind gate-loss term; the difference is that no-gate had
+    nothing to select with while no-approval had a gate that rejected everything.
+    From the arm's side that is indistinguishable from three genuinely bad draws,
+    and `wrong_suite` is what separates the two after the fact. Surfacing only the
+    no-gate half made a run where the gate rejected every draw on a third of the
+    tasks read as full gate availability.
     """
-    suites, selections, degenerate = {}, {}, []
+    suites, selections, degenerate, unapproved = {}, {}, [], []
     for record in records:
         if record.get("plan_shared"):
             key = (record["task_id"], record.get("repeat"))
@@ -1074,11 +1174,14 @@ def _gate_availability(records):
             selections[selection] = selections.get(selection, 0) + 1
             if selection == SELECTION_NO_GATE:
                 degenerate.append(record["task_id"])
+            elif selection == SELECTION_NO_APPROVAL:
+                unapproved.append(record["task_id"])
     by_status = {}
     for status, _trusted in suites.values():
         by_status[status or "?"] = by_status.get(status or "?", 0) + 1
     gated = sum(selections.values())
     no_gate = selections.get(SELECTION_NO_GATE, 0)
+    no_approval = selections.get(SELECTION_NO_APPROVAL, 0)
     return {
         "suites": len(suites),
         "by_tests_status": by_status,
@@ -1093,6 +1196,10 @@ def _gate_availability(records):
         "selection_no_gate": no_gate,
         "selection_no_gate_rate": _pct(no_gate, gated),
         "selection_no_gate_task_ids": sorted(set(degenerate)),
+        "selection_no_approval": no_approval,
+        "selection_no_approval_rate": _pct(no_approval, gated),
+        "selection_no_approval_task_ids": sorted(set(unapproved)),
+        "wrong_suite": wrong_suite_report(_a_prime3_draw_rows(records)),
     }
 
 
@@ -1242,6 +1349,18 @@ NO_GATE_NOTE = (
     "neither is patched around.")
 
 
+NO_APPROVAL_NOTE = (
+    "no-approval = A'@3 cells where the gate existed, was trustworthy, and "
+    "approved none of the three draws, so draw 1 was returned by position. Same "
+    "consequence as no-gate -- the blind gate-loss term is attenuated -- but a "
+    "different cause, and from inside the arm it is indistinguishable from three "
+    "genuinely bad draws. `wrong-suite` below is the post-hoc separator: a "
+    "trustworthy suite that rejects draws the HIDDEN suite passes is a suite "
+    "testing something the task never asked for, not a model failing. It is "
+    "counted and named, never repaired: loosening a gate that is being measured "
+    "for its error rate would destroy the measurement.")
+
+
 def _print_gate_availability(gate):
     """Printed first, and printed even when it is all zeroes.
 
@@ -1264,8 +1383,40 @@ def _print_gate_availability(gate):
              gate["selection_no_gate_rate"],
              "" if not gate["selection_no_gate_task_ids"]
              else "  (%s)" % ", ".join(gate["selection_no_gate_task_ids"][:6])))
+    # Beside the line above, never instead of it. Two fallbacks to draw 1, two
+    # causes, and reporting only the first one lets a run where the gate rejected
+    # everything read as a run where the gate worked.
+    print("  SELECTION_NO_APPROVAL: %d/%d = %.1f%% of A'@3 cells%s"
+          % (gate["selection_no_approval"], gate["a_prime3_cells"],
+             gate["selection_no_approval_rate"],
+             "" if not gate["selection_no_approval_task_ids"]
+             else "  (%s)" % ", ".join(
+                 gate["selection_no_approval_task_ids"][:6])))
+    _print_wrong_suite(gate.get("wrong_suite") or {})
     if gate["untrusted"]:
         print("\n" + NO_GATE_NOTE)
+    if gate["selection_no_approval"] or (gate.get("wrong_suite") or {}).get("count"):
+        print("\n" + NO_APPROVAL_NOTE)
+
+
+def _print_wrong_suite(wrong):
+    """One line, and it says which of the two zeroes it is.
+
+    "No task had a wrong suite" and "no draw has been graded, so the question was
+    never asked" are the same `0` and they mean opposite things. The graded-draw
+    denominator is on the line for that reason.
+    """
+    graded = wrong.get("graded_draws", 0)
+    if not graded:
+        print("  wrong-suite: not computed (no graded draw stored on any "
+              "candidate)")
+        return
+    print("  wrong-suite: %d/%d task(s) = %.1f%% -- trusted suite, every graded "
+          "draw passes hidden, gate approved none%s"
+          % (wrong.get("count", 0), wrong.get("tasks_with_a_graded_draw", 0),
+             wrong.get("rate_of_graded_tasks", 0.0),
+             "" if not wrong.get("tasks")
+             else "  (%s)" % ", ".join(wrong["tasks"][:6])))
 
 
 def _print_summary(summary):
@@ -1704,5 +1855,25 @@ def main(argv=None):
     return 0
 
 
+def cli(argv=None):
+    """`main`, plus the one failure that is not a per-cell outcome.
+
+    A per-day quota is a fact about the day. `run_one` re-raises it rather than
+    scoring it as `infra_loss`, so it arrives here, and here it is a message and
+    an exit code instead of a traceback. Every cell that completed is already
+    written to disk by `save_record`, so a re-run after the window resets resumes
+    from them; the summary is deliberately not written, because the sweep did not
+    finish and a summary over a truncated grid is the thing nobody should find
+    later and mistake for a result.
+    """
+    try:
+        return main(argv)
+    except agents_core.DailyQuotaExhausted as exc:
+        print("\nABORTED: %s" % exc, file=sys.stderr)
+        print("Completed cells are on disk. Re-run the same command once the "
+              "quota window has reset and it resumes from them.", file=sys.stderr)
+        return 3
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())

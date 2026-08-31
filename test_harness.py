@@ -501,6 +501,82 @@ def test_import_failure_is_distinguished():
           not result.failed_assertion, repr(result.failed_assertion))
 
 
+def test_the_source_prologue_neutralises_annotations():
+    """A 3.10-only annotation must not decide whether a solution imports.
+
+    The runtime is CPython 3.9, where a PEP 604 union in a signature is
+    evaluated when the `def` executes and raises TypeError -- so an Executor
+    that copies `float | int` out of the spec, or writes it out of habit,
+    fails at *import* for a reason that has nothing to do with the task. Six
+    of 57 pin-probe draws died this way. `_SOURCE_PROLOGUE` makes PEP 563 the
+    rule for the file we execute.
+
+    The two things it must not do are also checked here: it must not hide real
+    3.10 syntax, and it must not edit the record of what the model wrote.
+    """
+    median_body = ("    ordered = sorted(values)\n"
+                   "    n = len(ordered)\n"
+                   "    if n % 2:\n"
+                   "        return ordered[n // 2]\n"
+                   "    return (ordered[n // 2 - 1] + ordered[n // 2]) / 2\n")
+
+    union = "def median(values: list) -> float | int:\n" + median_body
+    result = harness.run_python_sandboxed(union, tests=SUITE)
+    check("a PEP 604 return annotation no longer breaks the import",
+          result.ok, (result.exit_code, result.stderr[-400:]))
+    check("the union solution is not classified as a failure",
+          result.failure_kind == harness.FAIL_NONE,
+          (result.failure_kind, result.stderr[-200:]))
+
+    # Requirement: the record shows what the model wrote, not what we ran.
+    check("ExecResult.source is the model's original bytes",
+          result.source == union, repr(result.source[:80]))
+    check("the recorded source carries no prologue",
+          harness._SOURCE_PROLOGUE not in result.source, repr(result.source[:80]))
+
+    # A future statement may be preceded by the module docstring, so line 1 is
+    # legal here too; the documented side effect is that the string stops being
+    # the docstring. Asserted rather than claimed.
+    doc = ('"""Median of a list."""\n\n'
+           "def median(values: list) -> float | None:\n" + median_body +
+           "\nprint('doc is %r' % (__doc__,))\n")
+    result = harness.run_python_sandboxed(doc)
+    check("a solution opening with a module docstring still runs",
+          result.ok, (result.exit_code, result.stderr[-400:]))
+    check("PEP 563 is in force and the docstring is no longer __doc__",
+          "doc is None" in result.stdout, result.stdout[:200])
+
+    already = ("from __future__ import annotations\n\n"
+               "def median(values: list) -> float | int:\n" + median_body)
+    result = harness.run_python_sandboxed(already, tests=SUITE)
+    check("a solution that already imports annotations still runs",
+          result.ok, (result.exit_code, result.stderr[-400:]))
+
+    # PEP 563 stringifies annotations. It does nothing for a soft keyword the
+    # 3.9 parser has never heard of, and it must not appear to.
+    matcher = ("def median(values: list):\n"
+               "    match len(values):\n"
+               "        case 0:\n"
+               "            return 0\n"
+               "    return sorted(values)[len(values) // 2]\n")
+    result = harness.run_python_sandboxed(matcher, tests=SUITE)
+    check("a match statement still fails", not result.ok,
+          (result.exit_code, result.stderr[-200:]))
+    check("a match statement is still an import/syntax failure",
+          result.failure_kind == harness.FAIL_IMPORT,
+          (result.failure_kind, result.stderr[-200:]))
+    check("the match failure is reported as a SyntaxError",
+          "SyntaxError" in result.stderr, result.stderr[-200:])
+
+    # Deliberate non-change: nothing is prepended to the suite, so the suite's
+    # own line numbers are exactly the ones the model would count. No annotation
+    # here, so this measures the suite and not the prologue's other effects.
+    wrong = "def median(values):\n    return 0\n"
+    result = harness.run_python_sandboxed(wrong, tests=SUITE)
+    check("the suite gets no prologue and its line numbers are unshifted",
+          result.failed_assertion_line == 3, result.failed_assertion_line)
+
+
 def test_vacuous_tests_are_caught():
     good = harness.audit_tests(SUITE)
     check("a real suite passes the audit", good.ok, good.reason)
@@ -1372,6 +1448,7 @@ def main():
         test_import_solution_works_under_isolated_mode,
         test_tests_passing_is_approved, test_wrong_answer_that_runs_is_revised,
         test_import_failure_is_distinguished, test_vacuous_tests_are_caught,
+        test_the_source_prologue_neutralises_annotations,
         test_executor_cannot_supply_its_own_tests,
         test_runaway_output_is_killed, test_filesystem_jail,
         test_destructive_calls_cannot_be_spelled_around_the_guard,
