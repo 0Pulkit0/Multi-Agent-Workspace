@@ -1,0 +1,367 @@
+{
+  "body_sha256": "80319b7189dcd7def55a704781f46b143c90d637121462541820f46094d1003c",
+  "counts": {
+    "by_tier": {
+      "1": 10,
+      "2": 16,
+      "3": 10
+    },
+    "families": 18,
+    "tasks": 36
+  },
+  "digest_algorithm": "sha256",
+  "generator": {
+    "families": [],
+    "limit": null,
+    "per_family": 2,
+    "seed": 0,
+    "tiers": []
+  },
+  "self_check": {
+    "at": "2026-08-30T19:10:13Z",
+    "battery": {
+      "equivalent_mutants": [
+        "tiered_pricing:le_to_lt"
+      ],
+      "mutations": [
+        "vacuous_stub",
+        "raise_to_pass",
+        "ge_to_gt",
+        "le_to_lt",
+        "or_to_and",
+        "sorted_to_list"
+      ],
+      "runaway_budget": 250000
+    },
+    "command": "gen_tasks.py --write-lock",
+    "passed": true,
+    "tasks": 36
+  },
+  "tasks": [
+    {
+      "family": "aggregation",
+      "prompt_sha256": "f09a1b26b35767f8a120590793d136662a0e4afcaca6f68789552dac7b0b2b5b",
+      "reference_sha256": "069e6de32530ef9643fdb63e56d948de80503cdb877ecb5c5edd91ce5a90c696",
+      "task_id": "aggregation-01",
+      "tests_sha256": "745f87ba61d57021a2cd750d4554443e4c77f271eb790eaaeb086847beb3c9d6",
+      "tier": 1,
+      "variant": 0
+    },
+    {
+      "family": "aggregation",
+      "prompt_sha256": "7bdb0e204035191dd3da1b3034e44a7658e893144af4fe5af2e84f859027e34f",
+      "reference_sha256": "b2d2df61129f77b392695fe9301e375935857a521cf2de090139afdb36aab6cb",
+      "task_id": "aggregation-02",
+      "tests_sha256": "599d2c8c08a75d52383a3e25acbcae58e3866dda8e17d52dcb659f902cd5a7d8",
+      "tier": 1,
+      "variant": 1
+    },
+    {
+      "family": "byte_formatting",
+      "prompt_sha256": "01f319a50086a991c1348e149a34e708c104fdcf599ce0059f29d345d4243645",
+      "reference_sha256": "f5c90577799defbe97a35168898bdc0b1e0f522a0dc3b489947b761f40ef8918",
+      "task_id": "byte-formatting-01",
+      "tests_sha256": "14ff3c087326002b72f44055a10eff16fc7cd947863fd7ce1861a972d752c9b9",
+      "tier": 1,
+      "variant": 0
+    },
+    {
+      "family": "byte_formatting",
+      "prompt_sha256": "4f7e89ab6edac41f7f98291ecc88f92705733197141f6c643bdc05be96874b4c",
+      "reference_sha256": "0445f6406d355f8e0e5b7de7d3fcd86a2939bc50d4b542ffc639e9833989279c",
+      "task_id": "byte-formatting-02",
+      "tests_sha256": "05308675948f37a23a5cf0eb6612d07c6650d1b87aaa7785c9d5dbed6e3030f5",
+      "tier": 1,
+      "variant": 1
+    },
+    {
+      "family": "config_parsing",
+      "prompt_sha256": "6ae0fcac5cf5904f97a7b4fc6b1cdffdef9a95db072f6770bb4b669dfc326cd9",
+      "reference_sha256": "f2dfe126b1c1599bef2c2703f3cedaea5dc5633f5b049d5ecd4dea819da86f7b",
+      "task_id": "config-parsing-01",
+      "tests_sha256": "8d68b724ed9a05806e950fdb9f4039b70b356056c630d44ebbf5155f85d6ba0d",
+      "tier": 3,
+      "variant": 0
+    },
+    {
+      "family": "config_parsing",
+      "prompt_sha256": "7c5a583652949e825fbcb7edaf0a9f5f2f3390e080e814651d4bf93f46bae2c4",
+      "reference_sha256": "4b26e980f888d9569fb6f502c617c15f40233a04981eee5ce66b84b626c31c2d",
+      "task_id": "config-parsing-02",
+      "tests_sha256": "ae45f69d4bf09551d830018f0de172c6346eaced38eabf858ec378fdf5c7f0a7",
+      "tier": 3,
+      "variant": 1
+    },
+    {
+      "family": "date_arithmetic",
+      "prompt_sha256": "769e1573f232c9730585d07b2aa005ee05a38653e6ed05c1a20ab71c1b30577d",
+      "reference_sha256": "5c9fa154aa966351560f3cee2d6e5fc81075cb6537949fe494cfdbd6b172f96f",
+      "task_id": "date-arithmetic-01",
+      "tests_sha256": "bd31b5433d861550fed2d9b1c12e20185325e662360fd456464e8b4d85fa921b",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "date_arithmetic",
+      "prompt_sha256": "769e1573f232c9730585d07b2aa005ee05a38653e6ed05c1a20ab71c1b30577d",
+      "reference_sha256": "5c9fa154aa966351560f3cee2d6e5fc81075cb6537949fe494cfdbd6b172f96f",
+      "task_id": "date-arithmetic-02",
+      "tests_sha256": "38899a01d469a4de60774d32da48a690ab82f770631839ec8d08d83be8e95d05",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "delimited_parsing",
+      "prompt_sha256": "61b1712bc0f46c73a1df9cb9ab3ed1f2c9771f88b0486f4b5a91df18dbea1d9b",
+      "reference_sha256": "3866d14819e8b5d6d7148477a1c433d5815113740d199eed6fc364f7657e02eb",
+      "task_id": "delimited-parsing-01",
+      "tests_sha256": "ad04281cd9876657c045dc49d935982853d94c4b00ac190a93c2f81d6f92a89d",
+      "tier": 3,
+      "variant": 0
+    },
+    {
+      "family": "delimited_parsing",
+      "prompt_sha256": "53333a1fb65333fcab98adbe0e6d0961fbd5a6e1c90b88c8f9397aba6c44beb7",
+      "reference_sha256": "ba8ab238586b21526a67b4a71376a1f75b23a023ecfa8e64556cb24ce1ecafbb",
+      "task_id": "delimited-parsing-02",
+      "tests_sha256": "9cfdb06327e0b9b78afd70351e48157bfc4e14c43f536ff9432051e772aca077",
+      "tier": 3,
+      "variant": 1
+    },
+    {
+      "family": "expression_eval",
+      "prompt_sha256": "95508790164200b5f35d36f1709d59a2993cfbea1511ea1edda5a5dbbabfb394",
+      "reference_sha256": "1c11fff088a42df8ed4472a088cee5ca979b5bafeb9505240d3fcf43c5944176",
+      "task_id": "expression-eval-01",
+      "tests_sha256": "d647a54f6647a4c39bf034ce6b38f225032bd93b078add4c824e2669d31d6b75",
+      "tier": 3,
+      "variant": 0
+    },
+    {
+      "family": "expression_eval",
+      "prompt_sha256": "95508790164200b5f35d36f1709d59a2993cfbea1511ea1edda5a5dbbabfb394",
+      "reference_sha256": "1c11fff088a42df8ed4472a088cee5ca979b5bafeb9505240d3fcf43c5944176",
+      "task_id": "expression-eval-02",
+      "tests_sha256": "265f76db50f5301386e4c5633cc6957559a9015ebc4afb738d1cb7a9cf441152",
+      "tier": 3,
+      "variant": 1
+    },
+    {
+      "family": "graph_traversal",
+      "prompt_sha256": "2861e9a4ea047326d2595535e359f4abac2487e676fc2c119972a690b4c4dcd5",
+      "reference_sha256": "dad3687eca7e4d4c99f2173b3d69aaa5c84d065c7b16b262c47e7934737e7ede",
+      "task_id": "graph-traversal-01",
+      "tests_sha256": "c1163f5e30a9854ee86a528d24fa7843fd82f3f79860f729eff4901aad55455d",
+      "tier": 3,
+      "variant": 0
+    },
+    {
+      "family": "graph_traversal",
+      "prompt_sha256": "2861e9a4ea047326d2595535e359f4abac2487e676fc2c119972a690b4c4dcd5",
+      "reference_sha256": "dad3687eca7e4d4c99f2173b3d69aaa5c84d065c7b16b262c47e7934737e7ede",
+      "task_id": "graph-traversal-02",
+      "tests_sha256": "9ca7ae6db0f79cf36f2ca567fb585ba6279328730d8442885122e7f4faaabe72",
+      "tier": 3,
+      "variant": 1
+    },
+    {
+      "family": "grouping",
+      "prompt_sha256": "3df01da5420b28cfde5f7fd3d2ec808c996363f41e7042b59395e64822d60dfe",
+      "reference_sha256": "b55f15c47f1f65866f6eea6d0b158187259ea0c4fd64e7064461d118b0442826",
+      "task_id": "grouping-01",
+      "tests_sha256": "6149ae566e666024276b68f4c9c19044b6f01c4169ff0aea91e4e1e797a4d878",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "grouping",
+      "prompt_sha256": "3df01da5420b28cfde5f7fd3d2ec808c996363f41e7042b59395e64822d60dfe",
+      "reference_sha256": "b55f15c47f1f65866f6eea6d0b158187259ea0c4fd64e7064461d118b0442826",
+      "task_id": "grouping-02",
+      "tests_sha256": "a53cf0a3b8e4e8af38ddd01f026a955b194d320a7b00f097fd605db560135f83",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "interval_logic",
+      "prompt_sha256": "a57bc72b767830f3d0a3f5e6f7d519e48af4e869c708c3cca65af366e0f6542b",
+      "reference_sha256": "3aecfa650020f2e845f025bfe54caf312d505ee274994409380653e2f303ecca",
+      "task_id": "interval-logic-01",
+      "tests_sha256": "bc8365ad305db755c3578596192d74a146014bc0656ab622f4ac2a7fb5b52277",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "interval_logic",
+      "prompt_sha256": "a57bc72b767830f3d0a3f5e6f7d519e48af4e869c708c3cca65af366e0f6542b",
+      "reference_sha256": "3aecfa650020f2e845f025bfe54caf312d505ee274994409380653e2f303ecca",
+      "task_id": "interval-logic-02",
+      "tests_sha256": "ff9cc30575a49e4e30fd8e009562517c0555a6d7c167ad296717e7aaa0895350",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "path_canonicalization",
+      "prompt_sha256": "6b283bfc347a8388b498b940bb9c04a72976b3fea80a25380d9289557d08a778",
+      "reference_sha256": "b8dc55f6bc4935e1f89387c45281b95c5ac7c63763a2773fdbba9ae03d448b8b",
+      "task_id": "path-canonicalization-01",
+      "tests_sha256": "0c8290c89061facfdbe22dbaf15cbcff722d8ff48b06b9631a8e6f0fb0ae0ba6",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "path_canonicalization",
+      "prompt_sha256": "3b8157705ecbb159493182db7a0bb61fec86d885927d39c7c29e491646bcc303",
+      "reference_sha256": "38def3ed7261c70948af1e44c1d6e2ca22c99bffc7d6e26dd4d73b72b523e1dd",
+      "task_id": "path-canonicalization-02",
+      "tests_sha256": "121602be7b5f7587460ee7bbf075c4028c5cce0256cd1cc3c293b70006d5c614",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "query_canonicalization",
+      "prompt_sha256": "50abbca9090a92ae4498e2dce9b957502af9dfef2b66f64731a239ac1b942b87",
+      "reference_sha256": "eb1aa389ab689067b21f4e5dcdaa24f6bd57ac47033ac9c04928e1fb89a3d459",
+      "task_id": "query-canonicalization-01",
+      "tests_sha256": "02f8355f0382484a57599427190c2169e35a042cc83f55e2a14ff10c038ca315",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "query_canonicalization",
+      "prompt_sha256": "7205ae1d3f27c5f46feb6f352bebee1cd5f9d5d6bf17de3b18975f34158a9488",
+      "reference_sha256": "a70ead88d5aec449534c2c433fd5f14ea437d6c98d86b8c706d53bd753711433",
+      "task_id": "query-canonicalization-02",
+      "tests_sha256": "9be7e13243a71a1484e00a71a7b0cef381e4eee4f7db662abe542594b8a4af40",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "ranking",
+      "prompt_sha256": "012521498fabe5ef863cfc45295ca0e247b1325f90f9415b63515dbcb0843474",
+      "reference_sha256": "8bcc550e0709f6073c7545b4134070a565b663643a3594f1c6f7a35f0766ce98",
+      "task_id": "ranking-01",
+      "tests_sha256": "3b1d289d2b631f3de6712431b83179081c2cbba88bc72075da79e636a93f2269",
+      "tier": 1,
+      "variant": 0
+    },
+    {
+      "family": "ranking",
+      "prompt_sha256": "90a01652cdd07d89cb75ab0d829cad1f82db2261d0fca880f30a829bf918a541",
+      "reference_sha256": "ff2be21fc4f9bc64123f889250f7e863d45ce09478dfeb345c61fd0f687309a9",
+      "task_id": "ranking-02",
+      "tests_sha256": "e9394ff0a917dca2885071b6df97a582acfbb4b9d22616ef3c2e0e338b1ad2fc",
+      "tier": 1,
+      "variant": 1
+    },
+    {
+      "family": "run_length_encoding",
+      "prompt_sha256": "5d2b7270231e7de467e6b2cf8761d7d1c3f7334e091d0ee16f0b15087b8b0d2e",
+      "reference_sha256": "3ec831277d601fb8befca7256c24bf7ae341cb96b8c3d80b8579e0509916350c",
+      "task_id": "run-length-encoding-01",
+      "tests_sha256": "af05ec09f24514495bd20179740483f4fbb97c4bf31c5dd0546fc26cfef8652d",
+      "tier": 1,
+      "variant": 0
+    },
+    {
+      "family": "run_length_encoding",
+      "prompt_sha256": "460b692c7a7c36b75e1226a076cfb0df33eadd5e57f3364bfade55f678d9bd54",
+      "reference_sha256": "e35b7000a90cb3b29b78abd499fdf9eabc24e5669ae7d80501c750c9c9f118e1",
+      "task_id": "run-length-encoding-02",
+      "tests_sha256": "7239f15fcd5cd8a5b7ebee67cc598cf107ba7752725d0a160e537ffe2b97b661",
+      "tier": 1,
+      "variant": 1
+    },
+    {
+      "family": "template_expansion",
+      "prompt_sha256": "065269c66f2e29f261854bd8196f9c3f62663b71d94e988620346e1306bc4335",
+      "reference_sha256": "c44d67ce68d00804d10f4f9fd83d8f2e5911978740add93d6b01b1a23d881914",
+      "task_id": "template-expansion-01",
+      "tests_sha256": "b46db2a740262cca7309b7eadf7aae50758a252bb44104162b4bf58252a1b4ff",
+      "tier": 3,
+      "variant": 0
+    },
+    {
+      "family": "template_expansion",
+      "prompt_sha256": "ecaa8a13ddb985060346e483b6f04ee8e65ba78940cd545002137f40a08015d6",
+      "reference_sha256": "d9820d446372d63aa8c8a27a4a20e41cf875696db9786c25eca7ee18cf784f9a",
+      "task_id": "template-expansion-02",
+      "tests_sha256": "4cecaa19fc9d1ca4a9ff3e31babffaa671d9bbb3012f2e0f64965a98b9f594ac",
+      "tier": 3,
+      "variant": 1
+    },
+    {
+      "family": "text_normalization",
+      "prompt_sha256": "793b680ebc5b3002e65ee29ab99304eefdc2b1560c739a9ce2bc0c52805e75ce",
+      "reference_sha256": "95c4052a6f2794d9ddc361a32430f59747470eed2fb811d9edbba647b914d4a0",
+      "task_id": "text-normalization-01",
+      "tests_sha256": "0c780629b2a68351260503a3e00f15c65921d91b079eddfea7798fe77ca0d792",
+      "tier": 1,
+      "variant": 0
+    },
+    {
+      "family": "text_normalization",
+      "prompt_sha256": "4f5460888955e12582b6277cc4a7e40838975583caaba1afb810710261cd48cc",
+      "reference_sha256": "0cc2325a7647db567a26257d9e3add73cf12e2c008bc5c9dd3dc3244f3fcf92e",
+      "task_id": "text-normalization-02",
+      "tests_sha256": "eced8d733e3fb5ee78899865aaedbc1cf5c1e6d996a02b755af8f449230acbbe",
+      "tier": 1,
+      "variant": 1
+    },
+    {
+      "family": "tiered_pricing",
+      "prompt_sha256": "f29addeb4b223b31ea9a1472ca7d79c9bf20d3047a68cd8345cde9062c652555",
+      "reference_sha256": "c0b339ac21f7d85a70a37985b078baac96ee88b842dcc1ec77df843aaec66d77",
+      "task_id": "tiered-pricing-01",
+      "tests_sha256": "ccf6e91734ba0b566bf4b61d736db2cb777c4794bdc84e6480a65eafcee50632",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "tiered_pricing",
+      "prompt_sha256": "b19f0b555bffa7da398c0ba712cbeb2bb8bc5e5faa190127fe556a17823c8e7c",
+      "reference_sha256": "e1dd92cc4385f305dbe1aba1f21f0a3655afcf3939a219a9049e145bb8b57d7c",
+      "task_id": "tiered-pricing-02",
+      "tests_sha256": "42fa173e3ce8681b0d180c91eac9bcaa620edee284d46f34224e3012d29b2f61",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "validation",
+      "prompt_sha256": "27c0e6800c412514dc461949983ccd443d0f0cebc949f7130559783f1e500a7f",
+      "reference_sha256": "3d0ddf733d1a3588d703b9b50b897ad77ce447f399637c3c883d11146bc44cec",
+      "task_id": "validation-01",
+      "tests_sha256": "f612987c718fe0bdb7485301dbb75c0ea495720fbeb5ebd3992d2638fe9f58d2",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "validation",
+      "prompt_sha256": "a8a2fcfc0bf981edb8fd6456a2d967263ca232604ecf13c8f51df301dec321a8",
+      "reference_sha256": "a6a7106aba0000c79ea0e2af58f3502b868fe449ac90ec7781d2c166e373752c",
+      "task_id": "validation-02",
+      "tests_sha256": "5e1d033cbb6388fd3bb091cdc360a157fe1aa995e250ff4f5b5e0da60565784c",
+      "tier": 2,
+      "variant": 1
+    },
+    {
+      "family": "version_ordering",
+      "prompt_sha256": "c927b987201c371e6cb7cc5d9443bd642c03983503829b0909a03811c7cda0da",
+      "reference_sha256": "b6cc41275d61323e8c7e4332b6cbe052a2522a45d4d82a5bd17496e6f361eea6",
+      "task_id": "version-ordering-01",
+      "tests_sha256": "fce4fa92d433f364459e209ee8cc33f9b3c6eb25aab6f80e3aa5369c8c8a4d0c",
+      "tier": 2,
+      "variant": 0
+    },
+    {
+      "family": "version_ordering",
+      "prompt_sha256": "c927b987201c371e6cb7cc5d9443bd642c03983503829b0909a03811c7cda0da",
+      "reference_sha256": "b6cc41275d61323e8c7e4332b6cbe052a2522a45d4d82a5bd17496e6f361eea6",
+      "task_id": "version-ordering-02",
+      "tests_sha256": "c60d1e587e6729e556ddbc429ec94969f6c1c789bba5e94db58fa685cb68c467",
+      "tier": 2,
+      "variant": 1
+    }
+  ],
+  "version": 1
+}

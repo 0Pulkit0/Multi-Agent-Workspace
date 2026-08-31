@@ -27,7 +27,12 @@ provider fails the task instead of silently rerouting the grid to the other one.
 about any model. It is there to prove the plumbing -- resume, grading, the
 false-APPROVED accounting, the governor -- without spending a call.
 
-Keys come from GEMINI_API_KEY and GROQ_API_KEY. Results land one JSON file per
+Keys come from `<PROVIDER>_API_KEY` -- GEMINI_API_KEY and GROQ_API_KEY on the
+default configuration -- or from whatever variable a configured provider names in
+its `env`. Which model each role calls is configuration too (`MAW_MODELS`, or
+`models.json`); `python3 eval/models.py --resolved` prints the resolved table and
+`--preflight` checks that every pair answers before a sweep spends anything.
+Results land one JSON file per
 (seed, arm, task, repeat) under eval/results/, and an existing file is skipped
 rather than rerun, so an interrupted run resumes by being started again.
 """
@@ -56,11 +61,37 @@ RESULTS_DIR = os.path.join(_HERE, "results")
 # Calls per minute, per provider, enforced client-side. Deliberately under the
 # published ceilings: the point is never to be told about the limit, because a
 # 429 costs a round trip and pollutes the wall-clock numbers.
-DEFAULT_RATES = {"gemini": 12.0, "groq": 25.0}
+#
+# Derived from `agents_core.MIN_CALL_INTERVAL_SECONDS` rather than restated, so
+# there is one set of pacing constants in this repository instead of two that
+# drift. `agents_core` is the honest place for them: it has the comment
+# explaining that both values are conservative guesses and not published limits.
+# (They were 12/min and 25/min here; gemini is now 10/min, i.e. tighter.)
+DEFAULT_RATES = dict(
+    (provider, round(60.0 / seconds, 3) if seconds > 0 else 0.0)
+    for provider, seconds in agents_core.MIN_CALL_INTERVAL_SECONDS.items())
 BURST = 2.0
 
 MAX_429_RETRIES = 4
 FALLBACK_BACKOFF = (2.0, 5.0, 12.0, 30.0)
+
+# ------------------------------------------------------------------ outcomes
+
+# What happened to a cell, as three mutually exclusive values.
+#
+#   graded      -- a model answered and the hidden suite ran. `passed` is a fact
+#                  about the model.
+#   infra_loss  -- no answer to grade: rate limit exhausted, 5xx, dead slug,
+#                  missing key, failover disabled. Carries no `passed` and no
+#                  `grade_*` at all, because a rate-limit death is not evidence
+#                  about a model and must not be able to look like one.
+#   error       -- a bug in *this* code, not in a provider. Kept as `passed:
+#                  False` exactly as before, and deliberately NOT excluded:
+#                  excluding our own crashes would shrink the denominator every
+#                  time we broke something, which is the opposite of loud.
+OUTCOME_GRADED = "graded"
+OUTCOME_INFRA_LOSS = "infra_loss"
+OUTCOME_ERROR = "error"
 
 # ------------------------------------------------------------------- governor
 
@@ -168,6 +199,10 @@ class Instrument(object):
         self.failed_calls = 0
         self.retries = 0
         self.providers = []
+        # Per provider, not just which ones were touched. A budget against a free
+        # tier is per provider, so "3 providers, 324 calls" is not the number
+        # anyone needs; the calibration sweep's projection is built off this.
+        self.calls_by_provider = {}
         self.slept = 0.0
 
     def __enter__(self):
@@ -179,16 +214,25 @@ class Instrument(object):
         agents_core.call_model = self._real
         return False
 
-    def _call(self, provider, api_key, system, user):
+    def _call(self, provider, api_key, system, user, role=None):
         for attempt in range(MAX_429_RETRIES + 1):
-            self.slept += self.governor.acquire(provider)
+            # The governor exists to arrive under a provider's rate limit. A stub
+            # never reaches a provider, so pacing it prevents nothing and costs
+            # the full interval per call in real time -- measured at 89% of an
+            # offline sweep's wall clock, which is why an offline audit of one
+            # task took 13.8s. Skip it when stubbed, and record that in the
+            # manifest so a stub summary cannot be read as a real sweep's cost.
+            if self.stub is None:
+                self.slept += self.governor.acquire(provider)
             self.calls += 1
+            self.calls_by_provider[provider] = (
+                self.calls_by_provider.get(provider, 0) + 1)
             if provider not in self.providers:
                 self.providers.append(provider)
             try:
                 if self.stub is not None:
-                    return self.stub(provider, system, user)
-                return self._real(provider, api_key, system, user)
+                    return self.stub(provider, system, user, role=role)
+                return self._real(provider, api_key, system, user, role=role)
             except agents_core.ProviderError as exc:
                 self.failed_calls += 1
                 is_429, retry_after = _rate_limit_info(exc)
@@ -202,6 +246,27 @@ class Instrument(object):
                 time.sleep(wait)
                 self.slept += wait
         raise AssertionError("unreachable")
+
+
+class _InstalledEventLog(object):
+    """`agents_core.set_event_log`, as a context manager that puts it back.
+
+    A sweep must not leave a finished log installed for whatever runs next in
+    the process -- a second `main()` call in a check, say, whose events would
+    then append to the first sweep's file.
+    """
+
+    def __init__(self, log):
+        self.log = log
+        self.previous = None
+
+    def __enter__(self):
+        self.previous = agents_core.set_event_log(self.log)
+        return self.log
+
+    def __exit__(self, *exc_info):
+        agents_core.set_event_log(self.previous)
+        return False
 
 # ------------------------------------------------------------------- stub model
 
@@ -247,12 +312,31 @@ class StubModel(object):
     # can miss it -- which is the situation this stub exists to reproduce. A
     # mutation that leaves behaviour unchanged would make `--stub broken`
     # quietly emit correct code, so the last resort is unambiguously wrong.
-    MUTATIONS = (("raise", None), (">=", ">"), ("<=", "<"),
-                 (" or ", " and "), ("sorted(", "list("))
+    #
+    # Derived from `gen_tasks.STUB_EDITS` rather than restated, because
+    # `gen_tasks --self-check` runs a battery over that list and `tasks.lock`
+    # records the battery by name. Two copies would let this stub grow an edit the
+    # lock's recorded guarantee does not cover, which is the exact class of defect
+    # the battery exists to close: a lock promising more than the code delivers.
+    MUTATIONS = tuple((find, replace)
+                      for _, find, replace in gen_tasks.STUB_EDITS)
 
     def _wrong(self):
-        """Right on the ordinary cases, wrong on at least one edge case."""
+        """Right on the ordinary cases, wrong on at least one edge case.
+
+        A mutation that applies *textually* is not necessarily one that changes an
+        answer. `path-canonicalization-02` draws `escape='clamp'`, so its only
+        `raise` is dead code and `raise -> pass` leaves the function computing
+        exactly what the reference computes; `--stub broken` was handing that task a
+        correct solution and calling it broken, which is the failure the comment
+        above says must not happen and nothing checked. So each candidate is offered
+        to the task's own hidden suite and one the suite cannot reject is passed
+        over. That is also what keeps this stub inside the guarantee
+        `gen_tasks --self-check` records in the lock: the battery there skips a
+        mutation the suite provably cannot catch, and this skips the same one.
+        """
         source = self.task.reference
+        tests = self.task.tests
         for find, replace in self.MUTATIONS:
             if find == "raise":
                 lines, hit = [], False
@@ -266,18 +350,30 @@ class StubModel(object):
                         hit = True
                     else:
                         lines.append(line)
-                if hit:
-                    return "\n".join(lines) + "\n"
+                mutant = "\n".join(lines) + "\n" if hit else None
             elif find in source:
-                return source.replace(find, replace, 1)
+                mutant = source.replace(find, replace, 1)
+            else:
+                mutant = None
+            if mutant is not None and gen_tasks.suite_rejects(mutant, tests)[0]:
+                return mutant
         return "".join("def %s(*args, **kwargs):\n    return None\n\n" % name
                        for name in self.task.names)
 
     def _thin_suite(self):
-        """The first two real asserts only -- a plausible weak suite."""
+        """The first two real asserts only -- a plausible weak suite.
+
+        Dedented, because a generated suite now carries each assert inside its
+        own `try` so it can report per-check results, and two asserts lifted out
+        of their wrappers are exactly the flat weak suite this is meant to be. It
+        matched on column zero before and silently returned a suite with no
+        asserts at all once the wrappers landed, which the audit then rejected as
+        unusable -- a stub failing for the wrong reason.
+        """
         lines = self.task.tests.splitlines()
         head = [line for line in lines if line.startswith("from solution")]
-        body = [line for line in lines if line.startswith("assert ")][:2]
+        body = [line.strip() for line in lines
+                if line.strip().startswith("assert ")][:2]
         return "\n".join(head + [""] + body) + "\n"
 
     def _vacuous_suite(self):
@@ -297,11 +393,32 @@ class StubModel(object):
             lines.append("assert %s is not None" % name)
         return "\n".join(lines) + "\n"
 
-    def __call__(self, provider, system, user):
-        model = agents_core.PROVIDERS[provider]["model"]
+    def probe(self, provider, api_key, model, system, user):
+        """The 404 gate alone -- no task, no completion. The preflight's call.
+
+        A preflight validates a `(provider, model)` pair, and validating one
+        offline means checking the exact slug that would have gone on the wire and
+        nothing else. Running a whole stub completion here would need a task,
+        which a preflight legitimately does not have; sharing this gate with
+        `__call__` is what makes `--bad-slug` a real negative control for the
+        preflight rather than a second, separately-wrong imitation of it.
+        """
         if self.live_models is not None and model not in self.live_models:
             raise agents_core.ProviderError(
-                "%s failed: 404 model '%s' does not exist" % (provider, model))
+                "%s failed: 404 model '%s' does not exist" % (provider, model),
+                status=404)
+        return "1"
+
+    def __call__(self, provider, system, user, role=None):
+        # The *resolved* model, which is what a real call would send and what a
+        # wrong slug has to be checked against. Reading `PROVIDERS[provider]`
+        # here instead would make the offline 404 simulation blind to exactly the
+        # case the configuration layer exists for: a role pointed at its own
+        # model. `--bad-slug` and `--live-models` both work through this line.
+        model = agents_core.model_for(role, provider) if role else None
+        if model is None:
+            model = agents_core.PROVIDERS[provider]["model"]
+        self.probe(provider, None, model, system, user)
         role = self._role(system)
         if role == "planner":
             suite = (self._vacuous_suite() if self.vacuous_plan
@@ -429,16 +546,38 @@ def _gate(code, plan):
     whether a task passed, against the hidden suite the arms never see.
     """
     if not plan.get("tests_trusted"):
+        agents_core.emit_event(agents_core.EVENT_GATE, available=False,
+                               reason="suite not trustworthy",
+                               verdict=harness.VERDICT_UNVERIFIED,
+                               approved=False,
+                               tests_sha256=plan.get("tests_sha256", ""))
         return harness.VERDICT_UNVERIFIED, False
     if not (code or "").strip():
+        agents_core.emit_event(agents_core.EVENT_GATE, available=True,
+                               reason="no code to run",
+                               verdict=harness.VERDICT_REVISE, approved=False,
+                               tests_sha256=plan.get("tests_sha256", ""))
         return harness.VERDICT_REVISE, False
     result = harness.run_python_sandboxed(code, plan["tests"],
                                          timeout=harness.EXEC_TIMEOUT_SECONDS)
     if result.failure_kind == harness.FAIL_PATH:
+        agents_core.emit_event(agents_core.EVENT_GATE, available=True,
+                               reason="harness could not run it",
+                               verdict=harness.VERDICT_UNVERIFIED,
+                               approved=False,
+                               tests_sha256=plan.get("tests_sha256", ""))
         return harness.VERDICT_UNVERIFIED, False
     approved = bool(result.ok and result.tested)
-    return (harness.VERDICT_APPROVED if approved else harness.VERDICT_REVISE,
-            approved)
+    verdict = (harness.VERDICT_APPROVED if approved
+               else harness.VERDICT_REVISE)
+    # The digest, not the suite. Which bytes gated is the auditable fact; the
+    # bytes themselves are already in the plan record once, shared across arms.
+    agents_core.emit_event(agents_core.EVENT_GATE, available=True, reason="",
+                           verdict=verdict, approved=approved,
+                           exit_code=result.exit_code, tested=result.tested,
+                           tests_sha256=plan.get("tests_sha256", ""),
+                           code_sha256=agents_core.sha256_of(code))
+    return verdict, approved
 
 
 def run_arm_a(task, keys, plan=None):
@@ -599,6 +738,38 @@ def result_path(root, seed, arm, task, repeat):
                         "%s__r%d.json" % (task.task_id, repeat))
 
 
+def _seeded_shuffle(items, key):
+    """A deterministic permutation of `items`, keyed by a string.
+
+    sha256 of the key rather than `random.seed(key)`: the string-seeding path
+    depends on the hash randomisation of whatever process runs it, which would
+    make "reproducible from the seed" false in exactly the way nobody checks.
+    """
+    ordered = list(items)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    random.Random(int(digest[:16], 16)).shuffle(ordered)
+    return ordered
+
+
+def _task_order(tasks, seed):
+    """A deterministic permutation of the task set (D7).
+
+    Generation order is family-first, so it is also tier-clustered: the first
+    tasks of the grid are the first families, and within a family the variants
+    arrive together. Any sweep that does not finish -- killed, out of quota, dead
+    provider -- then covers families unevenly, and which families it covered is a
+    function of position, which is to say of family and tier. Shuffling makes what
+    a truncated sweep measured independent of what it was measuring.
+
+    Keyed on the seed alone, not on the task set, so a resumed sweep walks the
+    same order as the sweep it is resuming even if it was given a narrower
+    `--family` or `--limit`. Selection stays generation-order -- `--limit 3` picks
+    the same three tasks it always did, and the lock verifies against them -- and
+    only the order they run in moves.
+    """
+    return _seeded_shuffle(tasks, "task-order|%d" % seed)
+
+
 def _arm_order(arms, seed, task, repeat):
     """A deterministic per-task permutation of the arms.
 
@@ -607,12 +778,13 @@ def _arm_order(arms, seed, task, repeat):
     first anyway would hand it a systematic position: it would absorb the least
     rate-limit pressure and the freshest quota on every single task. Seeded, so
     the order is reproducible and resume-safe.
+
+    Keyed per task and per repeat, unlike `_task_order`: the bias being removed
+    here is one arm always going first, so the permutation has to move between
+    tasks rather than being one fixed order applied to all of them.
     """
-    ordered = [arm for arm in ARM_ORDER if arm in arms]
-    digest = hashlib.sha256(
-        ("%d|%s|%d" % (seed, task.task_id, repeat)).encode("utf-8"))
-    random.Random(int(digest.hexdigest()[:16], 16)).shuffle(ordered)
-    return ordered
+    return _seeded_shuffle([arm for arm in ARM_ORDER if arm in arms],
+                           "%d|%s|%d" % (seed, task.task_id, repeat))
 
 
 def _call_log_slice(start):
@@ -621,9 +793,17 @@ def _call_log_slice(start):
     `requested` and `used` are both stored. In measurement mode they must be
     equal on every call; a record where they differ is a bug in `call_role`, not
     a finding about providers.
+
+    An allow-list, not the whole record: the record is a working object that grows,
+    and a results file is a published artifact. `status`, `exc_class`, `attempts`
+    and `retried` were added so a 429 that was survived by retrying is visible in
+    the record rather than only in the wall clock. `error` is still deliberately
+    out -- it is provider text, and the redacted copy already lives on the record's
+    own `error` field.
     """
     keep = ("role", "requested", "used", "model", "temperature", "top_p", "at",
-            "measurement_mode", "ok")
+            "measurement_mode", "ok", "status", "exc_class", "attempts",
+            "retried")
     return [{name: entry.get(name) for name in keep}
             for entry in agents_core.CALL_LOG[start:]]
 
@@ -645,6 +825,28 @@ def run_one(task, arm, keys, instrument, repeat, stub=None, plan=None):
               "variant": task.variant, "params": task.params, "arm": arm,
               "arm_note": note, "repeat": repeat, "seed": task.seed,
               "stub": None if stub is None else stub.quality,
+              # The identity of the suite that graded this cell, recorded on the
+              # cell. `passed` is meaningless without it: two results from two
+              # weeks apart are only comparable if they were graded against the
+              # same bytes, and "they were, we think" is not an audit. Full
+              # sha256, matching `tasks.lock`; `gate_tests_sha256` elsewhere on
+              # this record is the *visible* suite's short id and a different
+              # thing entirely.
+              "hidden_tests_sha256": gen_tasks.digest(task.tests),
+              # The resolved role -> (provider, model) table, on every cell.
+              # Resolved at this moment rather than read out of source, because
+              # `--bad-slug` mutates the provider table in place and a record built
+              # from source would name the pristine slug while the cell ran the
+              # dead one. This is also what makes a results directory attributable
+              # after a model retires under it: which models a run *actually used*
+              # is a fact about the run, and it now lives on the run.
+              "models": agents_core.resolved_roles(),
+              "models_source": agents_core.model_config_source(),
+              # Empty on a configuration where the grader did not write the code.
+              # Non-empty is not an error and does not stop anything; it is a
+              # standing note on the cell that the independence claim is weaker
+              # than the protocol's wording, so nobody has to re-derive it later.
+              "independence_warnings": agents_core.independence_warnings(),
               "measurement_mode": agents_core.MEASUREMENT_MODE}
     if plan is not None:
         # Recorded on every arm that consumed the plan, and flagged as shared so
@@ -656,22 +858,32 @@ def run_one(task, arm, keys, instrument, repeat, stub=None, plan=None):
         record["plan_call_log"] = plan.get("call_log", [])
     try:
         if plan is not None and plan.get("error"):
-            raise agents_core.ProviderError(plan["error"])
+            raise agents_core.ProviderError(plan["error"],
+                                            status=plan.get("error_status"),
+                                            exc_class=plan.get("error_class", ""))
         outcome = runner(task, keys, plan)
         record.update(outcome)
         record.update(grade(outcome.pop("code", ""), task))
         record["error"] = ""
+        record["outcome"] = OUTCOME_GRADED
     except agents_core.ProviderError as exc:
-        record.update({"passed": False, "verdict": harness.VERDICT_UNVERIFIED,
-                       "error": "provider: %s" % agents_core._redact(exc, keys),
-                       "grade_reason": "no answer to grade"})
+        # No answer came back, so there is nothing to grade and nothing this cell
+        # can say about a model. It gets `outcome: infra_loss` and NO `passed` and
+        # NO `grade_*` -- not `passed: False`. A rate-limit death that writes
+        # `passed: False` is indistinguishable from a model that answered and got
+        # it wrong, and every pass rate downstream then silently includes it.
+        record["outcome"] = OUTCOME_INFRA_LOSS
+        record.update({"verdict": harness.VERDICT_UNVERIFIED,
+                       "error": "provider: %s" % agents_core.redact(exc, keys)})
+        record.update(_infra_detail(exc, log_start))
     except Exception as exc:
         # Redacted: an SDK exception, or a frame in its traceback, is the one
         # place a key could plausibly reach a results file.
+        record["outcome"] = OUTCOME_ERROR
         record.update({"passed": False, "verdict": harness.VERDICT_UNVERIFIED,
                        "error": "%s: %s" % (type(exc).__name__,
-                                            agents_core._redact(exc, keys)),
-                       "traceback": agents_core._redact(
+                                            agents_core.redact(exc, keys)),
+                       "traceback": agents_core.redact(
                            traceback.format_exc(), keys)[-1200:],
                        "grade_reason": "no answer to grade"})
     record["seconds"] = round(time.time() - started, 2)
@@ -684,12 +896,56 @@ def run_one(task, arm, keys, instrument, repeat, stub=None, plan=None):
     record["provider_substituted"] = any(
         entry["requested"] != entry["used"]
         for entry in record["call_log"] + record.get("plan_call_log", []))
+    if record["outcome"] == OUTCOME_INFRA_LOSS:
+        agents_core.emit_event(agents_core.EVENT_INFRA_LOSS,
+                               task_id=task.task_id, arm=arm, repeat=repeat,
+                               provider=record.get("infra_provider", ""),
+                               status=record.get("infra_status"),
+                               attempts=record.get("infra_attempts", 0),
+                               seconds=record["seconds"],
+                               reason=record["error"])
+        # No `passed`, no `false_approved`. `setdefault` below would put a
+        # `passed: False` on this record, which is the whole thing being avoided.
+        return record
     # A step the harness approved that the hidden suite then fails. This is the
     # number the pipeline cannot self-report, so it is computed here.
     record["false_approved"] = bool(record.get("pipeline_says_passed")
                                    and not record.get("passed"))
     record.setdefault("passed", False)
     return record
+
+
+def _infra_detail(exc, log_start):
+    """What the infra loss was, from the exception and the calls it made.
+
+    Named apart from the grading fields on purpose: `infra_status`, not `status`,
+    so no summariser can pick these up by looking for a familiar key name.
+    """
+    calls = agents_core.CALL_LOG[log_start:]
+    last = calls[-1] if calls else {}
+    return {
+        "infra_provider": last.get("used", ""),
+        "infra_role": last.get("role", ""),
+        "infra_status": getattr(exc, "status", None),
+        "infra_exc_class": getattr(exc, "exc_class", ""),
+        "infra_attempts": last.get("attempts", 0),
+        "infra_retried": last.get("retried", 0),
+        "infra_seconds_backoff": last.get("seconds_backoff", 0.0),
+        "infra_retry_after": getattr(exc, "retry_after", None),
+    }
+
+
+def _outcome_label(record):
+    """`PASS` / `fail` / `INFRA` for the progress line.
+
+    `infra_loss` gets its own word rather than borrowing `fail`. The console line
+    is what a human watches a sweep through, and printing a rate-limit death as
+    `fail` reintroduces on screen exactly the conflation the record format was
+    changed to remove.
+    """
+    if record.get("outcome") == OUTCOME_INFRA_LOSS:
+        return "INFRA"
+    return "PASS" if record.get("passed") else "fail"
 
 
 def save_record(path, record):
@@ -747,13 +1003,117 @@ def _bucket(records):
     }
 
 
+def _excluded_task_ids(records):
+    """Task ids to drop from every bucket, because some cell lost to infra.
+
+    Exclusion is at TASK granularity, and that is the whole point. Dropping only
+    the cell that died would be differential: arm B makes the most calls, so it
+    absorbs the most 429s, so cell-level exclusion would quietly reweight the
+    task set toward whichever arms survived -- and the reweighting would correlate
+    with the arm, which is exactly the confound the paired design exists to kill.
+    Dropping the task drops it from all arms and all repeats at once.
+    """
+    return set(r["task_id"] for r in records
+               if r.get("outcome") == OUTCOME_INFRA_LOSS)
+
+
+def _infra_summary(records, excluded):
+    """The exclusion, counted and attributed. Reported whether or not it is zero.
+
+    A silent zero and a silent thirty look identical in a report, so this block is
+    always present and `_print_summary` always prints the line.
+    """
+    lost = [r for r in records if r.get("outcome") == OUTCOME_INFRA_LOSS]
+    by_arm, by_status = {}, {}
+    for record in lost:
+        by_arm[record["arm"]] = by_arm.get(record["arm"], 0) + 1
+        key = str(record.get("infra_status"))
+        by_status[key] = by_status.get(key, 0) + 1
+    return {
+        "cells": len(lost),
+        "tasks_excluded": len(excluded),
+        "task_ids_excluded": sorted(excluded),
+        "cells_dropped_with_them": sum(
+            1 for r in records if r.get("task_id") in excluded),
+        "by_arm": by_arm,
+        "by_status": by_status,
+    }
+
+
+def _gate_availability(records):
+    """Where the gate existed at all: `tests_status` per suite, and the no-gate rate.
+
+    Counted per SUITE and not per record. One Planner call resolves one suite and
+    that suite gates every arm of the task, so counting `tests_status` per record
+    would multiply each suite by the number of arms and report a distribution over
+    something that was never drawn.
+
+    The reason this is a first-class block and not a JSON field: every task whose
+    suite is untrusted is a task where A'@3 had nothing to select with and returned
+    draw 1 by position, so it contributes to `A'@3_gate` a value that came from A'.
+    The blind gate-loss term `A'@3_gate - A'@3_oracle` is attenuated toward zero by
+    each one, and a near-zero blind gate loss is exactly what the pre-registration
+    would otherwise read as a good selector. The rate has to be visible before the
+    grid is read, not discoverable in `summary.json` afterwards.
+
+    `unusable` and `vacuous` are the two ways `_resolve_tests` can end with nothing
+    trustworthy, and they are different events: `vacuous` means a suite was
+    extracted and asserted nothing real, `unusable` means the Test Writer's output
+    had no extractable code block at all. Reported separately, because collapsing
+    them would hide which half of the mechanism is failing.
+    """
+    suites, selections, degenerate = {}, {}, []
+    for record in records:
+        if record.get("plan_shared"):
+            key = (record["task_id"], record.get("repeat"))
+            if key not in suites:
+                suites[key] = (record.get("plan_tests_status") or "",
+                               record.get("tests_trusted"))
+        selection = record.get("selection")
+        if selection:
+            selections[selection] = selections.get(selection, 0) + 1
+            if selection == SELECTION_NO_GATE:
+                degenerate.append(record["task_id"])
+    by_status = {}
+    for status, _trusted in suites.values():
+        by_status[status or "?"] = by_status.get(status or "?", 0) + 1
+    gated = sum(selections.values())
+    no_gate = selections.get(SELECTION_NO_GATE, 0)
+    return {
+        "suites": len(suites),
+        "by_tests_status": by_status,
+        "trusted": sum(1 for _s, trusted in suites.values() if trusted),
+        "untrusted": sum(1 for _s, trusted in suites.values()
+                         if trusted is False),
+        "untrusted_task_ids": sorted(set(
+            task_id for (task_id, _repeat), (_status, trusted)
+            in suites.items() if trusted is False)),
+        "a_prime3_cells": gated,
+        "by_selection": selections,
+        "selection_no_gate": no_gate,
+        "selection_no_gate_rate": _pct(no_gate, gated),
+        "selection_no_gate_task_ids": sorted(set(degenerate)),
+    }
+
+
 def summarise(records):
     """Stratified by tier and by family. There is no headline number here.
 
     A pooled pass rate is a weighted average of whichever tiers happen to have
     the most families, so it is reported for completeness and is not a result.
+
+    Tasks that lost a cell to infrastructure are removed here, before `_bucket`
+    ever sees them, so no rate anywhere in the output is computed over a record
+    that has no `passed` field to compute it from.
     """
-    summary = {"by_arm": {}}
+    excluded = _excluded_task_ids(records)
+    summary = {"infra_loss": _infra_summary(records, excluded)}
+    records = [r for r in records if r.get("task_id") not in excluded]
+    # Over the same records the grid is, i.e. after the infra-loss exclusion. A
+    # no-gate rate computed over a wider set than the rates it qualifies would not
+    # describe them.
+    summary["gate_availability"] = _gate_availability(records)
+    summary["by_arm"] = {}
     for arm in sorted(set(r["arm"] for r in records)):
         rows = [r for r in records if r["arm"] == arm]
         entry = {"pooled_not_a_result": _bucket(rows), "by_tier": {}, "by_family": {}}
@@ -789,8 +1149,13 @@ def load_records(root, seed, arms):
 # -------------------------------------------------------------------------- cli
 
 def _keys_from_env():
-    return {"gemini": os.environ.get("GEMINI_API_KEY", ""),
-            "groq": os.environ.get("GROQ_API_KEY", "")}
+    """Delegated, so a provider added by configuration gets a key channel too.
+
+    This used to be a two-entry literal, which quietly made "adding a provider is
+    configuration, not a code edit" false: the new provider would resolve, and
+    then have no key. Kept under this name because the suites patch it here.
+    """
+    return agents_core.keys_from_env()
 
 
 def _parse_args(argv):
@@ -827,8 +1192,21 @@ def _parse_args(argv):
                              "runs. Requires --stub. Orthogonal to the stub "
                              "quality, which is why it is not a fourth choice "
                              "of --stub.")
+    parser.add_argument("--live-models", default=None,
+                        help="comma-separated model IDs the stub pretends the key "
+                             "can reach; every other slug 404s. Requires --stub. "
+                             "This is how the preflight is demonstrated against "
+                             "the *real* retired slug with no key and no network: "
+                             "--live-models gemini-3.6-flash leaves the Executor "
+                             "pointed at llama-3.3-70b-versatile and the run is "
+                             "refused by name.")
     parser.add_argument("--force", action="store_true",
                         help="rerun tasks that already have a result file")
+    parser.add_argument("--no-preflight", action="store_true",
+                        help="skip the (provider, model) validation. Only reason "
+                             "to: watching how a dead slug behaves *mid-run*, "
+                             "which is what --bad-slug demonstrated before the "
+                             "preflight started catching it at startup.")
     parser.add_argument("--summarise-only", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
@@ -844,8 +1222,55 @@ UNTRUSTED_NOTE = (
     "a quantity the Planner's own output quality caused.")
 
 
+INFRA_LOSS_NOTE = (
+    "infra = cells where no answer came back at all: rate limit exhausted, 5xx, "
+    "a dead model slug, a missing key. They are not graded and carry no `passed` "
+    "field, because a rate-limit death is not evidence about a model. Exclusion "
+    "is at TASK granularity, not cell: arm B makes the most calls and so absorbs "
+    "the most 429s, and dropping only the dead cell would reweight the task set "
+    "toward the arms that survived. The excluded task ids are listed in "
+    "summary.json under `infra_loss.task_ids_excluded`.")
+
+
+NO_GATE_NOTE = (
+    "no-gate = tasks whose acceptance suite was not trustworthy, so A'@3 had no "
+    "gate to select with and returned draw 1 by position. Each one attenuates the "
+    "blind gate-loss term A'@3_gate - A'@3_oracle toward zero, so this rate has to "
+    "be read BEFORE the pass rates below and not after them. `unusable` is the "
+    "Test Writer producing no extractable code block; `vacuous` is a suite that "
+    "extracted cleanly and asserts nothing real. Both are honest fallbacks and "
+    "neither is patched around.")
+
+
+def _print_gate_availability(gate):
+    """Printed first, and printed even when it is all zeroes.
+
+    Before the tables on purpose: it is the denominator qualifier for every rate
+    in them. A silent zero and a silent third of the task set read identically in
+    a report, and only one of them means the grid below is the mechanism.
+    """
+    print("gate availability: %d suite(s), %d trusted, %d untrusted"
+          % (gate["suites"], gate["trusted"], gate["untrusted"]))
+    print("  tests_status: %s"
+          % (", ".join("%s=%d" % pair
+                       for pair in sorted(gate["by_tests_status"].items()))
+             or "(none recorded)"))
+    print("  A'@3 selection: %s"
+          % (", ".join("%s=%d" % pair
+                       for pair in sorted(gate["by_selection"].items()))
+             or "(no A'@3 cells)"))
+    print("  SELECTION_NO_GATE: %d/%d = %.1f%% of A'@3 cells%s"
+          % (gate["selection_no_gate"], gate["a_prime3_cells"],
+             gate["selection_no_gate_rate"],
+             "" if not gate["selection_no_gate_task_ids"]
+             else "  (%s)" % ", ".join(gate["selection_no_gate_task_ids"][:6])))
+    if gate["untrusted"]:
+        print("\n" + NO_GATE_NOTE)
+
+
 def _print_summary(summary):
     untrusted_total = 0
+    _print_gate_availability(summary["gate_availability"])
     for arm in sorted(summary["by_arm"]):
         entry = summary["by_arm"][arm]
         print("\n=== arm %s" % arm)
@@ -864,8 +1289,29 @@ def _print_summary(summary):
               "%d untrusted suite"
               % (pooled["passed"], pooled["n"], pooled["pass_rate"],
                  pooled["false_approved"], pooled["untrusted_suite"]))
+
+    # Printed whether or not it is zero. A silent zero and a silent thirty read
+    # identically, and only one of them means the rates above are complete.
+    #
+    # Still after the tables, unlike the gate-availability block above it. The two
+    # are not the same kind of qualifier: the `n` column already reflects the
+    # infra-loss exclusion, so nothing above this line is misleading, whereas an
+    # unmeasured no-gate rate changes how the pass rates themselves should be read.
+    # (This used to say the placement was forced by a check pinning the table
+    # header to the third line of output. That check now finds the header by its
+    # `pass%` column instead, so the placement is a judgement and not a constraint.)
+    infra = summary.get("infra_loss") or {}
+    print("\ninfra loss: %d cell(s), %d task(s) excluded, %d cell(s) dropped "
+          "with them%s"
+          % (infra.get("cells", 0), infra.get("tasks_excluded", 0),
+             infra.get("cells_dropped_with_them", 0),
+             "" if not infra.get("by_arm")
+             else "  (by arm: %s)" % ", ".join(
+                 "%s=%d" % pair for pair in sorted(infra["by_arm"].items()))))
     if untrusted_total:
         print("\n" + UNTRUSTED_NOTE)
+    if infra.get("cells"):
+        print("\n" + INFRA_LOSS_NOTE)
 
 
 def main(argv=None):
@@ -895,15 +1341,84 @@ def main(argv=None):
         print("no tasks selected", file=sys.stderr)
         return 2
 
+    # The task set is verified against `eval/tasks.lock` before a single call is
+    # spent, and a mismatch refuses to run. 27ms for 36 tasks x 3 digests, which
+    # is nothing next to what it protects: if the hidden suite moves under a
+    # half-finished grid, the results before and after are being pooled into one
+    # pass rate that describes neither, and there is no way to notice afterwards.
+    #
+    # Refusing, rather than warning. A warning at the top of a sweep that then
+    # prints two hundred result lines is a warning nobody reads.
+    lock_failures, lock_reason = gen_tasks.verify_lock_or_reason(
+        tasks=tasks, seed=args.seed)
+    if lock_reason:
+        print("refusing to run: %s" % lock_reason, file=sys.stderr)
+        return 2
+    if lock_failures:
+        print("refusing to run: the task set does not match %s (%d problem%s):"
+              % (os.path.basename(gen_tasks.LOCK_PATH), len(lock_failures),
+                 "" if len(lock_failures) == 1 else "s"), file=sys.stderr)
+        for line in lock_failures:
+            print("  FAIL %s" % line, file=sys.stderr)
+        print("Nothing here is measurable against a task set that moved under "
+              "it. Restore the generator, or write a new lock deliberately and "
+              "treat the existing results as belonging to the old task set.",
+              file=sys.stderr)
+        return 2
+    lock = gen_tasks.load_lock()
+    print("tasks.lock verified: %d locked task(s), seed %d, self-check passed "
+          "at %s" % (lock["counts"]["tasks"], lock["generator"]["seed"],
+                     lock["self_check"]["at"]))
+
+    # D7. Selection above is generation order and stays that way -- the lock
+    # verifies against it and `--limit` must keep meaning the same thing -- and
+    # only the order the sweep walks is permuted. Recorded in the manifest below,
+    # because an order nobody can reconstruct is not a controlled variable.
+    generated = [task.task_id for task in tasks]
+    tasks = _task_order(tasks, args.seed)
+    print("task order: seeded permutation from seed %d, not generation order, so "
+          "a sweep that stops early does not stop on a family boundary."
+          % args.seed)
+
+    # Resolved before anything is spent, and printed, because a run that cannot
+    # say which model each role will call has nothing to put in its own record.
+    # With no config present this installs nothing and the source stays
+    # "defaults", so a sweep run today behaves exactly as it did.
+    #
+    # Before the keys are read, not after: a provider added by configuration
+    # names its own key variable, so the key lookup has to see the resolved
+    # `PROVIDERS` or that provider silently has no key.
+    try:
+        resolved = agents_core.configure_models()
+    except agents_core.ConfigError as exc:
+        print("refusing to run: model configuration: %s" % exc, file=sys.stderr)
+        return 2
     keys = _keys_from_env()
+    print("models (%s):" % agents_core.model_config_source())
+    for entry in resolved:
+        print("  %-12s %-8s %s  (temperature=%g top_p=%g%s)"
+              % (entry["role"], entry["provider"], entry["model"],
+                 entry["temperature"], entry["top_p"],
+                 "".join(" %s=%r" % pair for pair in sorted(entry.items())
+                         if pair[0] not in ("role", "provider", "model",
+                                            "base_url", "temperature", "top_p"))))
+    for line in agents_core.independence_warnings():
+        print("  WARNING: %s" % line)
+
     live_models = None
     if args.bad_slug:
         if not args.stub:
             print("--bad-slug requires --stub; it is a demonstration, not a "
                   "way to break a real run", file=sys.stderr)
             return 2
-        live_models = set(cfg["model"] for cfg in agents_core.PROVIDERS.values())
+        live_models = set(model for _provider, model, _roles
+                          in agents_core.resolved_pairs())
         agents_core.PROVIDERS[args.bad_slug]["model"] = "model-does-not-exist"
+        # And any role override pointing at that provider, or the override would
+        # keep the role on a live slug and the demonstration would be partial.
+        for role, provider in agents_core.ROLE_PROVIDER.items():
+            if provider == args.bad_slug:
+                agents_core.ROLE_MODEL[role] = "model-does-not-exist"
         print("--bad-slug %s: its model ID is now %r, so every %s call 404s."
               % (args.bad_slug,
                  agents_core.PROVIDERS[args.bad_slug]["model"], args.bad_slug))
@@ -911,6 +1426,17 @@ def main(argv=None):
         print("--vacuous-plan requires --stub; it shapes the stub Planner's "
               "output and cannot touch a real one", file=sys.stderr)
         return 2
+    if args.live_models is not None:
+        if not args.stub:
+            print("--live-models requires --stub; it tells a stand-in what to "
+                  "pretend a key can reach and has no meaning against a real "
+                  "provider", file=sys.stderr)
+            return 2
+        live_models = set(name.strip() for name in args.live_models.split(",")
+                          if name.strip())
+        print("--live-models: the stub answers only for %s; every other "
+              "configured slug 404s."
+              % ", ".join(sorted(live_models) or ["<nothing>"]))
     stub = (StubModel(args.stub, live_models=live_models,
                       vacuous_plan=args.vacuous_plan) if args.stub else None)
     if args.vacuous_plan:
@@ -921,13 +1447,48 @@ def main(argv=None):
         needed = sorted(set(agents_core.ROLE_PROVIDER.values()))
         absent = [name for name in needed if not keys.get(name)]
         if absent:
-            print("no key for %s (set GEMINI_API_KEY / GROQ_API_KEY), or pass "
+            print("no key for %s (set %s), or pass "
                   "--stub to validate this script offline"
-                  % ", ".join(absent), file=sys.stderr)
+                  % (", ".join(absent), agents_core.key_env_hint()),
+                  file=sys.stderr)
             return 2
         keys = dict((name, key) for name, key in keys.items() if key)
     else:
-        keys = {"gemini": "stub", "groq": "stub"}
+        # Every configured provider, not a hardcoded pair: a config that adds an
+        # OpenAI-compatible endpoint must not need a code edit here to be stubbed.
+        keys = dict((name, "stub") for name in agents_core.PROVIDERS)
+
+    # Before anything is spent. Two calls -- one per distinct (provider, model)
+    # pair, and `planner` and `test_writer` share one today -- convert a silent
+    # multi-hour loss into a one-second refusal. That loss is not hypothetical:
+    # Groq's slug retired under a frozen grid and Groq is the Executor in all four
+    # arms, so every arm was pointed at a dead model and nothing said so until a
+    # task failed. Refusing rather than warning, exactly as `--verify-lock` does.
+    #
+    # Stubbed sweeps preflight through the stub, so `--bad-slug` demonstrates the
+    # refusal with no key and no network at all.
+    preflight_records = []
+    if args.no_preflight:
+        print("preflight SKIPPED (--no-preflight): a dead (provider, model) pair "
+              "will now surface as a failed task mid-run instead of a refusal.")
+    else:
+        call = None if stub is None else stub.probe
+        preflight_records = agents_core.preflight(keys, call=call)
+        problems = agents_core.preflight_failures(preflight_records)
+        if problems:
+            print("refusing to run: %d configured (provider, model) pair(s) do "
+                  "not answer:" % len(problems), file=sys.stderr)
+            for line in problems:
+                print("  FAIL %s" % line, file=sys.stderr)
+            print("Point the role at a model the key can reach -- "
+                  "`python3 eval/models.py --list <provider>` says which -- or "
+                  "pass --no-preflight to spend the grid anyway.",
+                  file=sys.stderr)
+            return 2
+        print("preflight OK: %s"
+              % "; ".join("%s -> %s/%s" % ("+".join(record["roles"]),
+                                           record["provider"], record["model"])
+                          for record in preflight_records))
 
     # Not optional and not configurable. Silent failover turns an arm into a
     # provider mixture whose composition tracks rate-limit pressure, and the
@@ -936,7 +1497,22 @@ def main(argv=None):
     print("measurement mode ON: every call is pinned to one provider; a dead "
           "provider fails the task instead of silently rerouting to the other.")
 
+    # One retry layer, not two. `Instrument` below wraps `call_model` and runs its
+    # own 429 loop bounded by MAX_429_RETRIES, honouring the server's Retry-After
+    # through the governor; `agents_core` has a loop of its own bounded by
+    # MAX_PROVIDER_ATTEMPTS. Leaving both at their defaults multiplies them --
+    # 5 x 5 is 25 requests to a provider that has just said "slow down" -- so the
+    # inner one is pinned to a single attempt here and the outer one is the
+    # authority. Both bounds are written into the manifest so a run states which
+    # layer retried it. Same reasoning for pacing: `agents_core.PACER` ships
+    # disabled and `RateGovernor` does the pacing in this process.
+    agents_core.set_retry_attempts(1)
     governor = RateGovernor()
+    print("retry: RateGovernor + Instrument (%d retries, Retry-After honoured); "
+          "agents_core retry pinned to 1 attempt so the two bounds do not "
+          "multiply. Pacing: %s calls/min."
+          % (MAX_429_RETRIES,
+             ", ".join("%s=%g" % pair for pair in sorted(DEFAULT_RATES.items()))))
     if args.repeats == 1:
         print("--repeats 1: one draw per task. A per-family difference of one "
               "or two tasks is noise, not a finding.")
@@ -947,7 +1523,26 @@ def main(argv=None):
 
     started = time.time()
     done = 0
-    with Instrument(governor, stub=stub, verbose=args.verbose) as instrument:
+    # One event log for the whole sweep rather than one per cell. Which cell an
+    # event came from rides on the event (`scope` below); a file per cell would
+    # shatter the single chronology this log exists to provide -- what was
+    # happening when the sweep died -- across several hundred files.
+    #
+    # Installed process-wide so `run_workspace` picks it up ambiently. Arm B calls
+    # `run_workspace`, which opens a log of its own only when none is installed,
+    # so arm B's events land here carrying task/arm/repeat instead of in a sibling
+    # file that has no idea which cell produced them.
+    # `seed` in the base context, so an event names its own cell without anyone
+    # having to know which directory the file was read from. `(seed, task_id, arm,
+    # repeat)` is the result path, so every event joins to exactly one record.
+    # There is no per-cell `run_id` to put here: three of the four arms make a
+    # bare provider call and never create a `Memory`, so only arm B has one, and
+    # `run_workspace` scopes it onto its own events itself.
+    events = agents_core.EventLog(
+        os.path.join(root, "seed-%d" % args.seed, "events.jsonl"),
+        context={"seed": args.seed}, keys=keys)
+    with Instrument(governor, stub=stub, verbose=args.verbose) as instrument, \
+            _InstalledEventLog(events):
         for repeat in range(args.repeats):
             for task in tasks:
                 pending = []
@@ -957,6 +1552,16 @@ def main(argv=None):
                         if args.verbose:
                             print("  skip %s arm %s (already done)"
                                   % (task.task_id, arm))
+                        # Logged, because a resumed sweep and a fresh one produce
+                        # the same summary from different amounts of work and the
+                        # difference has to be visible somewhere. Zero provider
+                        # calls happen for this cell; that is the point of the
+                        # event. Basename only -- the absolute path carries the
+                        # user's home directory and says nothing extra.
+                        events.emit(agents_core.EVENT_RESUME_SKIP,
+                                    task_id=task.task_id, arm=arm,
+                                    repeat=repeat,
+                                    result=os.path.basename(path))
                         continue
                     pending.append(arm)
                 if not pending:
@@ -972,32 +1577,53 @@ def main(argv=None):
                     if stub is not None:
                         stub.task = task
                     try:
-                        plan = make_plan(task, keys)
+                        # `phase`, not `arm`: this call belongs to no arm -- all
+                        # three plan arms share it -- and writing an arm name here
+                        # would let a reader attribute one shared call to one arm.
+                        with events.scope(task_id=task.task_id, repeat=repeat,
+                                          phase="plan"):
+                            plan = make_plan(task, keys)
                         plan["error"] = ""
                     except agents_core.ProviderError as exc:
                         # In measurement mode this is the designed outcome of a
                         # dead provider: every plan-consuming arm on this task
                         # is recorded as failed. Loud, attributable, and not
                         # quietly rerouted to the other provider.
+                        #
+                        # The status and the class travel with the message, because
+                        # `run_one` re-raises this as a `ProviderError` and its
+                        # `infra_loss`/`error` split turns entirely on the status.
+                        # Without them a rate-limited Planner would reach the
+                        # record as a statusless failure, which does not retry and
+                        # cannot be told apart from a dead model slug.
                         plan = {"error": "planning failed: %s"
-                                         % agents_core._redact(exc, keys)}
+                                         % agents_core._redact(exc, keys),
+                                "error_status": getattr(exc, "status", None),
+                                "error_class": getattr(exc, "exc_class", "")}
                         print("  !! %s plan failed: %s"
                               % (task.task_id, plan["error"][:100]))
                     plan["calls"] = instrument.calls
                     plan["call_log"] = _call_log_slice(0)
 
                 for arm in pending:
-                    record = run_one(task, arm, keys, instrument, repeat, stub,
-                                     plan if arm in PLAN_ARMS else None)
+                    with events.scope(task_id=task.task_id, arm=arm,
+                                      repeat=repeat):
+                        record = run_one(task, arm, keys, instrument, repeat,
+                                         stub, plan if arm in PLAN_ARMS else None)
                     save_record(result_path(root, args.seed, arm, task, repeat),
                                 record)
                     done += 1
+                    # `.get`, not `[...]`. An `infra_loss` record deliberately
+                    # carries neither `passed` nor `false_approved` -- that is the
+                    # representation, not an omission -- so indexing them here
+                    # would turn every rate-limit loss into a KeyError that kills
+                    # the sweep at exactly the moment it is trying to survive one.
                     print("  %-8s %-24s %-9s %-11s %5.1fs %2d calls%s"
                           % (arm, task.task_id,
-                             "PASS" if record["passed"] else "fail",
+                             _outcome_label(record),
                              record.get("verdict", ""), record["seconds"],
                              record["calls"],
-                             "  FALSE APPROVED" if record["false_approved"]
+                             "  FALSE APPROVED" if record.get("false_approved")
                              else ("  " + record["error"][:60]
                                    if record.get("error") else "")))
                     if record.get("provider_substituted"):
@@ -1010,6 +1636,9 @@ def main(argv=None):
         print("  429 %s Retry-After=%s waited %.1fs (%s)"
               % (event["provider"], event["retry_after"], event["waited"],
                  event["source"]))
+    print("%d event(s) written to %s%s"
+          % (events.count, events.path,
+             " (%d write(s) failed)" % events.failed if events.failed else ""))
 
     records = load_records(root, args.seed, arms)
     summary = summarise(records)
@@ -1017,6 +1646,57 @@ def main(argv=None):
     summary["seed"] = args.seed
     summary["stub"] = args.stub
     summary["repeats"] = args.repeats
+    # The pacing and retry policy this sweep actually ran under, not the module
+    # defaults a reader would otherwise have to assume. Both layers are recorded
+    # -- the governor's rates and bounds, and `agents_core`'s pinned attempt count
+    # and (disabled) pacer -- so a run states which layer retried it and how long
+    # it was willing to wait. The `agents_core` rates are conservative guesses
+    # rather than documented free-tier limits; `MIN_CALL_INTERVAL_SECONDS` says so
+    # where they are defined, and `pacing.intervals` here carries the numbers.
+    summary["pacing"] = {"governor_rates_per_min": DEFAULT_RATES,
+                         "governor_burst": BURST,
+                         # False on a stub sweep: nothing was paced because
+                         # nothing left the process. The rates above are still
+                         # recorded, as policy rather than as what was spent.
+                         "governor_applied": stub is None,
+                         "governor_max_429_retries": MAX_429_RETRIES,
+                         "governor_fallback_backoff": list(FALLBACK_BACKOFF),
+                         "agents_core_pacer": agents_core.PACER.snapshot(),
+                         "agents_core_retry": agents_core.retry_snapshot()}
+    summary["events"] = {"path": os.path.basename(events.path),
+                         "count": events.count,
+                         "write_failures": events.failed}
+    # The order this sweep actually walked, and where each task sat in generation
+    # order. Both, because the permutation is only meaningful against the order it
+    # permuted, and a reader who has only the run order cannot tell a shuffle from
+    # a generator that changed.
+    summary["task_order"] = {
+        "seed": args.seed,
+        "shuffled": True,
+        "basis": "sha256('task-order|<seed>'), selection unchanged",
+        "order": [task.task_id for task in tasks],
+        "permutation": [generated.index(task.task_id) for task in tasks]}
+    # Which task set this is, by digest, so a results directory is attributable
+    # without trusting the directory name or the clock.
+    summary["tasks_lock"] = {"path": os.path.basename(gen_tasks.LOCK_PATH),
+                             "body_sha256": lock.get("body_sha256", ""),
+                             "locked_tasks": lock["counts"]["tasks"],
+                             "seed": lock["generator"]["seed"],
+                             "self_check_at": lock["self_check"]["at"],
+                             "verified_at_startup": True}
+    # Which models this sweep actually used, resolved, plus how that was decided
+    # and whether each pair answered before anything was spent. Resolved after the
+    # run rather than restated from source so `--bad-slug`'s mutation appears here
+    # too: a manifest that could not contradict source would be worth nothing as a
+    # record of what ran. D2 freezes this table, not the constants it came from.
+    summary["models"] = {
+        "source": agents_core.model_config_source(),
+        "resolved": agents_core.resolved_roles(),
+        "preflight": preflight_records,
+        "preflight_skipped": bool(args.no_preflight),
+        "independence_warnings": agents_core.independence_warnings()}
+    for line in summary["models"]["independence_warnings"]:
+        print("WARNING: %s" % line)
     summary_path = os.path.join(root, "seed-%d" % args.seed, "summary.json")
     save_record(summary_path, summary)
     _print_summary(summary)

@@ -22,6 +22,8 @@ whether verification and repair earn their cost.
     python3 eval/gen_tasks.py --list
     python3 eval/gen_tasks.py --self-check
     python3 eval/gen_tasks.py --per-family 3 --out eval/tasks.jsonl
+    python3 eval/gen_tasks.py --write-lock      # once, deliberately
+    python3 eval/gen_tasks.py --verify-lock     # cheap, and run_eval does it too
 
 Determinism: every task's inputs come from ``random.Random(seed)`` where the
 seed is derived from (global seed, family name, variant index). A given seed
@@ -36,13 +38,16 @@ reference and then against a stub.
 """
 
 import argparse
+import contextlib
 import hashlib
 import inspect
+import io
 import json
 import os
 import random
 import sys
 import textwrap
+import time
 import types
 
 TIER_NAMES = {
@@ -122,6 +127,50 @@ def _literal(value):
     return text
 
 
+# The tag is imported rather than spelled, because the grader parses what this
+# emits and a second copy of the literal is a second thing to keep in sync.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import harness as _harness             # noqa: E402 - after the path repair
+
+CHECK_TAG = _harness.CHECK_TAG
+
+# Emitted verbatim into every generated suite, once, above the checks.
+#
+# `_mawout` is bound to `sys.stdout` here and not looked up again, so a solution
+# that swaps `sys.stdout` after import cannot intercept the report; binding it
+# rather than calling `print` also keeps `builtins.print` out of the path. It is
+# deliberately not `sys.__stdout__`, which would be unswappable but would also
+# escape the in-process capture the self-check and the reorder battery rely on.
+#
+# `_mawfirst` is a one-element list rather than a `global`, so the helpers need
+# no declaration and the "first failure wins" rule is visible in the data.
+_PROLOGUE = '''
+import sys as _mawsys
+
+_mawout, _mawresults, _mawfirst = _mawsys.stdout, [], []
+
+
+def _mawpass(_i):
+    _mawresults.append((_i, "pass", "-"))
+
+
+def _mawfail(_i):
+    _t, _v = _mawsys.exc_info()[:2]
+    _mawresults.append((_i, "fail", getattr(_t, "__name__", "?")))
+    if not _mawfirst:
+        _mawfirst.append(_v)
+
+
+def _mawreport():
+    for _i, _outcome, _kind in _mawresults:
+        _mawout.write("%(tag)s %%d %%s %%s\\n" %% (_i, _outcome, _kind))
+    _mawout.write("%(tag)s done %%d\\n" %% len(_mawresults))
+    _mawout.flush()
+    if _mawfirst:
+        raise _mawfirst[0]
+''' % {"tag": CHECK_TAG}
+
+
 def _probe(refs, consts, imports=()):
     """A namespace holding the reference, for builders that must test inputs.
 
@@ -142,20 +191,38 @@ def _bake(reference, names, calls, raises):
     guaranteed passable. Every `raises` case is checked against the reference
     too -- a suite that demands an exception the reference never raises would be
     grading the pipeline against a spec nothing satisfies.
+
+    Each check gets its own `try`, so the suite can say *how many* checks passed
+    instead of only where it stopped. Two properties of the old shape are kept
+    exactly, because the verdict depends on them:
+
+      * `from solution import ...` stays outside every `try`. A missing entry
+        point must remain a whole-suite import failure and must never be
+        reported as a low score against a suite that never ran.
+      * the first failing check's own exception is re-raised at the end, with its
+        original traceback. So the exit code, the failure kind and the blamed
+        line are the same events they were when the suite stopped at the first
+        failure. The per-check counts are additional, not authoritative.
     """
     namespace = {}
     exec(compile(reference, "<reference>", "exec"), namespace)
 
-    lines = ["from solution import %s" % ", ".join(names), ""]
+    checks = []
     for expression in calls:
         value = eval(expression, dict(namespace))
         if value is None:
             raise ValueError("expected value is None, so a stub would pass: %s"
                              % expression)
-        lines.append("assert %s == %s, %r" % (expression, _literal(value),
-                                              expression))
+        checks.append(["assert %s == %s, %r" % (expression, _literal(value),
+                                                expression)])
 
     for expression, exception in raises:
+        if not (isinstance(exception, type) and issubclass(exception, Exception)):
+            # The per-check wrapper catches `Exception`. An expectation outside
+            # that hierarchy would be uncatchable there and would silently
+            # become a whole-suite failure instead of a recorded wrong-exception.
+            raise ValueError("raises case is not an Exception subclass: %r"
+                             % (exception,))
         try:
             eval(expression, dict(namespace))
         except exception:
@@ -163,13 +230,40 @@ def _bake(reference, names, calls, raises):
         else:
             raise ValueError("reference does not raise %s for %s"
                              % (exception.__name__, expression))
-        lines += ["", "try:",
-                  "    %s" % expression,
-                  "except %s:" % exception.__name__,
-                  "    pass",
-                  "else:",
-                  "    raise AssertionError(%r)"
-                  % ("%s should raise %s" % (expression, exception.__name__))]
+        # Nested rather than a four-clause `try`: the inner block is the same
+        # text the suite carried before, so a wrong exception falls out to the
+        # wrapper and is recorded by type, while no exception at all raises the
+        # same AssertionError on the same kind of line it always did.
+        checks.append(["try:",
+                       "    %s" % expression,
+                       "except %s:" % exception.__name__,
+                       "    pass",
+                       "else:",
+                       "    raise AssertionError(%r)"
+                       % ("%s should raise %s" % (expression,
+                                                  exception.__name__))])
+
+    return bake_checks(names, checks)
+
+
+def bake_checks(names, checks):
+    """The import line, the reporting prologue, one wrapper per check, the report.
+
+    Split out of `_bake` so it has exactly one definition. `eval/rank_battery.py`
+    recognises this shape structurally and `test_pipeline.py`'s order-dependence
+    controls have to be built in it -- a hand-rolled second copy would let the
+    controls keep passing against a shape the real suites no longer have, which is
+    the one thing a control must not do.
+
+    `checks` is a list of check bodies, each a list of source lines at column zero.
+    """
+    lines = ["from solution import %s" % ", ".join(names), "", _PROLOGUE.strip()]
+    for index, body in enumerate(checks, start=1):
+        lines += ["", "try:"]
+        lines += ["    %s" % line for line in body]
+        lines += ["except Exception:", "    _mawfail(%d)" % index,
+                  "else:", "    _mawpass(%d)" % index]
+    lines += ["", "_mawreport()"]
     return "\n".join(lines) + "\n"
 
 # --------------------------------------------------------------- input helpers
@@ -448,6 +542,28 @@ def _build_validation(rng):
               "validate_code('AB-1234-56')", "validate_code('AB-1234-')",
               "validate_code('A1-1234-5')", "validate_code(42)",
               "validate_code(None)", "validate_code('AB-1234-5-6')"]
+
+    def prefixed(prefix, digits="1357"):
+        """A code whose check digit is *right*, so only the prefix can reject it.
+
+        Every prefix case above carries a wrong check digit as well, so the suite
+        could not tell "rejected for its prefix" from "rejected for its checksum":
+        an implementation that got the prefix rule wrong still returned `False` for
+        all three, by the other branch, and passed. Replacing `or` with `and` in
+        the prefix test is exactly that implementation, and it is what
+        `calibrate.py --stub broken` produces here.
+        """
+        check = sum(int(d) * w for d, w in zip(digits, weights)) % 10
+        return "%s-%s-%d" % (prefix, digits, check)
+
+    # The matched pair is the point: the same digits and the same correct check
+    # digit, accepted with a legal prefix and refused with each illegal one, so a
+    # refusal can only be about the prefix.
+    calls += ["validate_code(%r)" % prefixed("AB"),
+              "validate_code(%r)" % prefixed("ABC"),
+              "validate_code(%r)" % prefixed("A"),
+              "validate_code(%r)" % prefixed("A1"),
+              "validate_code(%r)" % prefixed("ab")]
     return dict(
         prompt=(
             "Write `validate_code(code)`, returning `True` or `False`.\n\n"
@@ -845,7 +961,15 @@ def _build_version_ordering(rng):
         raises=[("compare_versions('1.x', '1.0')", ValueError),
                 ("compare_versions('', '1.0')", ValueError),
                 ("compare_versions('1.0', None)", ValueError),
-                ("compare_versions('1..0', '1.0')", ValueError)],
+                ("compare_versions('1..0', '1.0')", ValueError),
+                # `None` was the only non-`str` the suite tried, and it is falsy,
+                # so `not isinstance(text, str) or not text` and the same test with
+                # `and` rejected it alike. A *truthy* non-`str` separates them: the
+                # `and` version falls through to `.partition` and raises
+                # AttributeError, which is not the ValueError the prompt promises,
+                # and `except ValueError` in the suite will not swallow it.
+                ("compare_versions(42, '1.0')", ValueError),
+                ("compare_versions('1.0', 42)", ValueError)],
         refs=(_ref_compare_versions,), consts={"_PRE_LOWER": pre_lower},
         params={"prerelease_is_lower": pre_lower})
 
@@ -1410,7 +1534,14 @@ def _build_template_expansion(rng):
         raises=[("expand('{', %r)" % supplied, ValueError),
                 ("expand('{}', %r)" % supplied, ValueError),
                 ("expand('a}b', %r)" % supplied, ValueError),
-                ("expand('{name', %r)" % supplied, ValueError)]
+                ("expand('{name', %r)" % supplied, ValueError),
+                # Every unclosed-`{` case above still raises ValueError when the
+                # unclosed check itself is deleted -- from the empty-name branch or
+                # the missing-key branch instead -- so none of them tests the check.
+                # `'{namex'` does: its stem `'name'` is a supplied key, so an
+                # implementation that looks the name up before checking for `}`
+                # substitutes it and then rescans from index 0 forever.
+                ("expand('{namex', %r)" % supplied, ValueError)]
         + ([("expand('{nope}', %r)" % supplied, ValueError)]
            if missing == "raise" else []),
         refs=(_ref_expand,),
@@ -1463,25 +1594,39 @@ def generate(seed=0, per_family=2, tiers=None, families=None, limit=None):
 
 # ------------------------------------------------------------------ self-check
 
-def run_suite(solution_source, tests):
+def run_suite(solution_source, tests, out=None):
     """Run `tests` against `solution_source` as if it were the module `solution`.
 
     The suite does `from solution import ...`, so a real module object has to
     exist in ``sys.modules``. It is removed afterwards: leaving eighteen
     different `solution` modules behind would make the next import order-
     dependent, which is exactly the kind of bug a self-check must not have.
+
+    Returns whatever the suite wrote to stdout, which is where its per-check
+    report goes. Captured rather than passed through because the battery runs
+    every suite six times: printed, that is tens of thousands of report lines
+    between the caller and its own output.
+
+    Pass `out` -- any writable text buffer -- to read the report on the paths
+    where the suite raises, which is every path a failing candidate takes and so
+    exactly where the per-check count is worth having. Callers that only care
+    about the passing case can ignore it and use the return value.
     """
     module = types.ModuleType("solution")
     previous = sys.modules.get("solution")
     sys.modules["solution"] = module
+    captured = io.StringIO() if out is None else out
     try:
-        exec(compile(solution_source, "<solution>", "exec"), module.__dict__)
-        exec(compile(tests, "<test_solution>", "exec"), {"__name__": "__main__"})
+        with contextlib.redirect_stdout(captured):
+            exec(compile(solution_source, "<solution>", "exec"), module.__dict__)
+            exec(compile(tests, "<test_solution>", "exec"),
+                 {"__name__": "__main__"})
     finally:
         if previous is None:
             sys.modules.pop("solution", None)
         else:
             sys.modules["solution"] = previous
+    return captured.getvalue()
 
 
 def _stub(names):
@@ -1489,14 +1634,217 @@ def _stub(names):
     return "".join("def %s(*args, **kwargs):\n    return None\n\n" % name
                    for name in names)
 
+# ----------------------------------------------- the self-check's mutation battery
+#
+# One stub was never enough. `run_eval.StubModel._wrong` -- the strongest wrong
+# implementation this tree can produce -- applies the *first* applicable of the
+# edits below and then stops, so a suite can catch that one edit and stay blind to
+# the other four. That is not hypothetical: `eval/calibrate.py --stub broken` hands
+# `validation-01` and `validation-02` a wrong solution their own suites pass, while
+# `--self-check` calls the same suites sound because the only thing it ever tried
+# was the vacuous stub, which every suite catches. The lock then records the weaker
+# claim in the words of the stronger one.
+#
+# Applying each edit independently makes "every suite fails a wrong implementation"
+# a claim about that stub's whole closure rather than about whichever edit it
+# happened to reach for a given parameterisation. Deliberately *not* AST mutation
+# scoring, which stays deferred: five named textual edits plus the vacuous stub, so
+# what the lock promises is legible from the lock. `--write-lock` records the names
+# and a lock recording a different battery fails `--verify-lock`.
+STUB_EDITS = (
+    ("raise_to_pass", "raise", None),
+    ("ge_to_gt", ">=", ">"),
+    ("le_to_lt", "<=", "<"),
+    ("or_to_and", " or ", " and "),
+    ("sorted_to_list", "sorted(", "list("),
+)
+
+VACUOUS_STUB = "vacuous_stub"
+BATTERY = (VACUOUS_STUB,) + tuple(name for name, _, _ in STUB_EDITS)
+
+# A mutation can turn a terminating loop into a non-terminating one -- three in the
+# current set do -- so the battery needs a stop, and the vacuous stub never needed
+# one. It counts line events rather than taking a wall clock: the self-check's
+# verdict is recorded in tasks.lock, and a verdict that depends on how busy the
+# machine was is not something to freeze. The worst legitimate suite in the current
+# set spends 4,506 events, so this is 55x headroom, and a runaway is stopped in
+# about 40ms.
+RUNAWAY_BUDGET = 250000
+
+# Only these two frames are counted, so the budget means the same thing on every
+# interpreter; a count that included stdlib frames would drift with the standard
+# library and the lock would stop being reproducible across versions.
+_TRACED = ("<solution>", "<test_solution>")
+
+
+class _Runaway(BaseException):
+    """A mutant that stopped terminating.
+
+    `BaseException`, so neither a generated `except ValueError` nor a future
+    reference with a broad `except Exception` can swallow the stop and hand the
+    battery back a hang.
+    """
+
+
+# Mutants no assertion can catch, each with the argument for it. An exemption is
+# not "we could not think of a test"; it is the claim that the mutant computes the
+# same function as the reference on every input the prompt admits, so demanding the
+# suite catch it would be demanding an assertion that has to be false. Recorded in
+# tasks.lock so the list is frozen and reviewable rather than a quiet skip.
+EQUIVALENT_MUTANTS = {
+    ("tiered_pricing", "le_to_lt"): (
+        "`if units <= previous: break` guards a bracket whose contribution is "
+        "`(min(units, limit) - previous) * rate`, exactly 0 when units == "
+        "previous, and the trailing `units > previous` top-up is then False too. "
+        "So `<` charges what `<=` charges for every legal input. Swept over "
+        "0..max_limit+200 for both variants: 0 disagreements."),
+}
+
+# `unreachable` is computed, `equivalent` is asserted and reviewed, and
+# `not_applicable` is a property of the reference's text. None of the three is a
+# suite defect, which is why they are named separately from `survived`.
+MUTATION_SKIPS = ("not_applicable", "unreachable", "equivalent")
+
+
+def _mutate(source, mutation):
+    """`(mutant, lines)` for one named edit, or `(None, ())` where it does not apply.
+
+    Each edit is applied exactly the way `StubModel._wrong` applies it -- every
+    `raise` line for `raise_to_pass`, the first occurrence only for the other four
+    -- so a passing battery *implies* that no suite passes `--stub broken`, whatever
+    parameterisation decides which edit that stub reaches first. Applying them any
+    harder would be mutation scoring, which is deferred, and would fail suites for
+    wrong implementations nothing in this tree can produce.
+    """
+    if mutation == VACUOUS_STUB:
+        return None, ()
+    find, replace = dict((name, (f, r)) for name, f, r in STUB_EDITS)[mutation]
+    if find == "raise":
+        lines, edited, hit = source.splitlines(), [], []
+        for index, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith("raise "):
+                edited.append(line[:len(line) - len(stripped)] + "pass")
+                hit.append(index + 1)
+            else:
+                edited.append(line)
+        if not hit:
+            return None, ()
+        return "\n".join(edited) + "\n", tuple(hit)
+    if find not in source:
+        return None, ()
+    head = source.index(find)
+    return source.replace(find, replace, 1), (source.count("\n", 0, head) + 1,)
+
+
+def _run_traced(solution_source, tests, budget=RUNAWAY_BUDGET, out=None):
+    """`run_suite` under a line-event budget. Returns the solution lines that ran."""
+    spent = [0]
+    seen = set()
+
+    def trace(frame, event, arg):
+        name = frame.f_code.co_filename
+        if name not in _TRACED:
+            return None
+        spent[0] += 1
+        if spent[0] > budget:
+            raise _Runaway("stopped after %d line events" % budget)
+        if name == "<solution>":
+            seen.add(frame.f_lineno)
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        run_suite(solution_source, tests, out=out)
+    finally:
+        sys.settrace(previous)
+    return seen
+
+
+def suite_rejects(solution_source, tests, budget=RUNAWAY_BUDGET):
+    """`(rejected, why)` -- does this suite fail this solution?
+
+    A runaway counts as rejected: a candidate that stops terminating fails on the
+    child's timeout in the real harness, so treating it as passing here would be the
+    one verdict the pipeline can never deliver.
+    """
+    try:
+        _run_traced(solution_source, tests, budget)
+    except _Runaway:
+        return True, "stopped terminating"
+    except Exception as exc:
+        return True, type(exc).__name__
+    return False, ""
+
+
+def battery_verdicts(task, budget=RUNAWAY_BUDGET):
+    """`(mutation, verdict, detail)` per battery member, in battery order.
+
+    `verdict` is `caught`, `survived`, or one of `MUTATION_SKIPS`. The reference is
+    traced first so a mutation that edits a line the reference never executes under
+    its own suite is reported as `unreachable` rather than as a toothless suite:
+    such an edit cannot change an observable answer, so no assertion can catch it
+    and charging the suite for it would be a false failure -- the same shape of
+    error as charging the Executor for the harness's own denial.
+    """
+    reachable = _run_traced(task.reference, task.tests, budget)
+    verdicts = []
+    for mutation in BATTERY:
+        lines = ()
+        if mutation == VACUOUS_STUB:
+            source = _stub(task.names)
+        else:
+            source, lines = _mutate(task.reference, mutation)
+            if source is None:
+                verdicts.append((mutation, "not_applicable",
+                                 "the reference does not contain the edit site"))
+                continue
+            if not set(lines) & reachable:
+                verdicts.append((mutation, "unreachable",
+                                 "reference line%s %s never run under the "
+                                 "reference's own suite"
+                                 % ("" if len(lines) == 1 else "s",
+                                    ", ".join(str(n) for n in lines))))
+                continue
+            if (task.family, mutation) in EQUIVALENT_MUTANTS:
+                verdicts.append((mutation, "equivalent",
+                                 EQUIVALENT_MUTANTS[(task.family, mutation)]))
+                continue
+        rejected, why = suite_rejects(source, task.tests, budget)
+        if rejected:
+            verdicts.append((mutation, "caught", why))
+        else:
+            verdicts.append((mutation, "survived",
+                             "" if not lines
+                             else "at reference line %s"
+                             % ", ".join(str(n) for n in lines)))
+    return verdicts
+
+
+def battery_record():
+    """What `--write-lock` records about the battery.
+
+    The names, the budget and the exemptions, because the lock's guarantee is only
+    as strong as the battery that produced it. Recording "the self-check passed"
+    without recording what it ran is how the old lock came to promise more than the
+    code delivered.
+    """
+    return {"mutations": list(BATTERY),
+            "runaway_budget": RUNAWAY_BUDGET,
+            "equivalent_mutants": sorted("%s:%s" % key
+                                         for key in EQUIVALENT_MUTANTS)}
+
 
 def self_check(tasks, verbose=False):
     """Prove each suite is worth grading against, and report what failed.
 
     Two properties, and a suite is useless without both: it passes against the
-    reference (so a correct solution is not failed) and it *fails* against a
-    stub (so an incorrect one is not passed). The second is the one that
-    catches a suite full of ``assert callable(f)``.
+    reference (so a correct solution is not failed) and it *fails* against every
+    wrong implementation in `BATTERY` (so an incorrect one is not passed). The
+    second leg used to be one vacuous stub, which catches a suite full of
+    ``assert callable(f)`` and nothing subtler; the battery is what makes it catch a
+    suite that cannot tell a rejected prefix from a rejected checksum.
     """
     failures = []
     for task in tasks:
@@ -1506,13 +1854,18 @@ def self_check(tasks, verbose=False):
             failures.append("%s: reference fails its own suite: %s: %s"
                             % (task.task_id, type(exc).__name__, exc))
             continue
-        try:
-            run_suite(_stub(task.names), task.tests)
-        except Exception:
-            pass  # good: the suite noticed the stub
-        else:
-            failures.append("%s: suite passes against a stub - it is vacuous"
-                            % task.task_id)
+        verdicts = battery_verdicts(task)
+        survived = [(name, detail) for name, verdict, detail in verdicts
+                    if verdict == "survived"]
+        for name, detail in survived:
+            if name == VACUOUS_STUB:
+                failures.append("%s: suite passes against a stub - it is vacuous"
+                                % task.task_id)
+            else:
+                failures.append(
+                    "%s: suite passes the %s mutant %s - a wrong implementation "
+                    "would be graded as correct" % (task.task_id, name, detail))
+        if survived:
             continue
         for banned in ("assert ", "\ndef ", "```"):
             if banned in task.prompt:
@@ -1521,8 +1874,13 @@ def self_check(tasks, verbose=False):
             failures.append("%s: suite is suspiciously thin (%d lines)"
                             % (task.task_id, len(task.tests.splitlines())))
         if verbose:
-            print("  ok  %-28s tier %d  %d asserts"
-                  % (task.task_id, task.tier, task.tests.count("assert ")))
+            caught = sum(1 for _, verdict, _ in verdicts if verdict == "caught")
+            skipped = ["%s:%s" % (name, verdict) for name, verdict, _ in verdicts
+                       if verdict in MUTATION_SKIPS]
+            print("  ok  %-28s tier %d  %2d asserts  battery %d/%d caught%s"
+                  % (task.task_id, task.tier, task.tests.count("assert "),
+                     caught, len(BATTERY),
+                     ("  skipped %s" % ", ".join(skipped)) if skipped else ""))
     failures.extend(check_prompt_fairness(tasks))
     return failures
 
@@ -1559,6 +1917,258 @@ def check_prompt_fairness(tasks, peers=6):
                     break
     return failures
 
+# ------------------------------------------------------------------- tasks.lock
+
+# Written once, on purpose, by `--write-lock`. Never regenerated as a side effect
+# of anything: a lock that rewrites itself when it disagrees with the tree records
+# nothing at all, and the failure it exists to catch -- the hidden suite moving
+# under a half-finished grid -- is exactly the case where the convenient thing to
+# do is to rewrite it.
+LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "tasks.lock")
+LOCK_VERSION = 1
+
+# Full sha256, not the 16-hex prefix `run_eval._suite_hash` uses for the visible
+# gate suite. That one is an identity label inside one run's results; this one is
+# an integrity record that has to survive being compared across months, and the
+# two are deliberately different lengths so nobody compares them by accident.
+def digest(text):
+    """sha256 of one task part, hex. Empty text hashes to the empty string."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# The three parts, hashed separately rather than together. A single combined
+# digest would say "something moved" and stop there; the point of the lock is to
+# name which of the three, because a moved prompt, a moved suite and a moved
+# reference are three different accidents with three different consequences.
+DIGEST_PARTS = ("prompt", "tests", "reference")
+
+
+def task_digests(task):
+    return dict(("%s_sha256" % part, digest(getattr(task, part)))
+                for part in DIGEST_PARTS)
+
+
+def _lock_body(tasks, generator, self_check):
+    by_tier = {}
+    for task in tasks:
+        by_tier[str(task.tier)] = by_tier.get(str(task.tier), 0) + 1
+    entries = []
+    for task in tasks:
+        entry = {"task_id": task.task_id, "family": task.family,
+                 "tier": task.tier, "variant": task.variant}
+        entry.update(task_digests(task))
+        entries.append(entry)
+    return {
+        "version": LOCK_VERSION,
+        "digest_algorithm": "sha256",
+        "generator": generator,
+        "counts": {"tasks": len(tasks),
+                   "families": len(set(t.family for t in tasks)),
+                   "by_tier": by_tier},
+        "self_check": self_check,
+        "tasks": sorted(entries, key=lambda e: e["task_id"]),
+    }
+
+
+def _canonical(body):
+    return json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+def body_digest(body):
+    """The digest of everything except the digest field itself.
+
+    So a hand-edited lock -- one digest quietly updated to match a suite somebody
+    changed -- is detectable as an edit, not just as agreement.
+    """
+    without = dict((name, value) for name, value in body.items()
+                   if name != "body_sha256")
+    return hashlib.sha256(_canonical(without).encode("utf-8")).hexdigest()
+
+
+def generator_args(seed=0, per_family=2, tiers=None, families=None, limit=None):
+    """The selection that produced a task set, as it goes into the lock.
+
+    Recorded in full and not just as the seed: `generate` takes five arguments
+    and four of them change which tasks exist, so a lock that records only the
+    seed cannot be regenerated from itself.
+    """
+    return {"seed": seed, "per_family": per_family,
+            "tiers": sorted(tiers or ()), "families": sorted(families or ()),
+            "limit": limit}
+
+
+def generate_from(generator):
+    """The task set a lock's own `generator` block describes."""
+    return generate(seed=generator["seed"],
+                    per_family=generator["per_family"],
+                    tiers=set(generator.get("tiers") or ()),
+                    families=set(generator.get("families") or ()),
+                    limit=generator.get("limit"))
+
+
+def write_lock(path=None, seed=0, per_family=2, tiers=None, families=None,
+               limit=None, verbose=False):
+    """Run the self-check, then record the task set. Returns (path, failures).
+
+    The self-check is not optional here and its result is recorded with the time
+    it was obtained. "We validated the task set" was previously a claim about
+    something somebody ran once; this is that claim, dated, next to the digests
+    of the exact tasks it was run against. A failing self-check refuses to write:
+    a lock over a task set that cannot grade anything is worse than no lock,
+    because everything downstream would then verify happily against it.
+    """
+    path = path or LOCK_PATH
+    generator = generator_args(seed, per_family, tiers, families, limit)
+    tasks = generate_from(generator)
+    if not tasks:
+        return path, ["no tasks selected, so there is nothing to lock"]
+    failures = self_check(tasks, verbose=verbose)
+    if failures:
+        return path, failures
+    body = _lock_body(tasks, generator, {
+        "passed": True,
+        "tasks": len(tasks),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "command": "gen_tasks.py --write-lock",
+        # What the claim is worth, next to the claim. A lock that said only
+        # "passed" made a promise whose strength nobody could read off it.
+        "battery": battery_record(),
+    })
+    body["body_sha256"] = body_digest(body)
+    with open(path, "w") as handle:
+        json.dump(body, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return path, []
+
+
+def load_lock(path=None):
+    """The lock, or `None` when there is no file. Malformed JSON raises."""
+    path = path or LOCK_PATH
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _index(lock):
+    return dict((entry["task_id"], entry) for entry in lock.get("tasks", ()))
+
+
+def verify_lock(lock, tasks=None, seed=None):
+    """Every way the locked task set can have moved. Returns failure strings.
+
+    Three independent legs, and all three are needed:
+
+      * regenerate from the lock's own `generator` block and compare every
+        digest. This catches an edit to `gen_tasks.py` -- a changed reference, a
+        retuned parameter, a reworded prompt -- which is the case that silently
+        invalidates a half-finished grid.
+      * compare the task set a *run* actually selected against the lock. This
+        catches a run that generated tasks the lock never saw: a different seed,
+        a wider `--per-family`, a family added since the lock was written.
+      * compare the self-check battery the lock records against the one this code
+        runs. Every digest can match while the claim behind them has weakened,
+        because "the suites fail a wrong implementation" means whatever the battery
+        that ran means.
+
+    Named per task and per part, because "a digest moved" is not actionable and
+    "aggregation-01's tests digest moved" is.
+    """
+    failures = []
+    if not isinstance(lock, dict):
+        return ["tasks.lock is not a JSON object"]
+    if lock.get("version") != LOCK_VERSION:
+        failures.append("tasks.lock version is %r, this code writes %d"
+                        % (lock.get("version"), LOCK_VERSION))
+        return failures
+    recorded = lock.get("body_sha256")
+    actual = body_digest(lock)
+    if recorded != actual:
+        failures.append(
+            "tasks.lock was edited by hand: body_sha256 is %s but its contents "
+            "hash to %s. Regenerate it with --write-lock if that was deliberate."
+            % (recorded, actual))
+    if not lock.get("self_check", {}).get("passed"):
+        failures.append("tasks.lock records no passing --self-check, so the "
+                        "suites it locks were never shown to grade anything")
+    recorded_battery = lock.get("self_check", {}).get("battery")
+    current_battery = battery_record()
+    if recorded_battery != current_battery:
+        failures.append(
+            "tasks.lock records the self-check battery %s and this code runs %s. "
+            "The lock's guarantee is exactly as strong as the battery that "
+            "produced it, so a moved battery voids it even when every digest "
+            "matches: re-run --write-lock."
+            % (json.dumps(recorded_battery, sort_keys=True),
+               json.dumps(current_battery, sort_keys=True)))
+
+    index = _index(lock)
+    regenerated = generate_from(lock.get("generator") or generator_args())
+    failures.extend(_compare(index, regenerated, "gen_tasks.py"))
+    if lock.get("counts", {}).get("tasks") != len(regenerated):
+        failures.append("tasks.lock records %s task(s), the generator now "
+                        "produces %d"
+                        % (lock.get("counts", {}).get("tasks"),
+                           len(regenerated)))
+
+    if tasks is not None:
+        locked_seed = (lock.get("generator") or {}).get("seed")
+        if seed is not None and seed != locked_seed:
+            failures.append(
+                "this run uses seed %s and tasks.lock was written for seed %s. "
+                "The task ids are the same and their contents are not, so the "
+                "lock cannot vouch for this run: write a lock for seed %s."
+                % (seed, locked_seed, seed))
+        failures.extend(_compare(index, tasks, "this run's selection",
+                                 subset=True))
+    return failures
+
+
+def _compare(index, tasks, source, subset=False):
+    """Digest-by-digest, naming the task and the part that moved."""
+    failures = []
+    for task in tasks:
+        entry = index.get(task.task_id)
+        if entry is None:
+            failures.append("%s: %s produced a task that tasks.lock does not "
+                            "contain" % (task.task_id, source))
+            continue
+        for part in DIGEST_PARTS:
+            key = "%s_sha256" % part
+            now = digest(getattr(task, part))
+            if entry.get(key) != now:
+                failures.append(
+                    "%s: the %s digest moved (locked %s, %s now produces %s)"
+                    % (task.task_id, part, str(entry.get(key))[:16], source,
+                       now[:16]))
+    if not subset:
+        produced = set(task.task_id for task in tasks)
+        for task_id in sorted(set(index) - produced):
+            failures.append("%s: tasks.lock contains it and %s no longer "
+                            "produces it" % (task_id, source))
+    return failures
+
+
+def verify_lock_or_reason(tasks=None, seed=None, path=None):
+    """`(failures, reason)` -- `reason` set when there is no lock to verify.
+
+    Separated from the failure list because "the lock disagrees" and "there is no
+    lock" call for different words at a caller that has to refuse either way.
+    """
+    path = path or LOCK_PATH
+    try:
+        lock = load_lock(path)
+    except ValueError as exc:
+        return ["%s is not readable JSON: %s" % (path, exc)], None
+    if lock is None:
+        return [], ("no %s, so nothing states which task set this is. Write one "
+                    "with `python3 eval/gen_tasks.py --write-lock`."
+                    % os.path.basename(path))
+    return verify_lock(lock, tasks=tasks, seed=seed), None
+
 # -------------------------------------------------------------------------- cli
 
 def _parse_args(argv):
@@ -1579,8 +2189,20 @@ def _parse_args(argv):
     parser.add_argument("--show", default=None, metavar="TASK_ID",
                         help="print one task's prompt, reference and suite")
     parser.add_argument("--self-check", action="store_true",
-                        help="verify every suite passes its reference and "
-                             "fails a stub")
+                        help="verify every suite passes its reference and fails "
+                             "every applicable mutation in the battery")
+    parser.add_argument("--write-lock", action="store_true",
+                        help="run --self-check and record the task set in "
+                             "eval/tasks.lock: per task the sha256 of the "
+                             "prompt, the hidden suite and the reference. "
+                             "Deliberate and explicit; nothing else writes it.")
+    parser.add_argument("--verify-lock", action="store_true",
+                        help="regenerate from the lock's own recorded seed and "
+                             "fail on any digest that moved, naming the task "
+                             "and the part")
+    parser.add_argument("--lock", default=None, metavar="PATH",
+                        help="lock file to write or verify (default "
+                             "eval/tasks.lock)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -1613,11 +2235,78 @@ def _cmd_show(tasks, task_id):
     return 2
 
 
+def _cmd_write_lock(args):
+    """`--write-lock`. Refuses on a failing self-check rather than recording it."""
+    path, failures = write_lock(path=args.lock, seed=args.seed,
+                               per_family=args.per_family,
+                               tiers=set(args.tiers or ()),
+                               families=set(args.families or ()),
+                               limit=args.limit, verbose=args.verbose)
+    if failures:
+        print("refusing to write %s: the self-check does not pass, and a lock "
+              "over a task set that cannot grade anything would make every "
+              "later --verify-lock agree with a broken tree." % path,
+              file=sys.stderr)
+        for line in failures:
+            print("FAIL %s" % line, file=sys.stderr)
+        return 1
+    lock = load_lock(path)
+    print("wrote %s" % path)
+    print("  %d task(s), %d famil%s, tiers %s"
+          % (lock["counts"]["tasks"], lock["counts"]["families"],
+             "y" if lock["counts"]["families"] == 1 else "ies",
+             ", ".join("%s=%d" % pair
+                       for pair in sorted(lock["counts"]["by_tier"].items()))))
+    print("  generator %s" % json.dumps(lock["generator"], sort_keys=True))
+    print("  self-check passed at %s" % lock["self_check"]["at"])
+    print("  battery %s" % ", ".join(lock["self_check"]["battery"]["mutations"]))
+    print("  runaway budget %d line event(s), %d documented equivalent mutant(s)"
+          % (lock["self_check"]["battery"]["runaway_budget"],
+             len(lock["self_check"]["battery"]["equivalent_mutants"])))
+    print("  body sha256 %s" % lock["body_sha256"])
+    print("\nThis file is not regenerated by anything else. If a digest ever "
+          "moves, that is the finding -- not a reason to rewrite the lock.")
+    return 0
+
+
+def _cmd_verify_lock(args):
+    """`--verify-lock`. Loud, named per task and per part, and cheap."""
+    path = args.lock or LOCK_PATH
+    started = time.time()
+    failures, reason = verify_lock_or_reason(path=path)
+    if reason:
+        print("cannot verify: %s" % reason, file=sys.stderr)
+        return 2
+    lock = load_lock(path)
+    if failures:
+        print("tasks.lock DOES NOT MATCH the generator (%d problem%s):"
+              % (len(failures), "" if len(failures) == 1 else "s"),
+              file=sys.stderr)
+        for line in failures:
+            print("FAIL %s" % line, file=sys.stderr)
+        print("\nNothing should be measured against a task set that moved under "
+              "it. Either restore gen_tasks.py, or write a new lock deliberately "
+              "and treat every existing result as belonging to the old one.",
+              file=sys.stderr)
+        return 1
+    print("tasks.lock verified: %d task(s), %d digest(s), regenerated in %.0fms"
+          % (lock["counts"]["tasks"],
+             len(lock["tasks"]) * len(DIGEST_PARTS),
+             (time.time() - started) * 1000))
+    print("  seed %s, self-check passed at %s"
+          % (lock["generator"]["seed"], lock["self_check"]["at"]))
+    print("  battery %s"
+          % ", ".join(lock["self_check"]["battery"]["mutations"]))
+    return 0
+
+
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.list:
         _cmd_list()
         return 0
+    if args.verify_lock:
+        return _cmd_verify_lock(args)
 
     known = set(fam.name for fam in FAMILIES)
     unknown = sorted(set(args.families or ()) - known)
@@ -1632,6 +2321,9 @@ def main(argv=None):
 
     if args.show:
         return _cmd_show(tasks, args.show)
+
+    if args.write_lock:
+        return _cmd_write_lock(args)
 
     if args.self_check:
         print("self-check: %d tasks from %d families"

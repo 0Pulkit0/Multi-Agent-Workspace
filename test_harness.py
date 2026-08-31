@@ -204,6 +204,74 @@ def test_stdin_does_not_hang():
     check("EOFError surfaced", "EOFError" in result.stderr, repr(result.stderr)[:200])
 
 
+def _report(*lines):
+    """A stdout with `lines` as tagged report lines, plus some user noise."""
+    body = ["solution says hello"]
+    body += ["%s %s" % (harness.CHECK_TAG, line) for line in lines]
+    return "\n".join(body) + "\n"
+
+
+def test_the_per_check_report_is_read_or_distrusted():
+    """`read_checks` counts a coherent report and refuses an incoherent one.
+
+    The tally shares stdout with the code under test, so a solution can print the
+    tag. The guarantee therefore cannot be "forged lines are ignored" -- there is
+    no way to tell whose line is whose. It is that forgery can only ever destroy
+    a report, never inflate one: every failure shape below returns `(0, 0)` with a
+    note, and the caller reads that as *unknown*, which ranks below a measured
+    zero.
+
+    `total` is the load-bearing distinction in the first two cases. A suite whose
+    import failed produced no report at all, and "0 of 0, untrusted" is the only
+    honest reading of that -- reporting "0 of 13 passed" would let a missing entry
+    point look like a candidate that ran and scored nothing.
+    """
+    passed, total, kinds, note = harness.read_checks(
+        _report("1 pass -", "2 fail AssertionError", "3 fail TypeError",
+                "done 3"))
+    check("a coherent report is counted", (passed, total, note) == (1, 3, ""),
+          (passed, total, note))
+    check("and each check's exception type is carried out by id",
+          kinds == ["-", "AssertionError", "TypeError"], kinds)
+
+    passed, total, _kinds, note = harness.read_checks("Traceback...\nImportError\n")
+    check("no report at all is 0 of 0 and unknown, not 0 of N",
+          (passed, total) == (0, 0) and "no per-check report" in note,
+          (passed, total, note))
+
+    passed, total, _kinds, note = harness.read_checks(
+        _report("1 pass -", "2 pass -"))
+    check("ids with no completion marker are distrusted",
+          (passed, total) == (0, 0) and "completion marker" in note,
+          (passed, total, note))
+
+    forgeries = (
+        ("a duplicate id", ("1 pass -", "1 pass -", "2 pass -", "done 2")),
+        ("an id outside 1..N", ("1 pass -", "7 pass -", "done 2")),
+        ("an extra line beyond N", ("1 pass -", "2 pass -", "3 pass -",
+                                    "done 2")),
+        ("a second completion marker", ("1 pass -", "done 1", "done 1")),
+        ("a whole forged report ahead of the real one",
+         ("1 pass -", "done 1", "1 fail AssertionError", "done 1")),
+        ("a gap in the ids", ("1 pass -", "3 pass -", "done 3")),
+    )
+    broken = []
+    for label, lines in forgeries:
+        passed, total, kinds, note = harness.read_checks(_report(*lines))
+        if (passed, total, kinds) != (0, 0, []) or not note:
+            broken.append("%s: %r" % (label, (passed, total, kinds, note)))
+    check("every forgery shape collapses to unknown rather than a pass count",
+          not broken, "; ".join(broken))
+
+    passed, total, kinds, note = harness.read_checks(
+        _report("3 pass -", "1 fail ValueError", "2 pass -", "done 3"))
+    check("ids arriving out of order are trusted, because the battery permutes "
+          "the checks on purpose and the set is what carries the guarantee",
+          (passed, total, note) == (2, 3, "")
+          and kinds == ["ValueError", "-", "-"],
+          (passed, total, kinds, note))
+
+
 def test_output_truncation():
     # Deliberately under MAX_CAPTURE_BYTES: this checks that a program which
     # *finishes* has its output trimmed for display. A program that blows the
@@ -600,6 +668,461 @@ def test_filesystem_jail():
           (result.exit_code, result.stderr[-200:]))
 
 
+def test_destructive_calls_cannot_be_spelled_around_the_guard():
+    """The guard has to hold for the *spelling* a model picks, not one of them.
+
+    Every entry point below was already wrapped. The wrapper read `args[index]`
+    only, so the keyword spelling of the same call went straight through:
+    `shutil.rmtree(path=<outside>)` deleted every file under the target and was
+    then denied on the final top-level rmdir, so it raised a PermissionError
+    that read as though the guard had held while the tree was already empty.
+    `os.remove(path=<outside>)` succeeded with no error at all. A second route
+    was `dir_fd` plus a bare name: `_fs_allowed` resolves a relative name by
+    joining it onto the workdir, which a foreign descriptor makes false, so
+    `os.unlink("top.txt", dir_fd=fd)` always looked local -- and that is the
+    route rmtree's own recursion walks, which is what made the keyword case
+    destructive rather than merely permitted.
+
+    So each case here runs against a real throwaway tree outside the workdir and
+    asserts on the survivors, not only on the exception. "It raised
+    PermissionError" was true of the case that deleted everything.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    victim = os.path.join(tempfile.gettempdir(),
+                          "harness_victim_%d" % os.getpid())
+
+    def build():
+        if os.path.isdir(victim):
+            shutil.rmtree(victim)
+        os.makedirs(os.path.join(victim, "nested"))
+        for rel in ("top.txt", os.path.join("nested", "deep.txt")):
+            with open(os.path.join(victim, rel), "w") as handle:
+                handle.write("precious\n")
+
+    def survivors():
+        found = []
+        for root, _dirs, files in os.walk(victim):
+            for name in files:
+                found.append(os.path.relpath(os.path.join(root, name), victim))
+        return sorted(found)
+
+    intact = ["nested/deep.txt".replace("/", os.sep), "top.txt"]
+    top = os.path.join(victim, "top.txt")
+
+    # (label, source). Both spellings of everything the brief named, plus the
+    # two routes that defeated the positional-only wrapper.
+    cases = (
+        ("shutil.rmtree positional",
+         "import shutil\nshutil.rmtree(%r)\n" % victim),
+        ("shutil.rmtree by keyword",
+         "import shutil\nshutil.rmtree(path=%r)\n" % victim),
+        ("os.remove positional", "import os\nos.remove(%r)\n" % top),
+        ("os.remove by keyword", "import os\nos.remove(path=%r)\n" % top),
+        ("os.unlink by keyword", "import os\nos.unlink(path=%r)\n" % top),
+        ("os.rmdir by keyword",
+         "import os\nos.rmdir(path=%r)\n" % os.path.join(victim, "nested")),
+        ("os.rename by keyword",
+         "import os\nopen('mine.txt', 'w').write('x')\n"
+         "os.rename(src='mine.txt', dst=%r)\n"
+         % os.path.join(victim, "landed.txt")),
+        ("os.replace by keyword",
+         "import os\nopen('mine.txt', 'w').write('x')\n"
+         "os.replace(src='mine.txt', dst=%r)\n" % top),
+        ("shutil.move by keyword",
+         "import shutil\nopen('mine.txt', 'w').write('x')\n"
+         "shutil.move(src='mine.txt', dst=%r)\n"
+         % os.path.join(victim, "landed.txt")),
+        ("os.makedirs by keyword",
+         "import os\nos.makedirs(name=%r)\n"
+         % os.path.join(victim, "a", "b")),
+        ("os.open by keyword",
+         "import os\nos.open(path=%r, flags=os.O_WRONLY | os.O_CREAT)\n"
+         % os.path.join(victim, "made.txt")),
+        ("os.unlink with a foreign dir_fd",
+         "import os\nfd = os.open(%r, os.O_RDONLY)\n"
+         "os.unlink('top.txt', dir_fd=fd)\n" % victim),
+        ("os.rmdir with a foreign dir_fd",
+         "import os\nfd = os.open(%r, os.O_RDONLY)\n"
+         "os.rmdir('nested', dir_fd=fd)\n" % victim),
+        ("pathlib Path.unlink",
+         "import pathlib\npathlib.Path(%r).unlink()\n" % top),
+        ("a symlink inside the workdir pointing outside",
+         "import os\nos.symlink(%r, 'escape')\n"
+         "open(os.path.join('escape', 'planted.txt'), 'w').write('x')\n"
+         % victim),
+    )
+    try:
+        for label, source in cases:
+            build()
+            _, result = harness.verify_output("```python\n%s```" % source)
+            check("%s is refused" % label,
+                  result.exit_code != 0
+                  and "execution harness" in result.stderr,
+                  (result.exit_code, result.stderr[-200:]))
+            check("  and nothing under the target was deleted (%s)" % label,
+                  survivors() == intact and os.path.isdir(victim),
+                  (survivors(), os.path.isdir(victim)))
+    finally:
+        if os.path.isdir(victim):
+            shutil.rmtree(victim)
+
+
+def test_guarded_calls_still_work_inside_the_workdir():
+    """The other half of a guard: it must not deny the legal use of the same call.
+
+    A guard that over-denies is worse than a missing one here, because the cost
+    lands on the Executor. Two live false denies were found and fixed:
+
+    `pathlib` was broken in *both* directions on 3.9. The deferred `import
+    pathlib` exists so `Path.unlink` picks up the guards, but that only works
+    for C builtins -- those do not bind, so `os.unlink` sitting on
+    `pathlib._NormalAccessor` stayed a plain function. The pure-Python wrappers
+    *do* bind, so every accessor call arrived shifted by one with the accessor
+    instance in the path slot: a legal `Path("x").write_text("hi")` raised
+    `TypeError: unsupported operand type(s) for &: 'PosixPath' and 'int'` (the
+    path had landed in `os.open`'s flags slot), a legal `read_text()` raised the
+    same, and a real escape was refused naming `<pathlib._NormalAccessor object
+    at 0x...>` instead of a path.
+
+    And refusing the `dir_fd` family outright -- the fix for the bare-name hole
+    -- also refused a legal in-workdir `shutil.rmtree("build")`, because
+    `_rmtree_safe_fd` is that family's one honest caller. rmtree is pointed at
+    its path-based walk instead, which keeps the call working and makes each step
+    of the recursion checkable, where under the fd walk it was not checkable at
+    all.
+    """
+    cases = (
+        ("open/os.remove",
+         "import os\n"
+         "open('a.txt', 'w').write('hi')\n"
+         "assert open('a.txt').read() == 'hi'\n"
+         "os.remove('a.txt')\n"
+         "assert not os.path.exists('a.txt')\n"),
+        ("os.makedirs then shutil.rmtree",
+         "import os, shutil\n"
+         "os.makedirs(os.path.join('e', 'f'))\n"
+         "open(os.path.join('e', 'f', 'g.txt'), 'w').write('x')\n"
+         "shutil.rmtree('e')\n"
+         "assert not os.path.exists('e')\n"),
+        ("os.rename and os.replace",
+         "import os\n"
+         "open('one.txt', 'w').write('x')\n"
+         "os.rename('one.txt', 'two.txt')\n"
+         "open('three.txt', 'w').write('y')\n"
+         "os.replace('three.txt', 'two.txt')\n"
+         "assert open('two.txt').read() == 'y'\n"),
+        ("shutil.move and shutil.copy2",
+         "import os, shutil\n"
+         "os.mkdir('d')\n"
+         "open('src.txt', 'w').write('x')\n"
+         "shutil.copy2('src.txt', os.path.join('d', 'copied.txt'))\n"
+         "shutil.move('src.txt', os.path.join('d', 'moved.txt'))\n"
+         "assert sorted(os.listdir('d')) == ['copied.txt', 'moved.txt']\n"),
+        ("pathlib write_text/read_text/unlink",
+         "import pathlib\n"
+         "p = pathlib.Path('b.txt')\n"
+         "p.write_text('hello')\n"
+         "assert p.read_text() == 'hello'\n"
+         "p.unlink()\n"
+         "assert not p.exists()\n"),
+        ("pathlib mkdir/rename/rmdir",
+         "import pathlib\n"
+         "d = pathlib.Path('sub')\n"
+         "d.mkdir()\n"
+         "f = d / 'c.txt'\n"
+         "f.write_text('x')\n"
+         "f.rename(d / 'd.txt')\n"
+         "assert [q.name for q in d.iterdir()] == ['d.txt']\n"
+         "(d / 'd.txt').unlink()\n"
+         "d.rmdir()\n"),
+        ("pathlib reading outside the workdir",
+         "import pathlib\n"
+         "assert len(pathlib.Path(%r).read_text()) > 100\n"
+         % harness.__file__),
+    )
+    for label, source in cases:
+        _, result = harness.verify_output("```python\n%sprint('ok')\n```" % source)
+        check("%s works inside the workdir" % label,
+              result.exit_code == 0 and result.stdout.strip() == "ok",
+              (result.exit_code, result.stdout[-200:], result.stderr[-300:]))
+
+
+# A stand-in for 3.10's `pathlib`, accessor shape only. The runner puts the workdir
+# on `sys.path` before it installs the path guard, and the guard imports `pathlib`
+# late and on purpose, so a `pathlib.py` in the workdir *is* what the guard patches.
+# That is the only way to exercise another version's accessor on this interpreter,
+# and it exercises the real block rather than a copy of its rule.
+_FAKE_PATHLIB_310 = (
+    "import io\n"
+    "import os\n"
+    "\n"
+    "\n"
+    "class _Accessor(object):\n"
+    "    pass\n"
+    "\n"
+    "\n"
+    "class _NormalAccessor(_Accessor):\n"
+    "    stat = os.stat\n"
+    "    # The whole difference: 3.10 moved `Path.open` onto the accessor, so this\n"
+    "    # slot holds io.open's six-argument signature and not os.open's four.\n"
+    "    open = io.open\n"
+    "    unlink = os.unlink\n"
+    "    rmdir = os.rmdir\n"
+    "    mkdir = os.mkdir\n"
+    "    rename = os.rename\n"
+    "    replace = os.replace\n"
+    "    chmod = os.chmod\n"
+    "    utime = os.utime\n"
+    "    symlink = staticmethod(os.symlink)\n"
+    "\n"
+    "    def truncate(self, path, length):\n"
+    "        raise NotImplementedError('pathlib-authored, not os.truncate')\n"
+    "\n"
+    "\n"
+    "_normal_accessor = _NormalAccessor()\n"
+)
+
+# And 3.11's, which dropped the accessor entirely.
+_FAKE_PATHLIB_311 = "import io\nimport os\n\n\nclass Path(object):\n    pass\n"
+
+
+def _run_runner_against(fake_pathlib, probe):
+    """`(proc, mechanism)` from the real child runner, optionally over a stand-in `pathlib`.
+
+    `fake_pathlib=None` runs against the interpreter's own pathlib, which is the
+    only way to check the guard against the shape actually in play here rather
+    than against a reconstruction of another version's shape.
+    """
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    workdir = tempfile.mkdtemp(prefix="fake-pathlib-")
+    try:
+        files = [("solution.py", probe),
+                 ("_harness_runner.py", harness._RUNNER_SOURCE)]
+        if fake_pathlib is not None:
+            files.insert(0, ("pathlib.py", fake_pathlib))
+        for name, text in files:
+            with open(os.path.join(workdir, name), "w", encoding="utf-8") as h:
+                h.write(text)
+        proc = subprocess.run(
+            [sys.executable, "-I", "-B",
+             os.path.join(workdir, "_harness_runner.py"),
+             os.path.join(workdir, "solution.py"), "20",
+             str(harness.MAX_WRITE_BYTES), str(harness.MAX_MEMORY_BYTES),
+             "solution", os.path.join(workdir, harness.PHASE_NAME)],
+            cwd=workdir, env=harness._child_env(workdir),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=60)
+        return proc, harness._read_paths_mechanism(workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_the_path_guard_is_correct_on_the_interpreter_that_runs_it():
+    """`Path.write_text` and `Path.read_text` through the real pathlib, not a stand-in.
+
+    `test_the_pathlib_guard_survives_a_moved_accessor` reconstructs the 3.9, 3.10
+    and 3.11 accessor shapes and pokes the accessor slot directly. That is the
+    right way to cover versions this machine does not have, and it is not a
+    substitute for calling the public API on the version it does: a slot can hold
+    a correctly re-wrapped function and `Path.write_text` can still fail, because
+    `write_text` reaches `os.open` through `io.open`'s `opener=` and that route has
+    its own argument shape.
+
+    Which interpreter that is, is not a choice: `harness._run_child` launches the
+    child with `sys.executable`, so the guard always runs on whatever interpreter
+    invoked the harness -- there is no second interpreter and no hardcoded
+    `python3` to drift. That is asserted here rather than described, because the
+    version-coupling this covers is only decidable if the version is known.
+
+    Three behaviours, all of them measurement-validity rather than UX. A false
+    deny lands on the Executor as FAIL_RUNTIME and silently depresses the measured
+    pass rate:
+
+      * a legal in-workdir `Path.write_text()` succeeds -- no TypeError from a
+        substituted `open`, no PermissionError from a shifted path argument.
+      * an outside `Path.write_text()` raises PermissionError naming the workdir,
+        and specifically not TypeError. The distinction matters: TypeError is the
+        guard breaking, PermissionError is the guard working.
+      * an outside `Path.read_text()` is *allowed*. Reads outside the workdir are
+        deliberately not denied -- tracebacks read source and suites read fixtures
+        -- so the honest form of "a read is not misreported as a write" is that it
+        goes through and raises nothing at all.
+    """
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    import os
+    probe = (
+        "import io, os, pathlib, sys\n"
+        "outside = os.path.join(os.sep, 'etc', 'harness_probe_write')\n"
+        "readable = %r\n"
+        "pathlib.Path('legal.txt').write_text('hi')\n"
+        "assert pathlib.Path('legal.txt').read_text() == 'hi', 'wrote nothing'\n"
+        "try:\n"
+        "    pathlib.Path(outside).write_text('x')\n"
+        "except PermissionError as exc:\n"
+        "    assert 'outside the harness working directory' in str(exc), str(exc)\n"
+        "except TypeError as exc:\n"
+        "    raise AssertionError('write outside raised TypeError: %%s' %% exc)\n"
+        "else:\n"
+        "    raise AssertionError('an outside write went through')\n"
+        "try:\n"
+        "    body = pathlib.Path(readable).read_text()\n"
+        "except PermissionError as exc:\n"
+        "    raise AssertionError('a read outside was denied as a write: %%s' %% exc)\n"
+        "except TypeError as exc:\n"
+        "    raise AssertionError('read outside raised TypeError: %%s' %% exc)\n"
+        "assert body, 'read nothing'\n"
+        "print('ok', '.'.join(str(p) for p in sys.version_info[:3]))\n"
+        % os.path.abspath(harness.__file__))
+    proc, mechanism = _run_runner_against(None, probe)
+    reported = proc.stdout.decode("utf-8", "replace").strip().split()
+    check("the child runs on the parent's own interpreter, so the guard's "
+          "version coupling is decided by one version and not two",
+          len(reported) == 2 and reported[1] == version,
+          "parent %s, child said %r" % (version, reported[-1:]))
+    check("under Python %s a legal in-workdir Path.write_text() succeeds, an "
+          "outside one is a PermissionError and not a TypeError, and an outside "
+          "Path.read_text() is allowed" % version,
+          proc.returncode == 0 and reported[:1] == ["ok"],
+          (proc.returncode, proc.stdout[-200:], proc.stderr[-600:]))
+    check("and it took the accessor route this version actually has",
+          mechanism.startswith("pathlib:"), mechanism)
+
+
+def test_the_pathlib_guard_survives_a_moved_accessor():
+    """The accessor repair must not assume which function belongs in a slot.
+
+    The first repair put `os.<name>` back into every accessor slot as a
+    staticmethod, which is right on 3.9 and wrong from 3.10: 3.10 moved `Path.open`
+    onto the accessor, that slot holds `io.open`'s six-argument signature, and
+    four-argument `os.open` in it raises `TypeError: open() takes at most 4
+    arguments (6 given)` on a *legal* in-workdir `Path.write_text()`. A false deny,
+    charged to the Executor -- the same failure the repair was written to fix, one
+    version later. Skipping the block on 3.10 would be worse still: the slots would
+    keep the pure-Python guards, they would keep binding, and every legal
+    `Path.unlink()` would arrive with the accessor in the path slot and be refused.
+
+    So the rule is to re-wrap what the slot already holds, and only where that is
+    the module-level function this guard patched. Checked against both shapes on
+    one interpreter, because the version that broke it is not the version this runs
+    on and a comment is not a check.
+    """
+    probe_310 = (
+        "import io, os, pathlib\n"
+        "acc = pathlib._NormalAccessor\n"
+        "raw = vars(acc)\n"
+        "assert isinstance(raw['open'], staticmethod), 'the open slot still binds'\n"
+        "assert acc.open is io.open, 'the open slot was substituted, not re-wrapped'\n"
+        "assert acc.open is not os.open, 'os.open was put in io.open s slot'\n"
+        "assert isinstance(raw['unlink'], staticmethod), 'unlink still binds'\n"
+        "assert acc.unlink is os.unlink, 'the unlink slot was substituted'\n"
+        "assert not isinstance(raw['truncate'], staticmethod), 'a pathlib-authored "
+        "slot was rebound, which shifts it the other way'\n"
+        # The six-argument call shape 3.10 actually makes, both directions.
+        "handle = pathlib._normal_accessor.open('legal.txt', 'w', -1, None, None, "
+        "None)\n"
+        "handle.write('hi')\n"
+        "handle.close()\n"
+        "assert open('legal.txt').read() == 'hi', 'a legal in-workdir write failed'\n"
+        "try:\n"
+        "    pathlib._normal_accessor.open('/etc/harness_probe', 'w', -1, None, "
+        "None, None)\n"
+        "except PermissionError as exc:\n"
+        "    assert 'outside the harness working directory' in str(exc), str(exc)\n"
+        "else:\n"
+        "    raise AssertionError('an outside write went through the accessor')\n"
+        "print('ok')\n")
+    proc, mechanism = _run_runner_against(_FAKE_PATHLIB_310, probe_310)
+    check("a 3.10-shaped accessor keeps its own six-argument open, and both a "
+          "legal in-workdir write and a refused escape go through it",
+          proc.returncode == 0 and proc.stdout.strip() == b"ok",
+          (proc.returncode, proc.stdout[-200:], proc.stderr[-500:]))
+    check("and the reported mechanism names what it did, slot by slot",
+          mechanism == "pathlib:accessor-rebound-8+1-left-alone", mechanism)
+
+    proc, mechanism = _run_runner_against(
+        _FAKE_PATHLIB_311,
+        "import os\n"
+        "open('legal.txt', 'w').write('hi')\n"
+        "try:\n"
+        "    open('/etc/harness_probe', 'w')\n"
+        "except PermissionError:\n"
+        "    print('ok')\n")
+    check("an accessor-less pathlib is skipped rather than patched, and the "
+          "guard on os.* and io.open still holds without it",
+          proc.returncode == 0 and proc.stdout.strip() == b"ok",
+          (proc.returncode, proc.stdout[-200:], proc.stderr[-500:]))
+    check("and the reported mechanism says so instead of naming a repair that "
+          "never ran", mechanism == "pathlib:direct-calls", mechanism)
+
+    # The live interpreter, reported rather than predicted: the parent cannot know
+    # which branch the child took, so the child writes it and the parent reads it.
+    import pathlib as _parent_pathlib
+
+    _, result = harness.verify_output("```python\nprint('hi')\n```")
+    reported = [layer for layer in result.sandbox_layers
+                if layer.startswith("pathlib:")]
+    check("the pathlib dimension is reported exactly once", len(reported) == 1,
+          result.sandbox_layers)
+    expected = ("accessor-rebound-"
+                if hasattr(_parent_pathlib, "_NormalAccessor") else "direct-calls")
+    check("and on this interpreter it reports the branch this pathlib admits of",
+          reported and reported[0].startswith("pathlib:" + expected),
+          (reported, expected))
+    check("a child that never started leaves the dimension unanswered rather "
+          "than claiming a mechanism",
+          harness._read_paths_mechanism(harness.__file__ + "-does-not-exist")
+          == harness.PATHS_UNREPORTED)
+    check("the runner and the parent agree on the marker's name",
+          harness.PATHS_NAME in harness._RUNNER_SOURCE, harness.PATHS_NAME)
+
+
+def test_a_path_denial_is_the_models_failure_not_the_harnesss():
+    """A refused escape must stay revisable, which is why it is not FAIL_PATH.
+
+    The Sprint 7 brief asked for denials to surface as FAIL_PATH. They should
+    not. FAIL_PATH means the harness could not make `solution` importable; it
+    maps to VERDICT_UNVERIFIED with the reason "sys.path repair failed", and the
+    code comment at its one assignment site reads "our bug, not the Executor's"
+    precisely so those runs are neither graded nor revised. A model that wrote
+    `shutil.rmtree("/Users/someone")` has not exposed a harness bug -- it made a
+    mistake it can be told about and can fix. Routing it to FAIL_PATH would file
+    every escape attempt as a harness malfunction and make it unrevisable, so it
+    keeps arriving as an ordinary runtime failure, carrying the PermissionError.
+    What this checks is that the message reads correctly for that audience.
+    """
+    import os
+    import tempfile
+
+    probe = os.path.join(tempfile.gettempdir(),
+                         "harness_label_probe_%d.txt" % os.getpid())
+    verdict, result = harness.verify_output(
+        "```python\nimport shutil\nshutil.rmtree(path=%r)\n```"
+        % os.path.dirname(os.path.abspath(harness.__file__))
+    )
+    check("a refused escape is not filed as a harness bug",
+          result.failure_kind != harness.FAIL_PATH, result.failure_kind)
+    check("and not as unverified, so the run is still revisable",
+          verdict != harness.VERDICT_UNVERIFIED, verdict)
+    check("the message says what was refused and who refused it",
+          "writing outside the harness working directory" in result.stderr
+          and "execution harness" in result.stderr, result.stderr[-300:])
+    check("and it names the path, not an internal object",
+          os.path.dirname(os.path.abspath(harness.__file__)) in result.stderr
+          and "_NormalAccessor" not in result.stderr, result.stderr[-300:])
+    fixes = harness.format_fixes(verdict, result)
+    check("the Executor is given something to act on",
+          bool(fixes.strip()), fixes[:200])
+    if os.path.exists(probe):
+        os.remove(probe)
+
+
 def test_timeout_phase_attribution():
     """One timeout used to cover three problems with opposite fixes.
 
@@ -671,6 +1194,36 @@ def test_sandbox_layers_are_honest():
           "in-process:no-outside-writes" in result.sandbox_layers,
           result.sandbox_layers)
 
+    # `in-process:no-outside-writes` names the mechanism that was installed. It
+    # does not say whether anything stood behind it, and that is the question a
+    # reader of this list is actually asking, so the path dimension answers it
+    # the way the memory dimension answers "was the rlimit enforced".
+    paths = [layer for layer in result.sandbox_layers
+             if layer.startswith("paths:")]
+    check("the path dimension is reported exactly once", len(paths) == 1,
+          result.sandbox_layers)
+    # One prefix, because the OS-jail slot now names its dimension first like every
+    # other slot does. It used to name the *mechanism* when a jail engaged
+    # (`sandbox-exec:no-net`) and the dimension only when none did, so this
+    # selection needed the union of every mechanism name it might see and would
+    # have silently missed any jail added later.
+    os_layer = [layer for layer in result.sandbox_layers
+                if layer.startswith(harness.OS_LAYER_PREFIX)]
+    check("the path label matches the reporting function",
+          paths == [harness._path_layer(os_layer[0] if os_layer else "")],
+          (paths, os_layer))
+    check("the in-process guard is never reported as the OS layer",
+          paths[0] != (os_layer[0] if os_layer else ""), (paths, os_layer))
+    if os_layer and "no-write" in os_layer[0]:
+        check("an OS write-deny is credited to the OS",
+              "os-write-deny" in paths[0], (paths, os_layer))
+    else:
+        check("without an OS write-deny the guard admits it stood alone",
+              paths[0].endswith("guard-only"), (paths, os_layer))
+    check("and neither label claims to be a security boundary",
+          "secure" not in " ".join(result.sandbox_layers).lower(),
+          result.sandbox_layers)
+
     # A cap that is claimed must be a cap that was attempted.
     check("the child is actually asked to set a memory limit",
           "RLIMIT_AS" in harness._RUNNER_SOURCE
@@ -689,6 +1242,123 @@ def test_sandbox_rules_are_complete():
           "%d.%d" % sys.version_info[:2] in rules, rules)
 
 
+def test_the_os_jail_permits_the_writes_the_in_process_guard_permits():
+    """The two write guards must agree, and on macOS they silently did not.
+
+    `tempfile.mkdtemp()` hands back a path reached through a symlink -- macOS
+    resolves `/var/folders/...` to `/private/var/folders/...` -- and seatbelt
+    matches `subpath` against the kernel's canonical spelling. So a profile built
+    from the unresolved path has an allow-rule that matches nothing, `(deny
+    file-write*)` covers the workdir as well, and every legal in-workdir write
+    fails with EPERM.
+
+    Which is the same measurement bug Task 2 is about, one layer down: the false
+    deny is charged to the Executor as FAIL_RUNTIME and the measured pass rate
+    drops for a reason that has nothing to do with the model. It was invisible
+    because the jail probe ran `print('probe')`, which a write-denying jail passes,
+    and because the surrounding sandbox this was developed in made
+    `sandbox-exec` unavailable so no OS rung engaged at all.
+
+    Three checks: the probe would now catch it, the profile is built from the
+    canonical path, and -- on macOS, where it can be executed rather than argued
+    -- the two spellings really do differ.
+    """
+    import os
+    import platform
+    import shutil
+    import subprocess
+    import tempfile
+
+    check("the jail probe writes inside the workdir, so a jail that denies its "
+          "own working directory cannot pass it",
+          "open(" in harness._PROBE_SOURCE
+          and harness._PROBE_NAME in harness._PROBE_SOURCE,
+          harness._PROBE_SOURCE)
+
+    workdir = tempfile.mkdtemp(prefix="jail-probe-")
+    try:
+        real = os.path.realpath(workdir)
+        profiles = [prefix[2] for _label, prefix
+                    in harness._candidate_wrappers(workdir)
+                    if prefix and prefix[0] == "sandbox-exec"]
+        if platform.system() == "Darwin":
+            check("every macOS profile names the workdir by its canonical path "
+                  "and not by the symlinked one mkdtemp returned",
+                  profiles and all(workdir not in text or real in text
+                                   for text in profiles)
+                  and any(real in text for text in profiles),
+                  [text[-90:] for text in profiles])
+        else:
+            check("no macOS profiles are offered off Darwin, so there is nothing "
+                  "to canonicalise here", profiles == [], profiles)
+
+        if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
+            check("the two spellings differ under seatbelt (skipped: not macOS "
+                  "with sandbox-exec)", True, platform.system())
+            return
+        template = harness._MACOS_PROFILES[0][1]
+        outcomes = {}
+        for label, base in (("as-given", workdir), ("canonical", real)):
+            proc = subprocess.run(
+                ["sandbox-exec", "-p", template.format(workdir=base),
+                 sys.executable, "-I", "-B", "-c",
+                 "open('w.txt', 'w').write('hi')\nprint('WROTE')"],
+                cwd=workdir, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            outcomes[label] = (proc.returncode, b"WROTE" in proc.stdout)
+        check("the symlinked spelling really is denied and the canonical one "
+              "really is allowed, so the realpath is load-bearing rather than "
+              "decorative",
+              outcomes["as-given"] == (1, False)
+              and outcomes["canonical"] == (0, True), outcomes)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_the_readme_names_only_layers_the_code_emits():
+    """A doc that describes a label nothing emits is worse than no doc.
+
+    The README is where a reader learns what the feed's isolation strings mean, so
+    every layer-shaped string in it has to be one this tree can produce -- and the
+    families have to be complete in the other direction too, because the failure
+    that prompted this check was a README naming one macOS rung when the code has
+    two, the second of which denies no writes at all while the README said the
+    macOS layer denied them.
+    """
+    import os
+    import re
+
+    root = os.path.dirname(os.path.abspath(harness.__file__))
+    with open(os.path.join(root, "README.md"), "r", encoding="utf-8") as handle:
+        readme = handle.read()
+    with open(harness.__file__, "r", encoding="utf-8") as handle:
+        source = handle.read()
+
+    pattern = r'(?:os-level|paths|pathlib|memory|in-process):'
+    emitted = set(re.findall(r'"(%s[^"]*)"' % pattern, source))
+    # `%d`-formatted labels are emitted as a family, so compare on the stem.
+    stems = set(name.split("%")[0] for name in emitted if "%" in name)
+    claimed = set(re.findall(r'`(%s[^`]*)`' % pattern, readme))
+    unemittable = sorted(
+        name for name in claimed
+        if name not in emitted
+        and not any(name.startswith(stem) for stem in stems))
+    check("every layer string the README names is one the code can emit",
+          unemittable == [], unemittable)
+
+    # And the two OS families the README documents rung by rung, in full: a rung
+    # the code offers and the README omits is the defect this check exists for.
+    rungs = set(label for label, _profile in harness._MACOS_PROFILES)
+    rungs |= set(["os-level:unshare-net+user", "os-level:unshare-net",
+                  harness.OS_LAYER_UNAVAILABLE])
+    missing = sorted(rung for rung in rungs if "`%s`" % rung not in readme)
+    check("and every OS-jail rung the code offers is documented, fallbacks "
+          "included", missing == [], missing)
+    check("including that the weaker macOS rung denies no writes, which is the "
+          "claim the README used to get wrong",
+          "denies the network and **nothing else**" in readme, "")
+
+
 def main():
     for fn in (
         test_extraction, test_adversarial_extraction,
@@ -696,15 +1366,23 @@ def main():
         test_assertion_failure, test_syntax_error, test_nonzero_exit,
         test_timeout, test_signal_death_is_explained,
         test_network_blocked, test_subprocess_blocked,
-        test_stdin_does_not_hang, test_output_truncation, test_no_code_path,
+        test_stdin_does_not_hang, test_the_per_check_report_is_read_or_distrusted,
+        test_output_truncation, test_no_code_path,
         test_workdir_cleanup,
         test_import_solution_works_under_isolated_mode,
         test_tests_passing_is_approved, test_wrong_answer_that_runs_is_revised,
         test_import_failure_is_distinguished, test_vacuous_tests_are_caught,
         test_executor_cannot_supply_its_own_tests,
         test_runaway_output_is_killed, test_filesystem_jail,
+        test_destructive_calls_cannot_be_spelled_around_the_guard,
+        test_guarded_calls_still_work_inside_the_workdir,
+        test_the_pathlib_guard_survives_a_moved_accessor,
+        test_the_path_guard_is_correct_on_the_interpreter_that_runs_it,
+        test_a_path_denial_is_the_models_failure_not_the_harnesss,
         test_timeout_phase_attribution, test_sandbox_layers_are_honest,
         test_sandbox_rules_are_complete,
+        test_the_os_jail_permits_the_writes_the_in_process_guard_permits,
+        test_the_readme_names_only_layers_the_code_emits,
     ):
         print("\n-- %s" % fn.__name__)
         try:

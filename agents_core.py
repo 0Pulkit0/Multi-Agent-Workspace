@@ -15,8 +15,10 @@ solution proves nothing, and gating APPROVED on it would rebuild the fake
 verification this pipeline exists to remove.
 """
 
+import hashlib
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -56,6 +58,23 @@ CONTEXT_RECENT_STEPS = 2
 # Guard against a planner that emits a hundred "steps".
 MAX_STEPS = 12
 
+# ------------------------------------------------- providers, roles and models
+#
+# A provider is a `base_url` and a key. Nothing else is required to add one, so
+# any OpenAI-compatible endpoint is a configuration entry rather than a code
+# edit. `model` here is only the provider's default, used by a role that does
+# not name its own; the mapping that actually decides what gets called is
+# role -> (provider, model), resolved at run time by `resolved_roles()`.
+#
+# Why this does not weaken the pre-registration, since it moves a frozen-looking
+# constant into configuration: D2 freezes which models a run *actually used*.
+# That is a commitment about a run, not about a source constant. Recording a
+# config resolved at run time is strictly more honest than reading a constant out
+# of source, because today the frozen commit and the actual run can drift and
+# nothing notices -- `--bad-slug` mutates `PROVIDERS` in place, and a manifest
+# built by reading source would have reported the pristine slug. Every run JSON
+# and both manifests now carry the resolved table, and the preflight refuses to
+# start against a pair that does not answer.
 PROVIDERS = {
     "gemini": {
         # Verified against ai.google.dev/gemini-api/docs/models (2026-08-28):
@@ -65,6 +84,14 @@ PROVIDERS = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
     },
     "groq": {
+        # RETIRED. This slug 404s with `model_not_found` for the project's key as
+        # of 2026-08-30, and Groq is the Executor in all four arms, so every arm
+        # currently points at a dead model. Choosing the replacement is a
+        # registration decision and is deliberately not made here: point the role
+        # at a live slug through the configuration below (`MAW_MODELS`, or
+        # `models.json`), and `eval/models.py --list groq` will say what the key
+        # can actually reach. The preflight refuses to spend anything until the
+        # configured pair answers.
         "model": "llama-3.3-70b-versatile",
         "base_url": "https://api.groq.com/openai/v1",
     },
@@ -78,12 +105,342 @@ ROLE_PROVIDER = {
     "executor": "groq",
 }
 
+# Role -> model, overriding the provider's default. Empty by default, which is
+# what makes the defaults reproduce today's behaviour exactly: `model_for` falls
+# through to `PROVIDERS[provider]["model"]` and nothing changes.
+#
+# The structural gap this closes: `ROLE_PROVIDER` maps a role to a provider and
+# the model rode along from the provider, so a role could not have its own model.
+# Two retirements have now cost this project a run -- `gemini-2.0-flash`, then
+# `llama-3.3-70b-versatile` -- and each time the repair was a source edit, in a
+# workspace whose whole claim is that any model can serve any role with just an
+# API key. It is also why the escalation ladder's `alternate` rung had nowhere to
+# go without spending the other provider: "a different model" and "a different
+# provider" were the same axis.
+ROLE_MODEL = {}
+
+# Extra sampling parameters, per role, on top of temperature and top_p. Sent as
+# given and recorded as sent, because a provider that needs a parameter the
+# others do not -- a reasoning-effort knob, a max-tokens floor -- otherwise
+# either cannot be configured or is sent without appearing in the record.
+ROLE_PARAMS = {}
+
 # Sampling is pinned here rather than left to the endpoint. Free tiers override
 # unpinned parameters with their own defaults and change them without notice, so
 # a run that does not state top_p is not reproducible even against the same
 # model ID.
 TEMPERATURE = 0.4
 TOP_P = 1.0
+
+# Where a configuration comes from. `MAW_MODELS` is either inline JSON or a path
+# to a JSON file; `models.json` beside this module is the no-environment default.
+# Absent both, the source defaults stand and behaviour is exactly what it was.
+MODEL_CONFIG_ENV = "MAW_MODELS"
+MODEL_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "models.json")
+
+# What the resolution actually used, for the record. Not a claim about source.
+_MODEL_CONFIG_SOURCE = "defaults"
+
+
+def model_config_source():
+    """Where the live role->model mapping came from. Recorded, not inferred."""
+    return _MODEL_CONFIG_SOURCE
+
+
+def key_env(provider):
+    """The environment variable holding ``provider``'s key.
+
+    Derived from the name -- `groq` -> `GROQ_API_KEY` -- unless the provider names
+    its own `env`. Without this, "a provider is a base_url plus a key and nothing
+    else" was not true: the key lookup was a hardcoded two-entry dict, so a
+    configured provider had no way to be *given* a key and adding one meant a
+    source edit after all. The default reproduces the two names the project has
+    always used.
+    """
+    cfg = PROVIDERS.get(provider) or {}
+    return cfg.get("env") or (provider.upper().replace("-", "_") + "_API_KEY")
+
+
+def keys_from_env(env=None):
+    """provider -> key, for every configured provider. Missing reads as "".
+
+    Derived from `PROVIDERS`, so a provider added by configuration is reachable
+    without touching code, and never logged: only the variable *names* are ever
+    printed anywhere.
+    """
+    source = os.environ if env is None else env
+    return dict((name, source.get(key_env(name), "").strip())
+                for name in PROVIDERS)
+
+
+def key_env_hint():
+    """`GEMINI_API_KEY / GROQ_API_KEY`, built from the live configuration.
+
+    The message that names the variables to set had them spelled as a literal,
+    which goes stale the moment a provider is configured.
+    """
+    return " / ".join(key_env(name) for name in sorted(PROVIDERS))
+
+
+def model_for(role, provider=None):
+    """The model ``role`` will actually be called with, on ``provider``.
+
+    ``provider`` defaults to the role's own. When it is *not* the role's own --
+    the escalation ladder's `alternate` rung, or a failover outside measurement
+    mode -- the role's override deliberately does not apply: an override names a
+    model at the role's own endpoint, and asking a different endpoint for it
+    would 404 in a way that reads as a provider outage.
+
+    One function, so the record, the preflight and the call cannot disagree about
+    what is being sent -- the failure mode of a manifest built by reading source.
+
+    A same-provider alternate model is now *expressible* here, which is what the
+    `alternate` rung wanted and could not have while the model rode along with
+    the provider. It is deliberately not wired up: what `alternate` means is part
+    of arm B's definition and changing it is a registration decision.
+    """
+    if provider is None:
+        provider = ROLE_PROVIDER[role]
+    if provider == ROLE_PROVIDER.get(role) and ROLE_MODEL.get(role):
+        return ROLE_MODEL[role]
+    return PROVIDERS[provider].get("model")
+
+
+def sampling_for(role):
+    """Every sampling parameter that will be sent for ``role``, resolved.
+
+    `temperature` and `top_p` always, plus whatever `ROLE_PARAMS` adds. The
+    return value is what goes on the wire *and* what goes in the record, so a
+    parameter cannot be sent without appearing in the run's own account of it.
+    """
+    params = {"temperature": TEMPERATURE, "top_p": TOP_P}
+    params.update(ROLE_PARAMS.get(role) or {})
+    return params
+
+
+def resolved_roles(roles=None):
+    """The resolved role table: role, provider, model, base_url and sampling.
+
+    This is the record. It is built by asking the same functions the call path
+    asks, at the moment of recording, rather than by reading `PROVIDERS` out of
+    source -- `--bad-slug` mutates `PROVIDERS` in place, and a manifest built
+    from source would have reported the pristine slug while the run used the dead
+    one. Sorted by role so two runs' tables compare directly.
+    """
+    names = sorted(ROLE_PROVIDER if roles is None else roles)
+    table = []
+    for role in names:
+        provider = ROLE_PROVIDER[role]
+        entry = {
+            "role": role,
+            "provider": provider,
+            "model": model_for(role),
+            "base_url": PROVIDERS[provider].get("base_url"),
+        }
+        entry.update(sampling_for(role))
+        table.append(entry)
+    return table
+
+
+def resolved_pairs(roles=None):
+    """The distinct ``(provider, model)`` pairs a run will call, with their roles.
+
+    Distinct, because the preflight costs one call per pair and `planner` and
+    `test_writer` are the same pair today: validating each role separately would
+    spend three calls to learn two things.
+    """
+    pairs = {}
+    for entry in resolved_roles(roles):
+        pairs.setdefault((entry["provider"], entry["model"]), []).append(
+            entry["role"])
+    return [(provider, model, sorted(role_names))
+            for (provider, model), role_names in sorted(
+                pairs.items(), key=lambda item: item[0])]
+
+
+class ConfigError(Exception):
+    """A configuration that would not have done what it said. Refused, not fixed."""
+
+
+def apply_model_config(config, source="explicit"):
+    """Install a role/provider/model configuration. Returns the resolved table.
+
+    Validated before anything is installed, and installed all at once, because a
+    half-applied config is a run pointed somewhere nobody chose. Raises
+    `ConfigError` on an unknown role, a provider without a `base_url`, a role
+    naming a provider that does not exist, or a non-string model.
+    """
+    global _MODEL_CONFIG_SOURCE
+    config = config or {}
+    if not isinstance(config, dict):
+        raise ConfigError("a model config must be a JSON object, got %s"
+                          % type(config).__name__)
+    unknown = sorted(set(config) - {"providers", "roles", "sampling"})
+    if unknown:
+        raise ConfigError("unknown model config section(s): %s"
+                          % ", ".join(unknown))
+
+    providers = dict((name, dict(cfg)) for name, cfg in PROVIDERS.items())
+    for name, cfg in (config.get("providers") or {}).items():
+        if not isinstance(cfg, dict):
+            raise ConfigError("provider %r must be an object" % name)
+        extra = sorted(set(cfg) - {"base_url", "model", "env"})
+        if extra:
+            raise ConfigError(
+                "provider %r has field(s) %s; a provider is a base_url, a key "
+                "and at most a default model -- sampling is per-role and belongs "
+                "in that role's \"params\"" % (name, ", ".join(extra)))
+        if "env" in cfg and not (isinstance(cfg["env"], str)
+                                 and cfg["env"].strip()):
+            raise ConfigError("provider %r has a non-string env: %r"
+                              % (name, cfg["env"]))
+        merged = dict(providers.get(name) or {})
+        merged.update(cfg)
+        if not merged.get("base_url"):
+            raise ConfigError("provider %r has no base_url" % name)
+        providers[name] = merged
+
+    role_provider = dict(ROLE_PROVIDER)
+    role_model = dict(ROLE_MODEL)
+    role_params = dict(ROLE_PARAMS)
+    for role, cfg in (config.get("roles") or {}).items():
+        if role not in ROLE_PROVIDER:
+            raise ConfigError(
+                "unknown role %r; the model-backed roles are %s (the harness "
+                "runs code and has no provider)"
+                % (role, ", ".join(sorted(ROLE_PROVIDER))))
+        if isinstance(cfg, str):
+            cfg = {"model": cfg}
+        if not isinstance(cfg, dict):
+            raise ConfigError("role %r must be an object or a model string" % role)
+        extra = sorted(set(cfg) - {"provider", "model", "params"})
+        if extra:
+            raise ConfigError("role %r has unknown field(s): %s"
+                              % (role, ", ".join(extra)))
+        if "provider" in cfg:
+            if cfg["provider"] not in providers:
+                raise ConfigError(
+                    "role %r names provider %r, which is not configured; add it "
+                    "under \"providers\" with a base_url"
+                    % (role, cfg["provider"]))
+            role_provider[role] = cfg["provider"]
+        if "model" in cfg:
+            if not isinstance(cfg["model"], str) or not cfg["model"].strip():
+                raise ConfigError("role %r has a non-string model: %r"
+                                  % (role, cfg["model"]))
+            role_model[role] = cfg["model"].strip()
+        if "params" in cfg:
+            if not isinstance(cfg["params"], dict):
+                raise ConfigError("role %r's params must be an object" % role)
+            role_params[role] = dict(cfg["params"])
+
+    sampling = config.get("sampling") or {}
+    if not isinstance(sampling, dict):
+        raise ConfigError("\"sampling\" must be an object")
+    extra = sorted(set(sampling) - {"temperature", "top_p"})
+    if extra:
+        raise ConfigError(
+            "\"sampling\" takes temperature and top_p; %s is per-role and "
+            "belongs in that role's \"params\"" % ", ".join(extra))
+
+    # Every role must resolve to a model, or the run would send `model=None` and
+    # get a 400 several minutes in instead of a refusal now.
+    for role, provider in role_provider.items():
+        model = role_model.get(role) or providers[provider].get("model")
+        if not model:
+            raise ConfigError(
+                "role %r resolves to no model: provider %r has no default and "
+                "the role names none" % (role, provider))
+
+    global TEMPERATURE, TOP_P
+    PROVIDERS.clear()
+    PROVIDERS.update(providers)
+    ROLE_PROVIDER.clear()
+    ROLE_PROVIDER.update(role_provider)
+    ROLE_MODEL.clear()
+    ROLE_MODEL.update(role_model)
+    ROLE_PARAMS.clear()
+    ROLE_PARAMS.update(role_params)
+    if "temperature" in sampling:
+        TEMPERATURE = float(sampling["temperature"])
+    if "top_p" in sampling:
+        TOP_P = float(sampling["top_p"])
+    _MODEL_CONFIG_SOURCE = source
+    return resolved_roles()
+
+
+def load_model_config(env=None, path=None):
+    """Read a config from the environment or a file. Returns ``(config, source)``.
+
+    ``(None, "defaults")`` when neither is present, which is the day-one case and
+    must leave behaviour untouched.
+    """
+    raw = (os.environ if env is None else env).get(MODEL_CONFIG_ENV, "").strip()
+    if raw:
+        if raw.startswith("{"):
+            try:
+                return json.loads(raw), "%s (inline)" % MODEL_CONFIG_ENV
+            except ValueError as exc:
+                raise ConfigError("%s is not valid JSON: %s"
+                                  % (MODEL_CONFIG_ENV, exc))
+        path = raw
+    if path is None:
+        path = MODEL_CONFIG_FILE
+        if not os.path.exists(path):
+            return None, "defaults"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle), path
+    except ValueError as exc:
+        raise ConfigError("%s is not valid JSON: %s" % (path, exc))
+    except IOError as exc:
+        raise ConfigError("cannot read %s: %s" % (path, exc))
+
+
+def configure_models(env=None, path=None):
+    """Resolve and install the configuration. Returns the resolved role table.
+
+    Called once by each entry point. Idempotent on the defaults: with no config
+    present it installs nothing and the source stays ``"defaults"``.
+    """
+    config, source = load_model_config(env=env, path=path)
+    if config is None:
+        return resolved_roles()
+    return apply_model_config(config, source=source)
+
+
+# Roles whose models must differ for "the grader never wrote the code" to hold.
+# `executor` writes the code; `test_writer` writes the suite that grades it.
+INDEPENDENCE_PAIRS = (("executor", "test_writer"), ("executor", "planner"))
+
+
+def independence_warnings():
+    """Where the current configuration destroys grader independence.
+
+    The claim this protects is "execution grades, and the grader never wrote the
+    code". It is already only partly true: `planner` and `test_writer` are one
+    model off one spec lineage, and the Planner writes the suite the Executor is
+    graded against. A configuration that also points the Executor at that model
+    makes the claim false outright, and that must not be silent -- so it is said
+    at startup and written into the manifest, where a reader of the results can
+    see it without re-deriving the configuration.
+    """
+    said = []
+    for role, other in INDEPENDENCE_PAIRS:
+        if role not in ROLE_PROVIDER or other not in ROLE_PROVIDER:
+            continue
+        if (ROLE_PROVIDER[role], model_for(role)) == (ROLE_PROVIDER[other],
+                                                     model_for(other)):
+            said.append(
+                "grader independence: %s and %s are the same (provider, model) "
+                "pair -- %s/%s -- so the model that %s is also the model that %s"
+                % (role, other, ROLE_PROVIDER[role], model_for(role),
+                   "wrote the code" if role == "executor" else "graded it",
+                   "wrote the suite grading it" if other == "test_writer"
+                   else "wrote the spec and the suite"))
+    return said
+
 
 # Silent failover is a convenience in a UI and a contaminant in a measurement.
 # `call_role` walks every configured provider on any failure, so under 429
@@ -171,7 +528,93 @@ TRUSTED_TESTS = (TESTS_USER, TESTS_GENERATED, TESTS_REGENERATED)
 
 
 class ProviderError(Exception):
-    pass
+    """A provider call that failed, carrying *why* and not only that it did.
+
+    ``status`` is the provider's HTTP status when there was one, else None.
+    ``exc_class`` is the name of the exception the SDK actually raised.
+    ``retry_after`` is the server's own ``Retry-After``, in seconds, when it sent
+    one -- the only wait figure in this system that is not a guess.
+
+    Both exist because the message alone is unusable for policy. Flattened to a
+    string, a 429 (wait and try again), a 404 (the model slug is wrong and will
+    stay wrong) and a `KeyError` in this module (our bug) are one indistinguishable
+    line -- so retry cannot be written at all. Retrying a 404 burns the whole
+    backoff budget on a dead slug; not retrying a 429 scores a rate limit as a
+    model failure, which is the contamination the eval exists to avoid.
+    """
+
+    def __init__(self, message, status=None, exc_class="", retry_after=None):
+        Exception.__init__(self, message)
+        self.status = status
+        self.exc_class = exc_class or ""
+        self.retry_after = retry_after
+
+
+def _status_of(exc):
+    """The HTTP status on an SDK exception, or None.
+
+    Three shapes, tried in order, because the OpenAI-compatible clients are not
+    consistent about which one they expose. The SDK is deliberately not imported
+    to do this: this module -- and both offline suites -- must load without it,
+    so the status is read by attribute name and never by isinstance.
+    """
+    for attribute in ("status_code", "status"):
+        value = getattr(exc, attribute, None)
+        status = _as_status(value)
+        if status is not None:
+            return status
+    response = getattr(exc, "response", None)
+    if response is not None:
+        return _as_status(getattr(response, "status_code", None))
+    return None
+
+
+RETRY_AFTER_HEADERS = ("retry-after", "Retry-After",
+                       "x-ratelimit-reset-requests")
+
+# A server that says "wait an hour" gets believed only up to this. Past it the
+# run should stop and be restarted later, not hold a socket open for an hour and
+# report the hour as part of a task's wall clock.
+MAX_RETRY_AFTER_SECONDS = 120.0
+
+
+def _retry_after_of(exc):
+    """The server's ``Retry-After`` in seconds, or None.
+
+    Preferred over our own backoff when present: the provider knows when its
+    window resets and we are guessing. Clamped, and never negative -- a malformed
+    header must not be able to park the run.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    for name in RETRY_AFTER_HEADERS:
+        try:
+            raw = headers.get(name)
+        except Exception:
+            raw = None
+        if not raw:
+            continue
+        try:
+            seconds = float(str(raw).strip().rstrip("s"))
+        except (TypeError, ValueError):
+            continue
+        if seconds < 0:
+            continue
+        return min(seconds, MAX_RETRY_AFTER_SECONDS)
+    return None
+
+
+def _as_status(value):
+    """An HTTP status as an int, or None. A string ``"429"`` counts."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_mode(mode):
@@ -201,8 +644,73 @@ def required_providers(mode):
                    if stage in ROLE_PROVIDER})
 
 
-def call_model(provider, api_key, system, user):
+# Sampling parameters the OpenAI SDK accepts as typed keyword arguments. Anything
+# else a role's `params` names is treated as a provider extension and rides in
+# `extra_body`.
+#
+# The direction of the rule is deliberate: *unknown* goes to `extra_body`, not to
+# a keyword argument. An unrecognised keyword is a TypeError raised inside the SDK
+# and wrapped below as a ProviderError, so a configuration typo would be reported
+# as "groq failed" -- indistinguishable from a provider outage, and retried as one.
+# Through `extra_body` the same name reaches the server, which either honours it or
+# says what is wrong with it.
+#
+# Measured 2026-08-30, and the reason this split exists at all: `reasoning_format`
+# is a Groq extension. gpt-oss-20b with it unset returned zero fenced blocks and
+# put 568 characters into a separate `reasoning` field, so the Executor's own
+# extractor saw no code. `hidden` fixed it. Before this split the parameter could
+# not be *sent*, because `sampling_for` fed `**params` straight into `create()`.
+_SDK_KEYWORD_PARAMS = frozenset([
+    "temperature", "top_p", "max_tokens", "max_completion_tokens", "n", "seed",
+    "stop", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs",
+    "response_format", "stream",
+])
+
+
+def split_params(params):
+    """``(keyword_arguments, extra_body)`` for one call's sampling parameters.
+
+    The two dicts together are exactly ``params`` -- nothing dropped, nothing
+    invented -- so the record `sampling_for` builds still describes the wire.
+    """
+    keywords, extra = {}, {}
+    for name, value in (params or {}).items():
+        (keywords if name in _SDK_KEYWORD_PARAMS else extra)[name] = value
+    return keywords, extra
+
+
+def call_model_detailed(provider, api_key, system, user, role=None):
+    """One model call, with the accounting a bare string cannot carry.
+
+    Returns a JSON-serialisable dict:
+
+      ``text``             the reply, stripped -- byte-identical to what
+                           `call_model` returns, so a probe measures the same
+                           bytes the pipeline's extractor would see
+      ``model_requested``  the slug this call asked for
+      ``model_returned``   the slug the API says answered
+      ``usage``            the provider's usage block, unedited
+      ``finish_reason``    why generation stopped
+      ``params``           every sampling parameter sent, by its own name
+      ``extra_body``       which of those went through `extra_body`
+      ``reasoning_chars``  length of a separate `reasoning` field, 0 if absent
+
+    ``model_returned`` is recorded because "we asked for X" and "X answered" are
+    different claims -- a provider may serve an alias or a dated snapshot -- and a
+    run whose whole purpose is to pin a model has to make the second one.
+
+    ``usage`` in full, because ``reasoning_format="hidden"`` suppresses the
+    *reporting* of reasoning and not its computation. Those tokens are billed and
+    are otherwise invisible in both the reply text and the record.
+
+    No caching here or anywhere beneath it; see the standing prohibition in
+    `_attempt_provider`.
+    """
     cfg = PROVIDERS[provider]
+    model = (model_for(role, provider) if role in ROLE_PROVIDER
+             else cfg.get("model"))
+    params = sampling_for(role)
+    keywords, extra = split_params(params)
     try:
         # Imported lazily so this module (and the offline test suites) load
         # without the SDK installed.
@@ -210,17 +718,431 @@ def call_model(provider, api_key, system, user):
 
         client = OpenAI(api_key=api_key, base_url=cfg["base_url"], timeout=60)
         resp = client.chat.completions.create(
-            model=cfg["model"],
+            model=model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-        )
-        return (resp.choices[0].message.content or "").strip()
+            **(dict(keywords, extra_body=extra) if extra else keywords))
+        # Inside the try on purpose: an empty `choices` is an IndexError, and it
+        # has always surfaced as a ProviderError so the retry layer can see it.
+        choice = resp.choices[0]
+        usage = getattr(resp, "usage", None)
+        if usage is not None and hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        return {
+            "text": (choice.message.content or "").strip(),
+            "model_requested": model,
+            "model_returned": getattr(resp, "model", None),
+            "usage": dict(usage) if usage else {},
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "params": params,
+            "extra_body": extra,
+            "reasoning_chars": len(getattr(choice.message, "reasoning", None)
+                                   or ""),
+        }
     except Exception as exc:
-        raise ProviderError("%s failed: %s" % (provider, exc))
+        # Message shape unchanged -- every existing check and log line reads it.
+        # The status, the class and the server's own wait ride alongside it.
+        raise ProviderError("%s failed: %s" % (provider, exc),
+                            status=_status_of(exc),
+                            exc_class=type(exc).__name__,
+                            retry_after=_retry_after_of(exc))
+
+
+def call_model(provider, api_key, system, user, role=None):
+    """One model call, returning the reply text. ``role`` decides model and sampling.
+
+    ``role`` is optional so that the four-positional shape every stand-in in the
+    test suites was written against still works; without it the provider's
+    default model is used, which is what this function did before roles could
+    carry their own.
+
+    The text-only face of `call_model_detailed`, and deliberately still the name
+    the pipeline calls: roughly two dozen stand-ins across the offline suites
+    replace *this* symbol with a function returning a string. A caller that wants
+    the usage block or the model the API actually returned asks for the detail.
+    """
+    return call_model_detailed(provider, api_key, system, user,
+                               role=role)["text"]
+
+
+# ------------------------------------------------------------------- preflight
+
+# The smallest thing that still proves a (provider, model) pair answers. It has
+# to be a real completion: `models.list()` succeeds for keys that cannot call the
+# model, and a 404 on the model is exactly the failure being looked for.
+PREFLIGHT_SYSTEM = "Reply with the single character: 1"
+PREFLIGHT_USER = "1"
+PREFLIGHT_PARAMS = {"max_tokens": 1, "temperature": 0.0}
+
+
+def preflight_pair(provider, model, api_key, call=None):
+    """Validate one ``(provider, model)`` pair with one cheap call.
+
+    Returns ``(ok, status, detail)``. Any exception is a failure: this runs
+    before anything has been spent, so the useful bias is to refuse.
+
+    ``call`` takes ``(provider, api_key, model, system, user)`` -- the model
+    explicitly, not a role, because a preflight validates a *pair* and an offline
+    stand-in has to be able to check the exact slug that would go on the wire.
+    """
+    if call is None:
+        def call(provider_name, key, slug, system, user):
+            from openai import OpenAI
+
+            client = OpenAI(api_key=key,
+                            base_url=PROVIDERS[provider_name]["base_url"],
+                            timeout=30)
+            resp = client.chat.completions.create(
+                model=slug,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                **PREFLIGHT_PARAMS)
+            return (resp.choices[0].message.content or "")
+    try:
+        call(provider, api_key, model, PREFLIGHT_SYSTEM, PREFLIGHT_USER)
+    except Exception as exc:
+        return False, _status_of(exc), _redact(exc, {provider: api_key})
+    return True, None, ""
+
+
+def preflight(keys, roles=None, call=None):
+    """Validate every configured pair before a run spends anything.
+
+    One call per distinct pair, not per role. Returns a list of records --
+    ``role_names``, ``provider``, ``model``, ``ok``, ``status``, ``detail`` -- in
+    the same order as `resolved_pairs`. The caller refuses on any ``ok`` false,
+    exactly as it refuses on a `--verify-lock` mismatch: two calls turn a silent
+    multi-hour loss into a one-second failure, and the loss this actually
+    prevents already happened once, when Groq's slug retired under a frozen grid.
+
+    A missing key is a failure here rather than a skip. A run that cannot call a
+    role is not a run, and discovering that at task 1 of 144 is the whole point.
+    """
+    records = []
+    for provider, model, role_names in resolved_pairs(roles):
+        key = (keys or {}).get(provider)
+        if not key:
+            records.append({"roles": role_names, "provider": provider,
+                            "model": model, "ok": False, "status": None,
+                            "detail": "no API key for provider %r" % provider})
+            continue
+        ok, status, detail = preflight_pair(provider, model, key, call=call)
+        records.append({"roles": role_names, "provider": provider,
+                        "model": model, "ok": ok, "status": status,
+                        "detail": detail})
+    return records
+
+
+def preflight_failures(records):
+    """The refusal lines for a preflight result. Empty when every pair answered.
+
+    Each line names the role, the provider and the model, because "404" without
+    those three is the message that cost this project a grid.
+    """
+    lines = []
+    for record in records:
+        if record["ok"]:
+            continue
+        lines.append(
+            "%s -> %s/%s does not answer%s: %s"
+            % ("+".join(record["roles"]), record["provider"], record["model"],
+               "" if record["status"] is None else " (HTTP %s)" % record["status"],
+               record["detail"]))
+    return lines
+
+
+def list_models(provider, api_key):
+    """Model IDs the key can reach at ``provider``, sorted.
+
+    "What can this key actually reach" should be a command, not a script written
+    into /tmp when a slug retires. `eval/models.py --list <provider>` is that
+    command; this is what it calls.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=PROVIDERS[provider]["base_url"],
+                    timeout=30)
+    return sorted(getattr(item, "id", str(item))
+                  for item in client.models.list())
+
+
+# ------------------------------------------------------ retry policy and pacing
+
+# Which HTTP statuses are worth another attempt. 429 means "you asked too fast"
+# and 5xx means the provider is unwell: both are transient by definition and the
+# same request will plausibly succeed later. Everything else is a statement about
+# the request itself, and repeating it just spends the budget more slowly.
+#
+# 401/403/404 are listed explicitly rather than left to fall through the default,
+# because the case that matters is a wrong model slug: one 404 must end the task
+# in one call, not after five sleeps. That is what makes the bad-slug scenario
+# loud instead of slow, and it holds in both modes.
+RETRY_STATUS = 429
+RETRY_STATUS_FLOOR = 500
+HARD_FAIL_STATUSES = (400, 401, 403, 404, 422)
+
+# One initial attempt plus (MAX_PROVIDER_ATTEMPTS - 1) retries.
+MAX_PROVIDER_ATTEMPTS = 5
+BACKOFF_BASE_SECONDS = 2.0
+BACKOFF_CAP_SECONDS = 30.0
+BACKOFF_JITTER = 0.25
+
+
+def is_retryable_status(status):
+    """True for 429 and 5xx. False for everything else, including ``None``.
+
+    ``None`` -- a failure we could not classify -- deliberately does not retry.
+    That costs us the genuinely transient unclassified case (a reset connection
+    carries no status), and the alternative costs more: `call_model` wraps *any*
+    exception, so a `KeyError` in our own code would become five `KeyError`s and
+    forty seconds of sleep, reported as a rate-limit loss. A bug in this module
+    must not be able to present itself as infrastructure.
+    """
+    if status is None:
+        return False
+    if status == RETRY_STATUS:
+        return True
+    return status >= RETRY_STATUS_FLOOR
+
+
+def backoff_schedule(run_id, attempts=MAX_PROVIDER_ATTEMPTS):
+    """The sleep before each retry, in seconds, derived from the run id.
+
+    Exponential, capped, with jitter -- and the jitter comes from a generator
+    seeded on the run id, not from `random`'s global state. Unseeded jitter makes
+    the sleep schedule unreproducible, and a run whose own waits cannot be
+    reconstructed from its record is not a reproducible run: the wall-clock
+    numbers are then unexplainable after the fact.
+    """
+    rng = random.Random(hashlib.sha256(
+        ("backoff|%s" % run_id).encode("utf-8")).hexdigest())
+    delays = []
+    for attempt in range(max(0, int(attempts) - 1)):
+        base = min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * (2 ** attempt))
+        delays.append(round(base * (1.0 + BACKOFF_JITTER * (2.0 * rng.random() - 1.0)), 3))
+    return delays
+
+
+# The run id the backoff jitter is seeded from. Process-wide because `call_role`
+# is called from a dozen places that have no business threading a run id through;
+# the runner sets it once per run. The default is a literal so an unseeded process
+# still has a *reproducible* schedule rather than a random one -- silently falling
+# back to entropy is how a run ends up with waits nobody can reconstruct.
+_BACKOFF_RUN_ID = "unseeded"
+
+
+def set_backoff_run_id(run_id):
+    """Seed the backoff jitter for this run. Returns the previous value."""
+    global _BACKOFF_RUN_ID
+    previous = _BACKOFF_RUN_ID
+    _BACKOFF_RUN_ID = str(run_id or "unseeded")
+    return previous
+
+
+def backoff_run_id():
+    return _BACKOFF_RUN_ID
+
+
+# How many attempts `_attempt_provider` makes, as installed for this process.
+# `MAX_PROVIDER_ATTEMPTS` above is the default; this is what is in force.
+#
+# The knob exists because there are two retry layers in this repository and only
+# one of them may be active at a time. `eval/run_eval.py` wraps `call_model` in
+# `Instrument`, whose own loop retries a 429 up to `MAX_429_RETRIES` times and
+# honours `Retry-After` through `RateGovernor`. Leaving both bounds at their
+# defaults multiplies them: 5 attempts here x 5 there is 25 requests to a
+# provider that just said "slow down", which is how a rate limit becomes a ban.
+# So the eval installs 1 here and keeps its own; the interactive app installs
+# neither and uses this one. Whichever is in force is recorded in the manifest.
+_RETRY_ATTEMPTS = MAX_PROVIDER_ATTEMPTS
+
+
+def set_retry_attempts(attempts):
+    """Install the attempt bound for this process. Returns the previous one.
+
+    Floored at 1: a bound of 0 would mean "never call the provider", which is not
+    a retry policy but a silently empty run.
+    """
+    global _RETRY_ATTEMPTS
+    previous = _RETRY_ATTEMPTS
+    _RETRY_ATTEMPTS = max(1, int(attempts))
+    return previous
+
+
+def retry_attempts():
+    return _RETRY_ATTEMPTS
+
+
+# The sleep the retry loop performs, injectable for the same reason `Pacer` takes
+# one. A check that a 429 retries to its bound has to see the waits, and seeing
+# them by performing them would put half a minute of real sleep into an offline
+# suite -- 2 + 4 + 8 + 16 at the default bound. Nothing in production replaces
+# this; it is `time.sleep` unless a check says otherwise, and `retry_snapshot`
+# reports whether it is still the real one so a run cannot quietly claim waits it
+# never took.
+_RETRY_SLEEP = time.sleep
+
+
+def set_retry_sleep(sleep):
+    """Install the retry loop's sleep. Returns the previous one."""
+    global _RETRY_SLEEP
+    previous = _RETRY_SLEEP
+    _RETRY_SLEEP = sleep or time.sleep
+    return previous
+
+
+def retry_snapshot():
+    """The retry policy a run actually ran under, for the results manifest.
+
+    A number in a report that cannot be traced to the constants that produced it
+    is not reproducible. This is those constants, as installed, at run time.
+    """
+    return {"attempts": _RETRY_ATTEMPTS,
+            "default_attempts": MAX_PROVIDER_ATTEMPTS,
+            "retry_status": RETRY_STATUS,
+            "retry_status_floor": RETRY_STATUS_FLOOR,
+            "hard_fail_statuses": list(HARD_FAIL_STATUSES),
+            "backoff_base_seconds": BACKOFF_BASE_SECONDS,
+            "backoff_cap_seconds": BACKOFF_CAP_SECONDS,
+            "backoff_jitter": BACKOFF_JITTER,
+            "max_retry_after_seconds": MAX_RETRY_AFTER_SECONDS,
+            "backoff_run_id": _BACKOFF_RUN_ID,
+            "real_sleep": _RETRY_SLEEP is time.sleep,
+            "schedule_seconds": backoff_schedule(_BACKOFF_RUN_ID,
+                                                 _RETRY_ATTEMPTS)}
+
+
+# Minimum seconds between two calls to the same provider, enforced client-side
+# before the call goes out. A 429 costs a round trip and a sleep and pollutes the
+# wall-clock numbers, so the interesting place to prevent one is here -- retries
+# are the backstop for the 429s pacing fails to prevent, not the mechanism.
+#
+# HONESTY ABOUT THESE NUMBERS: both are conservative guesses, not documented
+# limits. Nothing in this repository records a provider's published free-tier RPM
+# and this sandbox has no egress to go and read one, so neither value has been
+# verified against a provider document. They are chosen low on purpose: pacing
+# too slowly costs wall-clock time, pacing too fast costs arm-correlated data
+# loss, and only one of those is recoverable. Raise them only against a quoted
+# published limit, and re-record them in the manifest when you do.
+MIN_CALL_INTERVAL_SECONDS = {
+    # 6.0s = 10 calls/minute. The lowest free-tier RPM I have seen quoted for a
+    # Gemini Flash model is 10; this sits at that floor rather than above it.
+    # Gemini carries the Planner *and* the Test Writer, so it is the scarce one.
+    "gemini": 6.0,
+    # 2.4s = 25 calls/minute. Groq's free tier is quoted per model and is
+    # generally looser than Gemini's; 25 is well under anything I have seen.
+    # Groq carries the Executor, which is where arm B's call volume actually is.
+    "groq": 2.4,
+}
+
+# A provider absent from the table above still gets paced. Defaulting to "no
+# limit" would mean adding a provider silently disables pacing for it.
+DEFAULT_MIN_CALL_INTERVAL_SECONDS = 6.0
+
+
+class Pacer(object):
+    """Per-provider minimum interval, measured on the monotonic clock.
+
+    `time.monotonic` and not `time.time`: a wall-clock step -- NTP, a laptop
+    waking from sleep -- can make the last call look like it happened in the
+    future and park the run for hours, or like it happened long ago and release a
+    burst straight into a rate limit.
+
+    `wait_for` returns the seconds it slept, so the caller can add them to the
+    task's wall clock. A benchmark that quietly excludes its own pacing sleep is
+    reporting a throughput nobody can obtain.
+    """
+
+    def __init__(self, intervals=None, default=None, sleep=time.sleep,
+                 clock=time.monotonic):
+        self.intervals = dict(MIN_CALL_INTERVAL_SECONDS if intervals is None
+                              else intervals)
+        self.default = (DEFAULT_MIN_CALL_INTERVAL_SECONDS if default is None
+                        else float(default))
+        self._sleep = sleep
+        self._clock = clock
+        self.last = {}
+        self.slept = {}
+
+    @classmethod
+    def disabled(cls, **kwargs):
+        """A pacer that never sleeps, and says so in its snapshot."""
+        return cls(intervals={}, default=0.0, **kwargs)
+
+    @property
+    def enabled(self):
+        return self.default > 0 or any(value > 0 for value in self.intervals.values())
+
+    def interval_for(self, provider):
+        return self.intervals.get(provider, self.default)
+
+    def wait_for(self, provider):
+        """Sleep until this provider may be called again. Returns seconds slept."""
+        interval = self.interval_for(provider)
+        now = self._clock()
+        previous = self.last.get(provider)
+        slept = 0.0
+        if previous is not None and interval > 0:
+            remaining = interval - (now - previous)
+            if remaining > 0:
+                self._sleep(remaining)
+                slept = remaining
+                now = self._clock()
+        self.last[provider] = now
+        self.slept[provider] = self.slept.get(provider, 0.0) + slept
+        return slept
+
+    def snapshot(self):
+        """The pacing a run actually ran under, for the results manifest."""
+        return {"enabled": self.enabled,
+                "min_call_interval_seconds": dict(self.intervals),
+                "default_min_call_interval_seconds": self.default,
+                "slept_seconds": dict((name, round(value, 2))
+                                      for name, value in self.slept.items())}
+
+
+# The process-wide pacer `call_role` consults. Module level so a UI session and
+# an eval sweep pace against the same last-call times: two independent pacers
+# would each believe itself within budget and together be over it.
+#
+# It starts DISABLED, like `MEASUREMENT_MODE`, and a runner turns it on. Two
+# reasons, and the first is the load-bearing one:
+#
+#   1. `eval/run_eval.py` already paces, in `RateGovernor`, and `Instrument`
+#      replaces `call_model` -- which lives *inside* the paced region here. An
+#      enabled-by-default pacer would sleep once here and again in the governor,
+#      double-charging every call and inflating exactly the wall-clock numbers the
+#      sprint is trying to make honest.
+#   2. Pacing is a property of a run, and a run has to be able to state the pacing
+#      it ran under (`snapshot()` goes into the manifest). A module default nobody
+#      declared is not stateable, and it silently costs any importer real seconds.
+PACER = Pacer.disabled()
+
+
+def set_pacing(on=True, intervals=None, default=None, sleep=time.sleep,
+               clock=time.monotonic):
+    """Install (or remove) client-side pacing process-wide.
+
+    Returns the pacer that was previously installed, so a caller can restore it.
+    """
+    global PACER
+    previous = PACER
+    if on:
+        PACER = Pacer(intervals=intervals, default=default, sleep=sleep,
+                      clock=clock)
+    else:
+        PACER = Pacer.disabled(sleep=sleep, clock=clock)
+    return previous
+
+
+def set_pacer(pacer):
+    """Install a specific pacer. Returns the previous one."""
+    global PACER
+    previous = PACER
+    PACER = pacer
+    return previous
 
 
 class RoleCall(tuple):
@@ -266,11 +1188,184 @@ def _redact(text, keys):
     return out
 
 
+# Public name for the same thing. Every write site is supposed to redact for
+# itself rather than trust a distant upstream one, and a write site in another
+# module cannot be asked to do that while the only spelling is private.
+redact = _redact
+
+
+# --------------------------------------------------------------- event log (D3)
+
+# Closed and enumerable on purpose. An open-ended `kind` string means a reader
+# has to discover the vocabulary from the data, and a typo becomes a silently
+# new event type that no analysis counts.
+EVENT_CALL = "call"
+EVENT_STEP = "step"
+EVENT_CANDIDATE = "candidate"
+EVENT_GATE = "gate"
+EVENT_VERDICT = "verdict"
+EVENT_INFRA_LOSS = "infra_loss"
+EVENT_RESUME_SKIP = "resume_skip"
+
+EVENT_KINDS = (EVENT_CALL, EVENT_STEP, EVENT_CANDIDATE, EVENT_GATE,
+               EVENT_VERDICT, EVENT_INFRA_LOSS, EVENT_RESUME_SKIP)
+
+EVENT_LOG_SUFFIX = ".events.jsonl"
+
+
+def event_log_path(memory_path):
+    """`runs/<run_id>.json` -> `runs/<run_id>.events.jsonl`.
+
+    The suffix is `.jsonl`, and that is not cosmetic. Three existing checks glob
+    `*.json` in the run directory and assert on the number of matches -- "the run
+    wrote exactly one file", "two run files on disk" -- and one indexes
+    `sorted(glob(...))[0]`. A sibling named `*.json` would break all four for no
+    reason. Nor may it end in `.tmp`: "no leftover temp files" globs that too.
+    """
+    root = memory_path
+    if root.endswith(".json"):
+        root = root[:-len(".json")]
+    return root + EVENT_LOG_SUFFIX
+
+
+def _redact_deep(value, keys):
+    """`_redact` over a whole nested structure, at the write site.
+
+    The JSONL writer redacts everything it is handed rather than trusting the
+    caller to have done it. A second writer relying on a distant first writer's
+    hygiene is exactly how an unredacted `ProviderError` reached a log before:
+    the guarantee has to live where the bytes are produced, because that is the
+    only place that cannot be bypassed by a new caller.
+    """
+    if isinstance(value, str):
+        return _redact(value, keys)
+    if isinstance(value, dict):
+        return dict((name, _redact_deep(item, keys))
+                    for name, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return [_redact_deep(item, keys) for item in value]
+    return value
+
+
+class EventLog:
+    """Append-only JSONL, one JSON object per line, flushed after every event.
+
+    Additive by construction: it is a *sibling* of the per-run JSON, never a
+    replacement. The UI and every stored record read that JSON's shape, so this
+    file adds a chronology without touching it.
+
+    Flushed (and fsynced) per event because the whole point is the run that dies
+    mid-grid. A buffered log of a crashed run is a log of everything except the
+    part you needed.
+    """
+
+    def __init__(self, path, context=None, keys=None):
+        self.path = path
+        self.context = dict(context or {})
+        self.keys = dict(keys or {})
+        self.count = 0
+        self.failed = 0
+
+    def scope(self, **context):
+        """Temporarily merge extra context (one cell of a sweep) into every event.
+
+        A context manager rather than a second EventLog object, so the file, the
+        event count and the redaction keys stay single. Two objects writing one
+        file would each report a partial count.
+        """
+        return _EventScope(self, context)
+
+    def emit(self, kind, **fields):
+        """Append one event. Returns the dict written, or None if the write failed.
+
+        Unknown kinds raise: the vocabulary is closed, and a typo that silently
+        invents an event type is a hole in every count computed from this file.
+        """
+        if kind not in EVENT_KINDS:
+            raise ValueError("unknown event kind %r; the vocabulary is %s"
+                             % (kind, ", ".join(EVENT_KINDS)))
+        event = {"kind": kind,
+                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        event.update(self.context)
+        event.update(fields)
+        event = _redact_deep(event, self.keys)
+        line = json.dumps(event, sort_keys=True, default=str)
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            # Same policy as `Memory.save`: a read-only filesystem must not take
+            # the run down. Counted, so a silent zero is visible as failures.
+            self.failed += 1
+            return None
+        self.count += 1
+        return event
+
+
+class _EventScope(object):
+    def __init__(self, log, context):
+        self.log = log
+        self.context = context
+        self.previous = None
+
+    def __enter__(self):
+        self.previous = dict(self.log.context)
+        self.log.context.update(self.context)
+        return self.log
+
+    def __exit__(self, *exc_info):
+        self.log.context = self.previous
+        return False
+
+
+# The event log `_log_call` forwards to, or None. Module level because `call_role`
+# is reached from call sites that have no business threading a log through;
+# `set_event_log` returns the previous value so a caller restores rather than
+# clears, and a nested runner cannot orphan its parent's log.
+_EVENT_LOG = None
+
+
+def set_event_log(log):
+    """Install the process-wide event log. Returns the previous one."""
+    global _EVENT_LOG
+    previous = _EVENT_LOG
+    _EVENT_LOG = log
+    return previous
+
+
+def event_log():
+    return _EVENT_LOG
+
+
+def emit_event(kind, **fields):
+    """Write an event if a log is installed. A no-op otherwise."""
+    log = _EVENT_LOG
+    if log is None:
+        return None
+    return log.emit(kind, **fields)
+
+
 def _log_call(record):
     CALL_LOG.append(record)
     if len(CALL_LOG) > MAX_CALL_LOG:
         del CALL_LOG[:len(CALL_LOG) - MAX_CALL_LOG]
     return record
+
+
+def _emit_call_event(record):
+    """The `call` event *is* the CALL_LOG record, so the two cannot drift.
+
+    Emitted after the outcome is settled rather than when the record is created.
+    `_log_call` runs before the provider is touched -- so the record it appends
+    still says `ok: False` -- and an event log whose every `call` event reads as a
+    failure would be worse than no event log.
+    """
+    return emit_event(EVENT_CALL, **record)
 
 
 def call_role(role, keys, system, user, emit=None, prefer=None):
@@ -308,29 +1403,13 @@ def call_role(role, keys, system, user, emit=None, prefer=None):
         if not key:
             continue
         attempted.append(provider)
-        record = {
-            "role": role,
-            "requested": requested,
-            "used": provider,
-            "model": PROVIDERS[provider]["model"],
-            "temperature": TEMPERATURE,
-            "top_p": TOP_P,
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "measurement_mode": MEASUREMENT_MODE,
-            "ok": False,
-            "error": None,
-        }
-        _log_call(record)
-        try:
-            text = call_model(provider, key, system, user)
-        except ProviderError as exc:
-            record["error"] = _redact(exc, keys)
-            last_error = exc
-            if emit and not MEASUREMENT_MODE:
-                emit("system", "%s failed for %s; trying next provider" % (provider, role))
-            continue
-        record["ok"] = True
-        return RoleCall(text, provider, record)
+        text, record, error = _attempt_provider(role, requested, provider, key,
+                                                system, user, keys)
+        if error is None:
+            return RoleCall(text, provider, record)
+        last_error = error
+        if emit and not MEASUREMENT_MODE:
+            emit("system", "%s failed for %s; trying next provider" % (provider, role))
 
     if MEASUREMENT_MODE:
         # Loud on purpose. A dead slug or a missing key must stop the task, not
@@ -339,13 +1418,110 @@ def call_role(role, keys, system, user, emit=None, prefer=None):
             raise ProviderError(
                 "measurement mode: no API key for %s (%s); failover is disabled"
                 % (role, requested))
+        # The status and the class are carried onto the wrapper. Flattening them
+        # away here is what made a 429 and a 404 indistinguishable to the caller
+        # deciding whether this was infrastructure or a model.
         raise ProviderError(
             "measurement mode: %s failed for %s and failover is disabled: %s"
-            % (requested, role, _redact(last_error, keys)))
+            % (requested, role, _redact(last_error, keys)),
+            status=getattr(last_error, "status", None),
+            exc_class=getattr(last_error, "exc_class", ""),
+            retry_after=getattr(last_error, "retry_after", None))
     if not attempted:
         raise ProviderError("no API key available for %s" % role)
     raise ProviderError("all providers failed for %s: %s"
-                       % (role, _redact(last_error, keys)))
+                       % (role, _redact(last_error, keys)),
+                       status=getattr(last_error, "status", None),
+                       exc_class=getattr(last_error, "exc_class", ""),
+                       retry_after=getattr(last_error, "retry_after", None))
+
+
+def _attempt_provider(role, requested, provider, key, system, user, keys):
+    """One provider, paced and retried. Returns ``(text, record, error)``.
+
+    Retries are per provider and happen before failover moves on, because in
+    measurement mode there is no failover: the order is one provider long, so a
+    retry here is the only thing standing between a 429 and a lost task.
+
+    `error` is None exactly when the call succeeded. The record is appended to
+    CALL_LOG once, before the first attempt, and mutated in place -- the retry
+    count belongs on the call, not as three near-identical log entries.
+    """
+    record = {
+        "role": role,
+        "requested": requested,
+        "used": provider,
+        # Resolved, not read off the provider: a role can carry its own model, and
+        # the record has to say which one this call actually asked for. Resolved
+        # against the provider being attempted, so a failover or an `alternate`
+        # rung records the model that endpoint was actually asked for.
+        "model": model_for(role, provider) if role in ROLE_PROVIDER
+                 else PROVIDERS[provider].get("model"),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "measurement_mode": MEASUREMENT_MODE,
+        "ok": False,
+        "error": None,
+        "status": None,
+        "exc_class": "",
+        "attempts": 0,
+        "retried": 0,
+        "seconds_paced": 0.0,
+        "seconds_backoff": 0.0,
+    }
+    # Every sampling parameter actually sent, by its own name, so `temperature`
+    # and `top_p` keep the keys every existing reader uses and a provider-specific
+    # parameter appears here too instead of going unrecorded.
+    record.update(sampling_for(role))
+    _log_call(record)
+    attempts = retry_attempts()
+    delays = backoff_schedule(_BACKOFF_RUN_ID, attempts)
+    error = None
+    for attempt in range(attempts):
+        record["attempts"] = attempt + 1
+        record["seconds_paced"] = round(
+            record["seconds_paced"] + PACER.wait_for(provider), 3)
+        try:
+            # STANDING PROHIBITION, and this is the line someone would wrap.
+            #
+            # Do not add a disk or memory cache keyed on
+            # (prompt, model, temperature, top_p, provider). It looks like a free
+            # speedup and it silently destroys the measurement. The D8 calibration
+            # sweep draws 10 independent A' samples per task; with a cache like
+            # that, 36 tasks become 36 unique answers replayed ten times at zero
+            # variance. k=3 becomes k=1. Every confidence interval collapses, the
+            # repeats look perfectly reproducible, and nothing in the output says
+            # a sample was replayed rather than drawn.
+            #
+            # If one is ever genuinely needed it needs (a) an attempt nonce in the
+            # key, so a repeat is a miss by construction, and (b) an unconditional
+            # bypass whenever MEASUREMENT_MODE is on. Prefer a content-addressed
+            # artifact store: that gives resume without ever handing back an old
+            # sample as if it had just been drawn.
+            text = call_model(provider, key, system, user, role=role)
+        except ProviderError as exc:
+            error = exc
+            record["error"] = _redact(exc, keys)
+            record["status"] = exc.status
+            record["exc_class"] = exc.exc_class
+            if not is_retryable_status(exc.status) or attempt == attempts - 1:
+                break
+            # The server's own number wins when it sent one; ours is a guess and
+            # its is not. Ours is the fallback, not the policy.
+            wait = getattr(exc, "retry_after", None)
+            if wait is None:
+                wait = delays[attempt]
+            record["retried"] = attempt + 1
+            record["seconds_backoff"] = round(record["seconds_backoff"] + wait, 3)
+            _RETRY_SLEEP(wait)
+            continue
+        record["ok"] = True
+        record["error"] = None
+        record["status"] = None
+        record["exc_class"] = ""
+        _emit_call_event(record)
+        return text, record, None
+    _emit_call_event(record)
+    return None, record, error
 
 
 def alternate_provider(role, keys):
@@ -603,6 +1779,14 @@ class StepResult:
     # The line the failing assert sat on. Only `ExecResult` carried this before;
     # the candidate ranking in `_verify_step` needs it on the step too.
     failed_assertion_line: Optional[int] = None
+    # The retained candidate's per-check tally, from the report its suite printed.
+    # Descriptive: `verdict` is decided by the harness's exit code and stderr and
+    # is never derived from these, and no threshold over them exists anywhere.
+    # `checks_trusted` False means the report was absent or incoherent, in which
+    # case `checks_passed` is 0 and means "unknown", not "none passed".
+    checks_passed: int = 0
+    checks_total: int = 0
+    checks_trusted: bool = False
     tested: bool = False
     note: str = ""
     # The last rung of ESCALATION used on this step, or "exhausted" if the
@@ -691,6 +1875,39 @@ def run_workspace(user_prompt, keys, mode=DEFAULT_MODE, on_event=None,
     stages = pipeline_for(mode)
     memory = Memory(prompt=user_prompt, mode=mode)
 
+    # An ambient log wins. `eval/run_eval.py` installs one per cell carrying the
+    # task id, arm and repeat, and arm B reaches this function from inside that
+    # scope; installing a second log here would send the run's events to a file
+    # that has no idea which cell produced them. When nothing is installed -- the
+    # interactive app, a direct caller -- the run opens its own beside its JSON.
+    events = event_log()
+    installed = events is None
+    if installed:
+        events = EventLog(event_log_path(memory.path), keys=keys)
+        set_event_log(events)
+    scope = events.scope(run_id=memory.run_id, mode=mode)
+    scope.__enter__()
+    previous_run_id = set_backoff_run_id(memory.run_id)
+    try:
+        return _run_workspace(user_prompt, keys, mode, stages, memory, on_event,
+                              user_tests, plan, tests)
+    finally:
+        # Teardown in a `finally` because `ProviderError` propagates out of here.
+        # A leaked backoff run id would seed the *next* task's jitter from this
+        # task's id, and a leaked log would keep writing into a finished run.
+        set_backoff_run_id(previous_run_id)
+        scope.__exit__(None, None, None)
+        if installed:
+            set_event_log(None)
+
+
+def _run_workspace(user_prompt, keys, mode, stages, memory, on_event,
+                   user_tests, plan, tests):
+    """`run_workspace`'s body, with the event log and the pacer already set up.
+
+    Split out only so the setup has a `finally` to be torn down in; every
+    argument is already validated and resolved by the caller.
+    """
     def emit(role, content):
         memory.add(role, content)
         if on_event:
@@ -748,7 +1965,7 @@ def run_workspace(user_prompt, keys, mode=DEFAULT_MODE, on_event=None,
 
         run.steps.append(record)
         completed.append((number, step, record.output))
-        memory.add_step({
+        step_log = {
             "number": record.number,
             "step": record.step,
             "verdict": record.verdict,
@@ -757,6 +1974,9 @@ def run_workspace(user_prompt, keys, mode=DEFAULT_MODE, on_event=None,
             "failure_kind": record.failure_kind,
             "failed_assertion": record.failed_assertion,
             "failed_assertion_line": record.failed_assertion_line,
+            "checks_passed": record.checks_passed,
+            "checks_total": record.checks_total,
+            "checks_trusted": record.checks_trusted,
             "tested": record.tested,
             "note": record.note,
             "escalation": record.escalation,
@@ -768,13 +1988,70 @@ def run_workspace(user_prompt, keys, mode=DEFAULT_MODE, on_event=None,
             "stderr": record.stderr,
             "code": record.code,
             "sandbox_layers": record.sandbox_layers,
-        })
+        }
+        memory.add_step(step_log)
+        _emit_step_events(step_log)
 
     run.deliverable = _assemble_deliverable(run)
     memory.set_deliverable(run.deliverable)
     emit("system", "Run complete - %d/%d step(s) verified against the "
                    "acceptance suite" % (run.verified_count, len(run.steps)))
     return run
+
+
+def _emit_step_events(step_log):
+    """`step`, one `candidate` per attempt, and `verdict`, from the step's log.
+
+    Derived from the dict that goes into the run JSON rather than from the
+    `StepResult`, so the JSONL and the JSON cannot disagree about what happened.
+    The bodies -- code, stdout, stderr -- are deliberately left out: they are
+    already in the JSON in full, and an append-only log meant to survive a kill
+    is worth less the larger each line is.
+    """
+    emit_event(EVENT_STEP,
+               number=step_log["number"],
+               provider=step_log["provider"],
+               rounds=step_log["rounds"],
+               escalation=step_log["escalation"],
+               retained_round=step_log["retained_round"],
+               final_round_worse=step_log["final_round_worse"],
+               candidates=len(step_log["candidates"] or []))
+    for candidate in (step_log["candidates"] or []):
+        emit_event(EVENT_CANDIDATE,
+                   number=step_log["number"],
+                   round=candidate.get("round"),
+                   verdict=candidate.get("verdict"),
+                   exit_code=candidate.get("exit_code"),
+                   failure_kind=candidate.get("failure_kind"),
+                   escalation=candidate.get("escalation"),
+                   checks_passed=candidate.get("checks_passed"),
+                   checks_total=candidate.get("checks_total"),
+                   checks_trusted=candidate.get("checks_trusted"),
+                   code_sha256=sha256_of(candidate.get("code") or ""))
+    emit_event(EVENT_VERDICT,
+               number=step_log["number"],
+               verdict=step_log["verdict"],
+               exit_code=step_log["exit_code"],
+               tested=step_log["tested"],
+               failure_kind=step_log["failure_kind"],
+               failed_assertion=step_log["failed_assertion"],
+               failed_assertion_line=step_log["failed_assertion_line"],
+               checks_passed=step_log["checks_passed"],
+               checks_total=step_log["checks_total"],
+               checks_trusted=step_log["checks_trusted"],
+               code_sha256=sha256_of(step_log["code"] or ""))
+
+
+def sha256_of(text):
+    """The digest of a string, or "" for an empty one.
+
+    Events carry digests where the JSON carries bodies. A digest is enough to
+    prove the JSON and the JSONL describe the same bytes, which is the only
+    question the event log has to answer about code it is not storing.
+    """
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _candidates_for_log(candidates):
@@ -787,7 +2064,8 @@ def _candidates_for_log(candidates):
     candidate is an ungradable one.
     """
     keep = ("round", "provider", "code", "verdict", "exit_code",
-            "failure_kind", "failed_assertion", "failed_assertion_line")
+            "failure_kind", "failed_assertion", "failed_assertion_line",
+            "checks_passed", "checks_total", "checks_trusted")
     return [{name: cand.get(name) for name in keep} for cand in candidates]
 
 
@@ -832,7 +2110,12 @@ def _resolve_tests(run, plan, keys, emit, user_tests):
         raw, _ = call_role("test_writer", keys, PROMPTS["test_writer"], request, emit)
     except ProviderError as exc:
         run.tests_status = TESTS_MISSING
-        run.tests_summary = "could not generate a suite: %s" % exc
+        # Redacted here, at the write site, not on the strength of `call_role`
+        # having done it upstream. `tests_summary` is persisted to the run JSON
+        # and rendered in the UI, and this exception can be a raw SDK error whose
+        # message quotes the request -- key included.
+        run.tests_summary = ("could not generate a suite: %s"
+                             % _redact(exc, keys))
         emit("tests", _tests_entry(run, None))
         return
 
@@ -928,45 +2211,73 @@ def _tests_entry(run, audit):
     return "\n".join(lines)
 
 
+def _candidate_checks(candidate):
+    """How many of the suite's checks this candidate passed, or `-1` for unknown.
+
+    `-1` sorts below a measured zero, which is the conservative direction and not
+    an accident. An unknown count almost always means the suite never produced a
+    report, and the dominant reason for that is that it never ran -- a missing
+    entry point, a syntax error, a timeout. Ranking "we did not measure it" above
+    "we measured it and nothing passed" would let an absent measurement promote a
+    candidate, which is the one thing the count must never do.
+    """
+    if not candidate.get("checks_trusted"):
+        return -1
+    passed = candidate.get("checks_passed")
+    return passed if isinstance(passed, int) else -1
+
+
 def _candidate_rank(candidate):
     """How far a candidate got, as an ordinal tuple. Higher is better.
 
     1. APPROVED beats everything.
-    2. An assertion failure beats an import failure: the module loaded and ran
-       under the suite, which is strictly further than not loading.
-    3. Deeper failing assert line beats shallower.
+    2. More checks passed beats fewer. Unknown sorts below a measured zero; see
+       `_candidate_checks`.
+    3. An assertion failure beats anything else: a wrong answer to a check is
+       further along than an import error, a timeout or a `NameError`, and the
+       per-check report records those apart precisely so this does not have to
+       treat them alike.
     4. Earliest round wins ties.
+    5. Anything still tied is broken by the digest of the candidate's own code.
 
-    Two things this is not, both of which are honest limits rather than
-    tuning knobs:
+    Element 2 replaced the failing assert *line*, which was a heuristic standing
+    in for "got further" and read a position in a list whose order the suite
+    never promised. Counting checks measures the same intuition directly, and the
+    reorder battery in `eval/rank_battery.py` is what establishes that the count
+    does not move when the suite's checks are permuted.
 
-    * Depth (3) is a *heuristic*, not a score. It only means "got further" if
-      the frozen suite's asserts are order-independent -- if assert 7 can only
-      be reached by passing 1-6. Nothing in this repo establishes that yet; the
-      permuted-assert-order flakiness battery that would is not written. Until
-      it is, read this as a tie-break with a plausible story, not a measurement.
-    * Everything that is not an assertion failure -- import errors, timeouts,
-      runaway output, no code block, harness failure -- collapses to one rank,
-      so among those the round-1 candidate is kept simply because it is first.
-      That is coarse and deliberately conservative. It is not a claim that a
-      round-1 timeout is better than a round-3 import error; it is a refusal to
-      guess between them.
+    What element 5 is for: rounds can contain more than one candidate -- arm
+    `a_prime3` draws three -- so `-round` does not settle every tie, and `max`
+    would otherwise keep whichever draw happened to be first. Draw order is
+    exactly what a retention rule must not depend on, so the last word goes to
+    something the draw order cannot influence. It is an arbitrary rule among
+    candidates the key has already found indistinguishable, not a quality claim:
+    the only properties asked of it are that it is total and that it is a
+    function of the candidate alone. Two candidates with identical code remain
+    tied, and are interchangeable in every field this retains.
+
+    One honest limit remains: everything that is not an assertion failure and
+    produced no report -- import errors, timeouts, runaway output, no code block,
+    harness failure -- still collapses to one rank, so among those the retained
+    one is settled by round and then by digest. That is a refusal to guess
+    between a round-1 timeout and a round-3 import error, not a claim about them.
     """
-    line = candidate.get("failed_assertion_line")
     return (
         1 if candidate.get("verdict") == harness.VERDICT_APPROVED else 0,
+        _candidate_checks(candidate),
         1 if candidate.get("failure_kind") == harness.FAIL_ASSERTION else 0,
-        line if isinstance(line, int) else -1,
         -candidate.get("round", 0),
+        hashlib.sha256((candidate.get("code") or "").encode("utf-8")).hexdigest(),
     )
 
 
 def _candidate_merit(candidate):
-    """`_candidate_rank` without the round tie-break.
+    """`_candidate_rank` without the round tie-break, or the digest under it.
 
     Comparing full ranks would make "the final round was worse" fire on every
     exhausted step whose candidates all failed the same way, since the later
-    round always loses the tie-break. Being later is not being worse.
+    round always loses the tie-break. Being later is not being worse -- and
+    neither is having a code digest that sorts lower.
     """
     return _candidate_rank(candidate)[:3]
 
@@ -979,6 +2290,13 @@ def _retain_best(record, candidates):
     answer that failed one late assert. That is not "the best effort", it is
     "the most recent effort", and freezing it as the measurement convention
     would pre-register the bug.
+
+    Retention reads `_candidate_rank`, so what "best" means is documented there.
+    The property this function owns is that the answer is a function of the *set*
+    of candidates and not of the order they arrived in: every element of the key
+    is computed from one candidate, the last element is total over distinct code,
+    and `max`'s own first-wins bias is only reachable between candidates whose
+    code is byte-identical.
     """
     if not candidates:
         return record
@@ -993,6 +2311,9 @@ def _retain_best(record, candidates):
     record.failure_kind = best["failure_kind"]
     record.failed_assertion = best["failed_assertion"]
     record.failed_assertion_line = best["failed_assertion_line"]
+    record.checks_passed = best["checks_passed"]
+    record.checks_total = best["checks_total"]
+    record.checks_trusted = best["checks_trusted"]
     record.sandbox_layers = list(best["sandbox_layers"])
     record.provider = best["provider"]
     record.retained_round = best["round"]
@@ -1038,6 +2359,9 @@ def _verify_step(record, task, keys, emit, run):
         record.failure_kind = result.failure_kind
         record.failed_assertion = result.failed_assertion
         record.failed_assertion_line = result.failed_assertion_line
+        record.checks_passed = result.checks_passed
+        record.checks_total = result.checks_total
+        record.checks_trusted = result.checks_trusted
         record.sandbox_layers = list(result.sandbox_layers)
         record.retained_round = attempt + 1
         candidates.append({
@@ -1052,6 +2376,9 @@ def _verify_step(record, task, keys, emit, run):
             "failure_kind": result.failure_kind,
             "failed_assertion": result.failed_assertion,
             "failed_assertion_line": result.failed_assertion_line,
+            "checks_passed": result.checks_passed,
+            "checks_total": result.checks_total,
+            "checks_trusted": result.checks_trusted,
             "sandbox_layers": list(result.sandbox_layers),
         })
 
@@ -1097,7 +2424,10 @@ def _verify_step(record, task, keys, emit, run):
             record.output, provider = call_role(
                 "executor", keys, PROMPTS["executor"], prompt, emit, prefer=prefer)
         except ProviderError as exc:
-            emit("system", "Revision failed: %s" % exc)
+            # Redacted at the write site. `emit` feeds the UI transcript *and*
+            # `Memory`, so an unredacted exception here is a key written to disk;
+            # relying on `call_role`'s redaction is how one got there before.
+            emit("system", "Revision failed: %s" % _redact(exc, keys))
             return _retain_best(record, candidates)
         record.provider = provider
         record.rounds = attempt + 1

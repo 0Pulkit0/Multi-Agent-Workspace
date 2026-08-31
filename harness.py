@@ -94,11 +94,29 @@ SOLUTION_MODULE = "solution"
 # prints no traceback at all -- can still be explained.
 PHASE_NAME = "_harness_phase"
 
+# And which pathlib mechanism its path guard ended up using. The parent reports the
+# layer list but cannot know this: it depends on what the child's pathlib actually
+# holds, and reconstructing it from `sys.version_info` in the parent would be
+# reading the mechanism out of source instead of recording what ran.
+PATHS_NAME = "_harness_paths"
+
+# When the child never got far enough to say. Not a mechanism -- an admission that
+# the dimension went unreported, which is a different fact from any of the answers.
+PATHS_UNREPORTED = "pathlib:unreported"
+
 PHASE_STARTUP = "startup"
 PHASE_IMPORT = "import-solution"
 PHASE_TESTS = "tests"
 PHASE_SOLUTION = "solution"
 PHASE_TEARDOWN = "teardown"
+
+# A generated suite reports one line per check on stdout, tagged with this. The
+# tag lives here rather than in the generator because two very different readers
+# have to agree on it byte for byte: `eval/gen_tasks.py` emits it and everything
+# that ranks candidates parses it. Four sigils and an internal hyphen so that
+# nothing an Executor prints by accident collides -- and see `read_checks` for
+# why a collision on purpose cannot buy anything either.
+CHECK_TAG = "@@MAW-CHECK@@"
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +335,11 @@ _WORKDIR = os.path.dirname(os.path.abspath(_TARGET))
 # traceback rewriting in the parent are keyed to it.
 _WORKDIR_REAL = os.path.realpath(_WORKDIR)
 _REAL_OPEN = open
+# Where the child leaves the one fact about the path guard that only the child can
+# know: which pathlib mechanism it used. Spelled here and in the parent's
+# `PATHS_NAME`, and a check asserts the two agree, because the runner is written
+# verbatim and cannot interpolate the parent's constant.
+_PATHS_NAME = "_harness_paths"
 
 # `-I` implies `-E -s` and, crucially, leaves the script's own directory OFF
 # sys.path -- so `from solution import ...` inside test_solution.py would die
@@ -421,6 +444,20 @@ def _fs_deny(path):
     return PermissionError("%s: %s" % (_FS_MSG, shown))
 
 
+def _fs_deny_fd(name):
+    """Refuse a call that names its target relative to a foreign directory.
+
+    `_fs_allowed` resolves a relative name by joining it onto _WORKDIR, which is
+    correct only because cwd *is* the workdir. A `dir_fd` breaks that premise:
+    the name resolves against a descriptor this process cannot inspect, so a
+    bare filename always looks local and is always allowed. No candidate
+    solution needs one, so the whole family is refused rather than guessed at.
+    """
+    return PermissionError(
+        "%s: %s resolves the name against a directory the harness cannot "
+        "check, so calls passing one are refused outright" % (_FS_MSG, name))
+
+
 def _fs_allowed(path):
     if isinstance(path, int):
         return True          # an already-open descriptor; nothing to resolve
@@ -479,41 +516,96 @@ def _block_filesystem():
         _write_flags |= getattr(os, flag, 0)
     _os_open = os.open
 
-    def _guarded_os_open(path, flags, *args, **kwargs):
-        if flags & _write_flags and not _fs_allowed(path):
+    def _guarded_os_open(*args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            raise _fs_deny_fd("dir_fd")
+        path = args[0] if args else kwargs.get("path")
+        flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+        try:
+            writing = bool(flags & _write_flags)
+        except TypeError:
+            writing = True   # unreadable flags: check the path rather than skip
+        if writing and not _fs_allowed(path):
             raise _fs_deny(path)
-        return _os_open(path, flags, *args, **kwargs)
+        return _os_open(*args, **kwargs)
 
     os.open = _guarded_os_open
 
-    def _guard(real, checked):
+    def _guard(real, checked, fds=()):
         def _wrapped(*args, **kwargs):
-            for index in checked:
-                if index < len(args) and not _fs_allowed(args[index]):
-                    raise _fs_deny(args[index])
+            for name in fds:
+                if kwargs.get(name) is not None:
+                    raise _fs_deny_fd(name)
+            for index, name in checked:
+                if index < len(args):
+                    value = args[index]
+                elif name in kwargs:
+                    value = kwargs[name]
+                else:
+                    continue     # defaulted; nothing was named to check
+                if not _fs_allowed(value):
+                    raise _fs_deny(value)
             return real(*args, **kwargs)
         return _wrapped
 
-    # The index of each path argument that must land inside the workdir. For
-    # copies only the destination is checked, because the source is only read;
-    # for rename/move both, because the source is destroyed.
-    for module, name, checked in (
-        (os, "remove", (0,)), (os, "unlink", (0,)), (os, "rmdir", (0,)),
-        (os, "removedirs", (0,)), (os, "mkdir", (0,)), (os, "makedirs", (0,)),
-        (os, "truncate", (0,)), (os, "chmod", (0,)), (os, "chown", (0,)),
-        (os, "utime", (0,)), (os, "mknod", (0,)), (os, "mkfifo", (0,)),
-        (os, "chdir", (0,)),
-        (os, "rename", (0, 1)), (os, "renames", (0, 1)), (os, "replace", (0, 1)),
-        (os, "link", (1,)), (os, "symlink", (1,)),
-        (shutil, "rmtree", (0,)), (shutil, "move", (0, 1)),
-        (shutil, "copy", (1,)), (shutil, "copy2", (1,)),
-        (shutil, "copyfile", (1,)), (shutil, "copytree", (1,)),
-        (shutil, "copymode", (1,)), (shutil, "copystat", (1,)),
-        (shutil, "make_archive", (0,)), (shutil, "unpack_archive", (1,)),
+    # Each path argument by position *and* by keyword, because a wrapper that
+    # only reads args[index] is bypassed by the keyword spelling of the same
+    # call: shutil.rmtree(path=<outside>) emptied a directory outside the
+    # workdir, and only the final top-level rmdir was denied -- so it raised a
+    # PermissionError that read as though the guard had held. os.remove(path=..)
+    # succeeded with no error at all. The `fds` column lists the dir_fd-style
+    # keywords that make a relative name resolve somewhere this process cannot
+    # see; rmtree walks a tree by exactly that route.
+    #
+    # For copies only the destination is checked, because the source is only
+    # read; for rename/move both, because the source is destroyed.
+    _DIR_FD = ("dir_fd",)
+    _SRC_DST_FD = ("src_dir_fd", "dst_dir_fd")
+    for module, name, checked, fds in (
+        (os, "remove", ((0, "path"),), _DIR_FD),
+        (os, "unlink", ((0, "path"),), _DIR_FD),
+        (os, "rmdir", ((0, "path"),), _DIR_FD),
+        (os, "removedirs", ((0, "name"),), ()),
+        (os, "mkdir", ((0, "path"),), _DIR_FD),
+        (os, "makedirs", ((0, "name"),), ()),
+        (os, "truncate", ((0, "path"),), ()),
+        (os, "chmod", ((0, "path"),), _DIR_FD),
+        (os, "chown", ((0, "path"),), _DIR_FD),
+        (os, "utime", ((0, "path"),), _DIR_FD),
+        (os, "mknod", ((0, "path"),), _DIR_FD),
+        (os, "mkfifo", ((0, "path"),), _DIR_FD),
+        (os, "chdir", ((0, "path"),), ()),
+        (os, "rename", ((0, "src"), (1, "dst")), _SRC_DST_FD),
+        (os, "renames", ((0, "old"), (1, "new")), ()),
+        (os, "replace", ((0, "src"), (1, "dst")), _SRC_DST_FD),
+        (os, "link", ((1, "dst"),), _SRC_DST_FD),
+        (os, "symlink", ((1, "dst"),), _DIR_FD),
+        (shutil, "rmtree", ((0, "path"),), ()),
+        (shutil, "move", ((0, "src"), (1, "dst")), ()),
+        (shutil, "copy", ((1, "dst"),), ()),
+        (shutil, "copy2", ((1, "dst"),), ()),
+        (shutil, "copyfile", ((1, "dst"),), ()),
+        (shutil, "copytree", ((1, "dst"),), ()),
+        (shutil, "copymode", ((1, "dst"),), ()),
+        (shutil, "copystat", ((1, "dst"),), ()),
+        (shutil, "make_archive", ((0, "base_name"),), ()),
+        (shutil, "unpack_archive", ((1, "extract_dir"),), ()),
     ):
         real = getattr(module, name, None)
         if real is not None:
-            setattr(module, name, _guard(real, checked))
+            setattr(module, name, _guard(real, checked, fds))
+
+    # rmtree's default recursion is the one legitimate caller of the dir_fd
+    # family: `_rmtree_safe_fd` opens each subdirectory and unlinks by bare name,
+    # so refusing dir_fd above also refuses a perfectly legal in-workdir
+    # `shutil.rmtree("build")`. Routing rmtree through its path-based walk
+    # instead keeps that call working *and* makes every step of the recursion
+    # checkable -- under the fd walk the individual unlinks could not be
+    # verified at all, which is what let the keyword form empty a tree outside
+    # the workdir. The path walk is the more race-prone of the two if something
+    # swaps a directory for a symlink mid-delete; that trade is deliberate,
+    # because a candidate racing its own rmtree is not what this guards against.
+    shutil._use_fd_functions = False
 
     # Imported *after* the patches above, and only now: pathlib snapshots
     # os.unlink and friends into its accessor at import time, so importing it
@@ -521,7 +613,76 @@ def _block_filesystem():
     # guards on 3.9. If something imported pathlib earlier, its accessor holds
     # the originals -- one more reason this is containment, not a boundary.
     try:
-        import pathlib  # noqa: F401
+        import pathlib
+    except Exception:
+        pathlib = None
+    # ...but the snapshot only works for C builtins. Those do not bind, so
+    # os.unlink sitting on the accessor's class stayed a plain function; the
+    # pure-Python wrappers installed above *do* bind, and every call arrived
+    # shifted by one, with the accessor instance in the path slot. That broke
+    # pathlib in both directions on 3.9: a legal in-workdir Path.write_text()
+    # raised "unsupported operand type(s) for &: 'PosixPath' and 'int'" because
+    # the path had landed in os.open's flags slot, a legal read_text() raised the
+    # same, and a genuine escape was refused with "<pathlib._NormalAccessor
+    # object at 0x...>" in place of the path. A false deny on legal code is
+    # charged to the Executor, so the guard was manufacturing failures it would
+    # then blame on the model. staticmethod restores the unbound call.
+    #
+    # The first version of the repair also *substituted* `os.<name>` into each
+    # slot, which assumed every slot holds `os.<name>`. True on 3.9, false from
+    # 3.10: 3.10 moved `Path.open` onto the accessor, where the slot holds
+    # `io.open`'s six-argument signature, so four-argument `os.open` in that slot
+    # raises "TypeError: open() takes at most 4 arguments (6 given)" on a legal
+    # in-workdir Path.write_text() -- the same false deny, one version later.
+    # Skipping the block on 3.10 instead would be worse, not better: the slots
+    # would still hold the pure-Python guards, they would still bind, and every
+    # legal Path.unlink() would then arrive with the accessor in the path slot and
+    # be denied outright. So the repair stops guessing what belongs in a slot and
+    # re-wraps what is already in it, which is correct on both versions and needs
+    # no version table. It re-wraps only where the slot holds the module-level
+    # function this guard patched; a slot holding something else -- pathlib's own
+    # `def lchmod(self, path, mode)` fallbacks, or an original C builtin snapshotted
+    # by an earlier import -- is left alone, because a staticmethod around a real
+    # method shifts it the other way and would deny legal calls in a third way.
+    _ACCESSOR_NAMES = ("open", "unlink", "rmdir", "mkdir", "rename", "replace",
+                       "chmod", "chown", "utime", "link", "symlink", "mkfifo",
+                       "truncate")
+    if pathlib is None:
+        _paths_mechanism = "pathlib:unimportable"
+    else:
+        _accessor = getattr(pathlib, "_NormalAccessor", None)
+        if _accessor is None:
+            # 3.11 dropped the accessor: pathlib calls os.* and io.open at call
+            # time and both are patched above, so there is nothing to re-wrap and
+            # nothing is opened up by the removal.
+            _paths_mechanism = "pathlib:direct-calls"
+        else:
+            _rebound, _untouched = 0, 0
+            for name in _ACCESSOR_NAMES:
+                current = vars(_accessor).get(name)
+                if current is None or isinstance(current, staticmethod):
+                    continue     # absent, or already unbound and already guarded
+                # `open` is the one slot whose module changed between versions.
+                patched = [getattr(os, name, None)]
+                if name == "open":
+                    patched.append(getattr(io, "open", None))
+                if any(current is one for one in patched if one is not None):
+                    setattr(_accessor, name, staticmethod(current))
+                    _rebound += 1
+                else:
+                    _untouched += 1
+            _paths_mechanism = "pathlib:accessor-rebound-%d" % _rebound
+            if _untouched:
+                _paths_mechanism += "+%d-left-alone" % _untouched
+
+    # Written where the parent reads the phase marker, because the parent reports
+    # the layer list and only the child knows which branch above it took. Deriving
+    # it in the parent from `sys.version_info` would be reading the mechanism out
+    # of source rather than recording what ran, which is the failure this whole
+    # label family exists to avoid.
+    try:
+        with _REAL_OPEN(os.path.join(_WORKDIR, _PATHS_NAME), "w") as handle:
+            handle.write(_paths_mechanism)
     except Exception:
         pass
 
@@ -628,9 +789,17 @@ except BaseException:
 # OS-level jail probing
 # --------------------------------------------------------------------------
 
+# Every other dimension of the layer list names the dimension first -- `memory:`,
+# `paths:`, `in-process:` -- and the OS jail slot alone named the *mechanism* when
+# one engaged (`sandbox-exec:no-net`) and the dimension when none did
+# (`os-level:unavailable`). So the one slot a reader most wants to select was the
+# only one that could not be selected by prefix, and the absence of a jail read as a
+# different kind of fact from the presence of one. It is not: both are answers to
+# "which OS jail held", so both are `os-level:`. The mechanism keeps its name after
+# the colon, because "which jail" is the whole content of the answer.
 _MACOS_PROFILES = (
     (
-        "sandbox-exec:no-net+no-write",
+        "os-level:sandbox-exec-no-net+no-write",
         "(version 1)\n"
         "(allow default)\n"
         "(deny network*)\n"
@@ -640,10 +809,15 @@ _MACOS_PROFILES = (
         ' (literal "/dev/stderr") (literal "/dev/dtracehelper"))\n',
     ),
     (
-        "sandbox-exec:no-net",
+        "os-level:sandbox-exec-no-net",
         "(version 1)\n(allow default)\n(deny network*)\n",
     ),
 )
+
+# The one string that says no OS jail held. Named rather than spelled out at the
+# call site so the family is legible in one place.
+OS_LAYER_UNAVAILABLE = "os-level:unavailable"
+OS_LAYER_PREFIX = "os-level:"
 
 _probe_cache = {}
 
@@ -652,21 +826,51 @@ def _candidate_wrappers(workdir):
     """Yield ``(label, argv_prefix)`` OS jails to try, strongest first."""
     system = platform.system()
     if system == "Darwin" and shutil.which("sandbox-exec"):
+        # realpath, and it is load-bearing. seatbelt matches `subpath` against the
+        # kernel's canonical path, and on macOS every temp directory is reached
+        # through a symlink: `tempfile.mkdtemp()` returns
+        # `/var/folders/.../harness-xxxx` while the kernel sees
+        # `/private/var/folders/...`. Handing seatbelt the unresolved spelling
+        # writes a profile whose allow-rule matches nothing, so `(deny
+        # file-write*)` applies to the workdir too and every legal in-workdir
+        # write fails with EPERM -- charged to the Executor as FAIL_RUNTIME,
+        # which is a measurement bug and not a UX wart. Measured: as-given
+        # denied, realpath allowed.
+        real = os.path.realpath(workdir)
         for label, profile in _MACOS_PROFILES:
-            yield label, ["sandbox-exec", "-p", profile.format(workdir=workdir)]
+            yield label, ["sandbox-exec", "-p", profile.format(workdir=real)]
     elif system == "Linux" and shutil.which("unshare"):
-        yield "unshare:net+user", ["unshare", "--map-root-user", "--net"]
-        yield "unshare:net", ["unshare", "--net"]
+        yield "os-level:unshare-net+user", ["unshare", "--map-root-user", "--net"]
+        yield "os-level:unshare-net", ["unshare", "--net"]
 
 
-def _wrapper_works(label, prefix):
-    """Probe a jail once with a trivial script; cache the verdict."""
+_PROBE_NAME = "_harness_jail_probe"
+
+_PROBE_SOURCE = ("open(%r, 'w').write('probe')\n"
+                 "print('probe')\n" % _PROBE_NAME)
+
+
+def _wrapper_works(label, prefix, workdir=None):
+    """Probe a jail once and cache the verdict. It must permit a workdir write.
+
+    The probe used to be `print('probe')`, and a jail that denied every write
+    inside its own working directory passed it. That is the one failure this
+    selection cannot afford to wave through: the jail engages, the label claims
+    it, and the solution's first `open(..., 'w')` raises EPERM -- so a correct
+    Executor answer is recorded as FAIL_RUNTIME and the measured pass rate is
+    depressed by an artefact of the harness. Falling back to a weaker profile is
+    the right answer there, and it is only reachable if the probe asks.
+
+    Cached by label, which stays correct because the only per-workdir part of the
+    profile is now a canonical path under one fixed temp root.
+    """
     if label in _probe_cache:
         return _probe_cache[label]
     ok = False
     try:
         proc = subprocess.run(
-            prefix + [sys.executable, "-I", "-B", "-c", "print('probe')"],
+            prefix + [sys.executable, "-I", "-B", "-c", _PROBE_SOURCE],
+            cwd=workdir,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -675,13 +879,19 @@ def _wrapper_works(label, prefix):
         ok = proc.returncode == 0 and b"probe" in proc.stdout
     except Exception:
         ok = False
+    finally:
+        if workdir:
+            try:
+                os.unlink(os.path.join(workdir, _PROBE_NAME))
+            except OSError:
+                pass
     _probe_cache[label] = ok
     return ok
 
 
 def _select_wrapper(workdir):
     for label, prefix in _candidate_wrappers(workdir):
-        if _wrapper_works(label, prefix):
+        if _wrapper_works(label, prefix, workdir):
             return label, prefix
     return None, []
 
@@ -746,6 +956,15 @@ class ExecResult:
     stdout_bytes: int = 0         # bytes the child *emitted*, not bytes kept
     stderr_bytes: int = 0
     phase: str = ""               # how far the child got; see PHASE_* above
+
+    # Per-check accounting, parsed out of stdout. Descriptive only: nothing here
+    # is allowed to move `ok`, the failure kind or the verdict, all of which are
+    # still decided by exit code and stderr exactly as before these existed.
+    checks_total: int = 0
+    checks_passed: int = 0
+    checks_kinds: List[str] = field(default_factory=list)
+    checks_trusted: bool = False
+    checks_note: str = ""
 
     @property
     def ok(self):
@@ -816,6 +1035,27 @@ def _memory_layer():
     if hasattr(resource, "RLIMIT_DATA"):
         return "memory:rlimit-data-%dmb" % megabytes
     return "memory:unguarded"
+
+
+def _path_layer(os_label):
+    """An honest label for the path dimension: what held, not what was installed.
+
+    `in-process:no-outside-writes` names a mechanism -- the wrappers around
+    `open`, `os.open` and the destructive `os`/`shutil` entry points. It does not
+    say whether anything stood behind them, and the answer differs per machine.
+    The macOS profile's `(deny file-write*)` is kernel-enforced and real;
+    `unshare` isolates the network and the user namespace and denies no write at
+    all; and inside a nested sandbox neither is available. Where the OS layer is
+    absent, the in-process guard is the only thing between a hallucinated
+    `shutil.rmtree("/Users/<someone>")` and the disk -- and it is bypassable on
+    purpose, through ctypes, an entry point the table does not list, or importlib.
+    Part G of the pre-registration calls that accident containment rather than a
+    security boundary, and this label is where a reader finds out whether the
+    containment was standing on its own.
+    """
+    if "no-write" in (os_label or ""):
+        return "paths:in-process-guard+os-write-deny"
+    return "paths:in-process-guard-only"
 
 
 def _pump(stream, chunks, cap, seen, breached):
@@ -942,6 +1182,22 @@ def _read_phase(workdir):
         return ""
 
 
+def _read_paths_mechanism(workdir):
+    """Which pathlib mechanism the child's path guard used, per its marker.
+
+    Only a `pathlib:` label is accepted. A truncated or garbled marker is the same
+    situation as no marker at all -- the dimension went unreported -- and saying so
+    is the point of this label family.
+    """
+    try:
+        with open(os.path.join(workdir, PATHS_NAME), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            said = handle.read().strip()[:60]
+    except Exception:
+        return PATHS_UNREPORTED
+    return said if said.startswith("pathlib:") else PATHS_UNREPORTED
+
+
 def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
     """Run ``source`` in an isolated subprocess and capture what it did.
 
@@ -984,7 +1240,17 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         layers = ["in-process:isolated-interpreter", "in-process:no-network",
                   "in-process:no-subprocess", "in-process:no-outside-writes",
                   "in-process:rlimits", _memory_layer()]
-        layers.append(label if label else "os-level:unavailable")
+        layers.append(label if label else OS_LAYER_UNAVAILABLE)
+        # Appended after the OS label because it is a statement *about* it: the
+        # line above says which OS jail ran, this one says whether the path
+        # guard had it behind them or was standing alone.
+        layers.append(_path_layer(label))
+        # And this one says *how* the path guard reached pathlib, which the child
+        # decides and only the child can report. It starts as unreported and is
+        # replaced once the child has run: a child that never started leaves this
+        # dimension genuinely unanswered, and the label says so rather than naming
+        # a mechanism nothing exercised.
+        layers.append(PATHS_UNREPORTED)
         result.sandbox_layers = layers
 
         argv = list(prefix) + [
@@ -1022,6 +1288,7 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         result.stderr_bytes = seen_err
         # Read before the workdir goes away in the finally block.
         result.phase = _read_phase(workdir)
+        result.sandbox_layers[-1] = _read_paths_mechanism(workdir)
 
         result.ran = True
         result.exit_code = proc.returncode
@@ -1107,9 +1374,78 @@ def _signal_name(number):
 
 _FRAME = re.compile(r'File "([^"]+)", line (\d+)[^\n]*\n[ \t]*([^\n]*)')
 
+_CHECK_RESULT = re.compile(r"^%s (\d+) (pass|fail) (\S+)$" % re.escape(CHECK_TAG))
+_CHECK_DONE = re.compile(r"^%s done (\d+)$" % re.escape(CHECK_TAG))
+
+
+def read_checks(stdout):
+    """How many of a generated suite's checks passed. `(passed, total, kinds, note)`.
+
+    `note` is empty when the report is coherent and says what was wrong when it
+    is not; an incoherent report yields `(0, 0, [], note)` and the caller must
+    treat it as "unknown", never as "zero of N passed".
+
+    The parse is deliberately all-or-nothing, because the suite shares stdout
+    with the code under test. A solution is free to print `CHECK_TAG` lines, so
+    the guarantee cannot be "we ignore fabricated lines" -- we cannot tell which
+    are ours. It is instead that fabrication can only ever *destroy* a report:
+
+      * the suite emits exactly one line per check, with the ids 1..N each
+        appearing exactly once, then exactly one `done N`, and this requires
+        precisely that. A forged line is a duplicate id, an out-of-range id or an
+        extra line, and each of those fails the shape.
+      * a forged *whole* report collides with the real one on `done`, and two
+        `done` lines fail the shape.
+      * the real report is written last, so suppressing it means exiting before
+        it -- which the exit code and the missing report both record.
+
+    So the worst a hostile solution achieves is a rank of "unknown", which is
+    the floor. It cannot manufacture a pass count it did not earn.
+
+    The ids are required as a *set* and not as an ascending sequence. They are
+    emitted in execution order, and `eval/rank_battery.py` reorders a frozen
+    suite's checks on purpose to ask whether the ranking key depends on their
+    order -- so ascending arrival is a property of the unpermuted suite, not of a
+    trustworthy report. Nothing is given up: every id in 1..N is already spoken
+    for by the real report, so an extra line is still a duplicate.
+    """
+    ids, results, done = [], {}, []
+    for line in stdout.splitlines():
+        line = line.strip()
+        match = _CHECK_RESULT.match(line)
+        if match:
+            ids.append(int(match.group(1)))
+            results[int(match.group(1))] = (match.group(2), match.group(3))
+            continue
+        match = _CHECK_DONE.match(line)
+        if match:
+            done.append(int(match.group(1)))
+
+    if not done:
+        # No report at all is the normal case for a hand-written suite, so it is
+        # stated as an absence rather than as a fault. Ids with no terminator is
+        # a different thing: the report started and did not finish.
+        return 0, 0, [], ("report has %d line(s) and no completion marker" % len(ids)
+                          if ids else "no per-check report")
+    if len(done) > 1:
+        return 0, 0, [], "%d completion markers, so at least one is forged" % len(done)
+    total = done[0]
+    if sorted(ids) != list(range(1, total + 1)):
+        # Covers every shape failure at once: duplicates, gaps and extras.
+        return 0, 0, [], ("check ids %s do not match 1..%d exactly"
+                          % (sorted(set(ids))[:8] or "[]", total))
+    passed = sum(1 for index in ids if results[index][0] == "pass")
+    kinds = [results[index][1] for index in sorted(ids)]
+    return passed, total, kinds, ""
+
 
 def _classify(result):
     """Work out *how* it failed, since each mode needs different guidance."""
+    (result.checks_passed, result.checks_total, result.checks_kinds,
+     result.checks_note) = read_checks(result.stdout)
+    # A total of zero is never trustworthy, whatever the note says: there is no
+    # report to trust, and "0 of 0 passed" must not read as a measured floor.
+    result.checks_trusted = bool(result.checks_total) and not result.checks_note
     if result.ok:
         result.failure_kind = FAIL_NONE
         return

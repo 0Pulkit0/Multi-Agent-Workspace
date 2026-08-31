@@ -13,10 +13,15 @@ __pycache__/
 # Machine-local permission settings, not project protocol.
 .claude/settings.local.json
 
-# Run output, not protocol. `runs/` is captured child stdout and `eval/results/`
-# is measurement data. Both are *outputs of* the thing this repository freezes,
-# and committing them alongside the protocol destroys the one property the
-# pre-registration exists to have: that the protocol provably predates the data.
-# Data gets committed deliberately and separately, once it exists.
+# Run output, not protocol. `runs/` is captured child stdout, `eval/results/` is
+# grid measurement data and `eval/calibration/` is the D8 sweep's draws. All three
+# are *outputs of* the thing this repository freezes, and committing them alongside
+# the protocol destroys the one property the pre-registration exists to have: that
+# the protocol provably predates the data. Data gets committed deliberately and
+# separately, once it exists. `eval/calibration/` was missing here while
+# `eval/results/` was listed, though the reasoning is the same for both and the
+# calibration is the sweep that decides whether the grid runs at all.
 runs/
 eval/results/
+eval/calibration/
+memory.json

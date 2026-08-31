@@ -194,10 +194,19 @@ Always on (in-process, before user code imports anything):
 - wall-clock timeout enforced by killing the whole process group
 - per-stream output truncation
 
-Best effort (probed once per machine, silently dropped if the platform refuses):
+Best effort (probed once per machine, strongest rung first, silently dropped if
+the platform refuses every rung). Each rung is a layer label, and the label is
+the answer to "which OS jail actually held":
 
-- macOS: `sandbox-exec` denying `network*` and writes outside the temp dir
-- Linux: `unshare --map-root-user --net`
+- macOS, `os-level:sandbox-exec-no-net+no-write` — denies `network*` and every
+  write outside the temp dir
+- macOS, `os-level:sandbox-exec-no-net` — the fallback when the profile above is
+  refused. It denies the network and **nothing else**: no write is denied at
+  this rung, and the write guard is then the in-process one alone
+- Linux, `os-level:unshare-net+user` — `unshare --map-root-user --net`
+- Linux, `os-level:unshare-net` — `unshare --net`, the fallback where the user
+  namespace is unavailable
+- `os-level:unavailable` — no rung was accepted
 
 The honest limit: the in-process layer is a guard against LLM code that
 casually reaches for the network, not a security boundary against code written
@@ -205,6 +214,24 @@ to escape it. Only the OS layer makes "no network" kernel-enforced, and it is
 unavailable inside an existing sandbox or without the right privileges — when
 the feed says `os-level:unavailable`, that is exactly what happened. Treat
 generated code as untrusted regardless.
+
+Two further labels report on the write guard specifically, because
+`in-process:no-outside-writes` names a mechanism that was *installed* and a
+reader wants to know what stood behind it:
+
+- `paths:in-process-guard+os-write-deny` when the OS rung that held also denied
+  writes, `paths:in-process-guard-only` when the guard stood alone — which is
+  every macOS fallback rung, both Linux rungs, and `os-level:unavailable`
+- `pathlib:accessor-rebound-N`, `pathlib:accessor-rebound-N+M-left-alone`,
+  `pathlib:direct-calls`, `pathlib:unimportable`, or `pathlib:unreported` when
+  the child never got far enough to say — saying how the guard reached
+  `pathlib`. Before 3.11 `pathlib` dispatches through an accessor object holding
+  snapshots of `os.*`, so the guard has to re-wrap those slots or they bind as
+  methods and every legal call is refused; from 3.11 there is no accessor and
+  the patched `os.*` and `io.open` are called directly. The child writes this
+  label and the parent reads it, rather than the parent deriving it from
+  `sys.version_info`, because the point of the whole family is to report what
+  ran.
 
 `RLIMIT_CPU` is deliberately set to the wall-clock timeout **plus
 `CPU_GRACE_SECONDS`**, so the wall-clock kill (which can be explained) normally

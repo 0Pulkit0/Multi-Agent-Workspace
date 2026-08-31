@@ -8,6 +8,7 @@ from agents_core import (
     PROVIDERS,
     ProviderError,
     pipeline_for,
+    redact,
     required_providers,
     run_workspace,
 )
@@ -16,6 +17,29 @@ st.set_page_config(page_title="Multi-Agent Code Workspace", page_icon="🤖")
 st.title("🤖 Multi-Agent Code Workspace")
 st.caption("The verification stage runs the code against an acceptance suite. "
            "APPROVED means the asserts passed, not that nothing crashed.")
+
+# Client-side pacing, on for this process. `agents_core` ships it disabled so an
+# eval sweep -- which paces in its own `RateGovernor` around a replaced
+# `call_model` -- is not charged for the same wait twice. Nothing else paces the
+# interactive app, so the app opts in.
+#
+# Guarded: Streamlit re-executes this script top to bottom on every interaction,
+# and re-installing the pacer would throw away the last-call times, which is
+# precisely the state that prevents a burst.
+if not agents_core.PACER.enabled:
+    agents_core.set_pacing(True)
+
+# The role -> (provider, model) mapping, resolved from configuration rather than
+# read out of source. Re-resolved on every rerun, which is free and idempotent:
+# Streamlit re-executes this script top to bottom, and a config edited while the
+# app is open should take effect on the next interaction rather than needing a
+# restart. Choosing a model is still not done here -- the picker UI is out of
+# scope -- but *reading* the choice is the point of the configuration layer.
+try:
+    RESOLVED_ROLES = agents_core.configure_models()
+    CONFIG_ERROR = ""
+except agents_core.ConfigError as exc:
+    RESOLVED_ROLES, CONFIG_ERROR = [], str(exc)
 
 # ---------------------------------------------------------------- sidebar
 st.sidebar.header("🔑 API Keys")
@@ -43,9 +67,20 @@ st.sidebar.caption(
     "Stages: %s" % " → ".join(pipeline_for(mode))
 )
 st.sidebar.caption(
-    "Models: %s" % " · ".join(
-        "%s=%s" % (name, cfg["model"]) for name, cfg in PROVIDERS.items())
+    "Models (%s): %s" % (
+        agents_core.model_config_source(),
+        " · ".join("%s=%s/%s" % (entry["role"], entry["provider"],
+                                 entry["model"])
+                   for entry in RESOLVED_ROLES))
 )
+if CONFIG_ERROR:
+    st.sidebar.error("Model configuration ignored: %s" % CONFIG_ERROR)
+# Said out loud, at startup, not left for a reader to derive from the table.
+# "Execution grades and the grader never wrote the code" is already only partly
+# true -- the Planner and the Test Writer are one model off one spec lineage --
+# and a configuration that also points the Executor there makes it false.
+for _warning in agents_core.independence_warnings():
+    st.sidebar.warning(_warning)
 st.sidebar.caption(
     "Harness: %ss timeout, no network, no subprocesses, no stdin."
     % harness.EXEC_TIMEOUT_SECONDS
@@ -158,10 +193,13 @@ if should_run:
         status.empty()
     except ProviderError as exc:
         status.empty()
-        feed.error("Provider error: %s" % exc)
+        # Redacted at the write site: the keys are in this process's session
+        # state, and an SDK error can quote the request that carried one.
+        feed.error("Provider error: %s" % redact(exc, stored_keys))
     except Exception as exc:
         status.empty()
-        feed.error("Workspace crashed:\n\n```\n%s: %s\n```" % (type(exc).__name__, exc))
+        feed.error("Workspace crashed:\n\n```\n%s: %s\n```"
+                   % (type(exc).__name__, redact(exc, stored_keys)))
 elif st.session_state.log:
     # Replay a previous run's feed on plain reruns (widget changes, tab clicks).
     for role, content in st.session_state.log:
