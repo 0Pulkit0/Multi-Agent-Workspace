@@ -367,6 +367,46 @@ def planner_calls_since(start):
             if entry.get("role") in REPLAY_ROLES]
 
 
+def rehash_suite(text, claimed):
+    """Rehash ``text`` the way a digest of ``claimed``'s width was written.
+
+    Returns ``None`` when no writer in this repo produces that width, which the
+    caller turns into a refusal.
+
+    Two writers, two widths, both deliberate. `run_eval._suite_hash` records the
+    visible gate suite's *identity* as a 16-hex prefix; `agents_core.sha256_of`
+    records a full 64-hex *integrity* digest, as `eval/gen_tasks.py` does for the
+    task lock -- and that comment says in as many words that the two are different
+    lengths so nobody compares them by accident. Which is exactly what this guard
+    did: it rehashed with `sha256_of` a field every plan record here was written
+    with by `_suite_hash`, so all 19 stored specs failed on a 16-vs-64 length
+    difference while their bytes were intact.
+
+    Selecting the function by the claimed width is not a weaker check than
+    fixing on one. A 16-hex digest still has to be the exact prefix
+    `_suite_hash` would produce for these bytes and for no others, so tampering
+    with the suite still fails. What is deliberately *not* done is accepting a
+    prefix match: that would turn an integrity guard into a length-agnostic
+    "starts with" test, in which a one-character digest validates any suite at
+    all.
+
+    Width 0 -- no digest recorded -- rehashes as a full digest, which reproduces
+    the old guard exactly rather than tightening it under cover of a fix: both
+    writers hash empty text to ``""``, so an empty suite with no digest still
+    validates, and a non-empty suite with no digest still refuses because neither
+    writer returns ``""`` for text. The 17 quota-killed plan records in the first
+    probe's ledger are that shape, and `replayable_plans` drops them before this
+    is ever asked about them.
+    """
+    if not claimed:
+        return agents_core.sha256_of(text)
+    if len(claimed) == 16:
+        return run_eval._suite_hash(text)
+    if len(claimed) == 64:
+        return agents_core.sha256_of(text)
+    return None
+
+
 def replayed_plan_unit(record, source_path):
     """A plan reused verbatim from an earlier ledger. Zero calls, by construction.
 
@@ -379,16 +419,25 @@ def replayed_plan_unit(record, source_path):
 
     So the spec, the suite, its digest, its status and its trust flag are copied
     byte for byte and the digest is re-derived from the copied text before any draw
-    is made. A ledger whose suite and digest disagree cannot be replayed at all:
-    which of the two gated the first probe is exactly the unknown that would make
-    the second one unreadable, so it refuses rather than picking one.
+    is made -- by the width the record claims, see `rehash_suite`. A ledger whose
+    suite and digest disagree cannot be replayed at all: which of the two gated the
+    first probe is exactly the unknown that would make the second one unreadable,
+    so it refuses rather than picking one.
 
     The two union-bearing specs are copied like the rest. They are the reason for
     the sprint: replaying them under the prologue is the measurement.
     """
     tests = record.get("tests") or ""
     claimed = record.get("tests_sha256") or ""
-    rehashed = agents_core.sha256_of(tests)
+    rehashed = rehash_suite(tests, claimed)
+    if rehashed is None:
+        raise SystemExit(
+            "REFUSING TO REPLAY %s: the source ledger's suite does not hash to "
+            "its own tests_sha256\n  recorded %s\n  recorded width %d hex "
+            "character(s), which is neither the 16 run_eval._suite_hash writes "
+            "nor the 64 agents_core.sha256_of writes, so there is no function "
+            "here that could have written it\n  source %s"
+            % (record.get("task_id"), claimed, len(claimed), source_path))
     if rehashed != claimed:
         raise SystemExit(
             "REFUSING TO REPLAY %s: the source ledger's suite does not hash to "

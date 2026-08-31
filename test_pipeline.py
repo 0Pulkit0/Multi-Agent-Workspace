@@ -6149,14 +6149,27 @@ def _replay_source_ledger(pin, task_ids):
     Written through `pin.append` so it is a real ledger and not a fixture shaped
     like one: the replay has to survive `load_ledger`, digest re-derivation and the
     resume key, and a hand-built dict would skip all three.
+
+    The digests are written by the two functions that actually write this field in
+    this repo, one each, alternating by position: `run_eval._suite_hash` at 16 hex
+    for the first id and `agents_core.sha256_of` at 64 for the second. The first is
+    production shape -- every one of the 19 plan records the pin probe has written
+    carries that width -- and the fixture used to write the field with `sha256_of`
+    for both, so it asserted an invariant that was true of itself and false of
+    every real ledger. That is precisely why the suite passed while the replay
+    refused all 19. Locking both widths here is what stops the fixture drifting
+    from the writer again.
     """
+    run_eval = _import_run_eval()
+    hashers = (run_eval._suite_hash, agents_core.sha256_of)
     root = tempfile.mkdtemp(prefix="pin-replay-src-")
     path = pin.ledger_path(root)
-    suites = {}
+    suites, digests = {}, {}
     for index, task_id in enumerate(task_ids):
         tests = ("from solution import f\nassert f(%d) == %d\n"
                  % (index, index))
         suites[task_id] = tests
+        digests[task_id] = hashers[index % len(hashers)](tests)
         pin.append(path, {
             "kind": pin.KIND_PLAN, "task_id": task_id, "candidate": "",
             "at": "2026-08-30T00:00:0%dZ" % index, "ok": True,
@@ -6165,9 +6178,9 @@ def _replay_source_ledger(pin, task_ids):
             "spec": "Write f(x: int | None) -> int | None.",
             "steps": ["write f"], "tests": tests,
             "tests_status": "generated", "tests_trusted": True,
-            "tests_sha256": agents_core.sha256_of(tests),
+            "tests_sha256": digests[task_id],
             "planner_provider": "gemini"})
-    return root, path, suites
+    return root, path, suites, digests
 
 
 def test_replaying_stored_plans_spends_nothing_on_the_planner():
@@ -6184,7 +6197,7 @@ def test_replaying_stored_plans_spends_nothing_on_the_planner():
     pin = _import_pin_executor()
     tasks = pin.locked_tasks()[:3]
     ids = [task.task_id for task in tasks]
-    src_root, src_path, suites = _replay_source_ledger(pin, ids[:2])
+    src_root, src_path, suites, digests = _replay_source_ledger(pin, ids[:2])
     dst = tempfile.mkdtemp(prefix="pin-replay-out-")
     counter, asked = [], []
     restore = _pin_harness(pin, counter)
@@ -6217,12 +6230,14 @@ def test_replaying_stored_plans_spends_nothing_on_the_planner():
               [line for line in text.splitlines() if "skip" in line])
         for task_id in ids[:2]:
             record = plans[task_id]
+            width = len(digests[task_id])
             check("the suite is carried over byte for byte (%s)" % task_id,
                   record["tests"] == suites[task_id], record["tests"])
-            check("its digest is copied intact and still describes the text (%s)"
-                  % task_id,
-                  record["tests_sha256"] == agents_core.sha256_of(suites[task_id])
-                  == record["replayed_tests_sha256"],
+            check("its %d-char digest is copied intact and still describes the "
+                  "text (%s)" % (width, task_id),
+                  record["tests_sha256"] == digests[task_id]
+                  == record["replayed_tests_sha256"]
+                  == pin.rehash_suite(suites[task_id], digests[task_id]),
                   (record["tests_sha256"], record["replayed_tests_sha256"]))
             check("status and trust come across too, so the gate behaves as it "
                   "did (%s)" % task_id,
@@ -6247,6 +6262,10 @@ def test_replaying_stored_plans_spends_nothing_on_the_planner():
                   and draws[task_id]["tests_trusted"] is True
                   for task_id in ids[:2]),
               [(k, v["tests_status"]) for k, v in draws.items()])
+        check("and both digest widths this repo writes were replayed, not just "
+              "the one the fixture happened to use",
+              sorted(len(digests[task_id]) for task_id in ids[:2]) == [16, 64],
+              digests)
 
         # The guard inside `_run`, on the branch `main` normally filters away.
         # Checked directly because "never plan in replay mode" has to hold for
@@ -6290,6 +6309,127 @@ def test_replaying_stored_plans_spends_nothing_on_the_planner():
               (pin.KIND_DRAW, "with", "m"): {"task_id": "with", "ok": True}}))
           == ["with"],
           sorted(pin.replayable_plans({})))
+
+
+def test_the_replay_rehashes_a_suite_by_the_width_its_digest_claims():
+    """The guard refused all 19 real specs on a 16-vs-64 length difference.
+
+    `run_eval._suite_hash` writes this field at 16 hex; the guard rehashed with
+    `agents_core.sha256_of` at 64. Every recorded digest was an exact prefix of
+    its own rehash, so the suites were intact and the replay was unusable -- it
+    failed closed on the first plan record of every ledger production has ever
+    written. The unit checks missed it because the fixture wrote the field with
+    `sha256_of` too, which is now fixed at the fixture and locked at both widths
+    above.
+
+    What is checked here is the selection rule itself, including the two things
+    it must keep refusing. A prefix match is not accepted: it would reduce an
+    integrity guard to "starts with", under which a one-character digest
+    validates any suite. And a width nothing wrote is refused rather than guessed
+    at, because a guess either blesses a digest no writer produced or compares
+    two different hashes and calls the difference tampering.
+    """
+    pin = _import_pin_executor()
+    run_eval = _import_run_eval()
+    tests = "from solution import f\nassert f(1) == 1\n"
+    short, full = run_eval._suite_hash(tests), agents_core.sha256_of(tests)
+    check("the two writers really do disagree on width, which is the whole "
+          "defect and is documented as deliberate in eval/gen_tasks.py",
+          (len(short), len(full)) == (16, 64) and full.startswith(short),
+          (short, full))
+
+    def unit(claimed, text=tests, task_id="width-01"):
+        return pin.replayed_plan_unit(
+            {"kind": pin.KIND_PLAN, "task_id": task_id, "ok": True, "spec": "s",
+             "tests": text, "tests_status": "generated", "tests_trusted": True,
+             "tests_sha256": claimed}, "src.jsonl")
+
+    check("a 16-char digest is rehashed at 16 and replayed, which is the case "
+          "that refused every real record",
+          unit(short)["tests_sha256"] == short, short)
+    check("a 64-char digest is rehashed at 64 and replayed, so fixing the one "
+          "did not break the other",
+          unit(full)["tests_sha256"] == full, full)
+    check("and neither width is silently rewritten on the way through: the "
+          "record carries the digest the source recorded",
+          unit(short)["replayed_tests_sha256"] == short
+          and unit(full)["replayed_tests_sha256"] == full, "")
+
+    for label, claimed in (("16", "0" * 16), ("64", "0" * 64)):
+        try:
+            unit(claimed, task_id="tamper-%s" % label)
+            check("a wrong %s-char digest is still refused, so selecting the "
+                  "hasher by width did not weaken the guard" % label, False,
+                  "no refusal")
+        except SystemExit as exc:
+            check("a wrong %s-char digest is still refused, so selecting the "
+                  "hasher by width did not weaken the guard" % label,
+                  "REFUSING TO REPLAY" in str(exc)
+                  and "tamper-%s" % label in str(exc), str(exc))
+
+    try:
+        unit(short[:8])
+        check("a prefix of the right digest is refused, not accepted -- a "
+              "length-agnostic startswith would let a 1-char digest validate "
+              "anything", False, "no refusal")
+    except SystemExit as exc:
+        check("a prefix of the right digest is refused, not accepted -- a "
+              "length-agnostic startswith would let a 1-char digest validate "
+              "anything", "REFUSING TO REPLAY" in str(exc), str(exc))
+
+    try:
+        unit("0" * 32, task_id="odd-width")
+        check("a width no writer here produces is refused, and the message "
+              "names the width and both widths that exist", False, "no refusal")
+    except SystemExit as exc:
+        check("a width no writer here produces is refused, and the message "
+              "names the width and both widths that exist",
+              "odd-width" in str(exc) and "32 hex character(s)" in str(exc)
+              and "_suite_hash" in str(exc) and "sha256_of" in str(exc),
+              str(exc))
+
+    check("an empty suite with no digest still validates, exactly as it did "
+          "before the width fix",
+          unit("", text="")["tests_sha256"] == "", "")
+    try:
+        unit("", task_id="no-digest")
+        check("but a real suite with no digest is still refused, so preserving "
+              "that case did not open a hole", False, "no refusal")
+    except SystemExit as exc:
+        check("but a real suite with no digest is still refused, so preserving "
+              "that case did not open a hole",
+              "no-digest" in str(exc) and "REFUSING TO REPLAY" in str(exc),
+              str(exc))
+    check("rehash_suite reports the unknown width as None rather than raising, "
+          "so the refusal can name the task and the source file",
+          pin.rehash_suite(tests, "0" * 32) is None
+          and pin.rehash_suite(tests, short) == short
+          and pin.rehash_suite(tests, full) == full, "")
+
+    # The check that would have caught this: the guard has to accept the ledger
+    # production actually wrote, not one a fixture wrote to match it.
+    live = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval",
+                        "results", "pin-executor", "ledger.jsonl")
+    if not os.path.exists(live):
+        check("the first probe's ledger is not on this checkout, so the "
+              "synthetic widths above are the whole check", True)
+        return
+    units, _malformed = pin.load_ledger(live)
+    lendable = pin.replayable_plans(units)
+    replayed = [pin.replayed_plan_unit(record, live)
+                for record in lendable.values()]
+    check("every plan record the first probe stored is now replayable, read "
+          "only and without a single refusal",
+          len(replayed) == 19
+          and all(unit["ok"] and unit["tests"] for unit in replayed),
+          (len(lendable), len(replayed)))
+    check("and all 19 of them carry the 16-char width the guard used to reject",
+          sorted(set(len(unit["tests_sha256"]) for unit in replayed)) == [16],
+          sorted(set(len(unit["tests_sha256"]) for unit in replayed)))
+    check("the 17 quota-killed plan records are still filtered out before the "
+          "guard ever sees their empty digests",
+          len([key for key in units if key[0] == pin.KIND_PLAN]) == 36,
+          len([key for key in units if key[0] == pin.KIND_PLAN]))
 
 
 def main():
@@ -6408,6 +6548,7 @@ def main():
         test_the_probe_refuses_a_dead_candidate_before_it_generates,
         test_a_preflight_validates_the_parameters_the_role_will_actually_send,
         test_replaying_stored_plans_spends_nothing_on_the_planner,
+        test_the_replay_rehashes_a_suite_by_the_width_its_digest_claims,
     ):
         print("\n-- %s" % fn.__name__)
         try:

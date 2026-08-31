@@ -782,13 +782,20 @@ def main(argv=None):
 def cli(argv=None):
     """`main`, plus the one failure that is not a per-cell outcome.
 
-    A per-day quota is a fact about the day. `run_one` re-raises it rather than
-    scoring it as `infra_loss`, so it arrives here, and here it is a message and
-    an exit code instead of a traceback. Every cell that completed is already
-    written to disk by `save_record`, so a re-run after the window resets resumes
-    from them; the summary is deliberately not written, because the sweep did not
-    finish and a summary over a truncated grid is the thing nobody should find
-    later and mistake for a result.
+    A per-day quota is a fact about the day, not about a cell. Neither leg of a
+    sweep converts it into one: `calibration_plan` makes its Planner call with no
+    handler at all, and `one_draw` catches `agents_core.ProviderError` only --
+    which `DailyQuotaExhausted` is deliberately not a subclass of -- so it is
+    never scored as `OUTCOME_INFRA_LOSS` and never lands in a draw file. It
+    arrives here instead, where it is a message and an exit code rather than a
+    traceback.
+
+    Every cell that completed is already on disk, written per plan and per draw by
+    `run_eval.save_record`, and resume is the `os.path.exists` check on
+    `plan_path` and `draw_path`, so a re-run of the same command after the window
+    resets picks up from them. The manifest is deliberately not written, because
+    it is written after the loop and a summary over a truncated grid is the thing
+    nobody should find later and mistake for a result.
     """
     try:
         return main(argv)
