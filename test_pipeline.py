@@ -8053,7 +8053,7 @@ def test_an_interrupted_record_is_not_a_completed_draw():
 #
 # `guard_writes.py` is an external wrapper, so nothing in this suite depends on
 # it and a guard that stopped working could not fail a check by going missing.
-# What it can do is print "0 writes attempted into eval/calibration/ or
+# What it can do is print "0 nameable writes attempted into eval/calibration/ or
 # eval/results/" because it never patched anything -- the identical line a
 # working guard prints. Its `--self-test` exists to separate those two cases, and
 # the separation is what is worth pinning here, because a self-test that cannot

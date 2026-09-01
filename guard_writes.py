@@ -25,6 +25,20 @@ allow-list that drifts out of date -- so writes outside the two roots are
 counted and their distinct prefixes printed instead of silently permitted. An
 unexpected write target is then visible without one line per write in a
 960-check run.
+
+One class of write cannot be adjudicated at all: a *relative* path resolved
+against an open directory fd, as in `shutil.rmtree`'s internal
+`os.unlink(entry.name, dir_fd=topfd)`. Naming it would need `F_GETPATH` on macOS
+or `/proc/self/fd` on Linux, which is out of scope for a stdlib
+accident-containment guard, and guessing it -- joining the name to the process
+cwd, as an earlier version did -- is wrong in both directions: it reported
+temp-dir teardown as a repo-root write, and it would have let a write aimed at a
+denied root through by resolving it somewhere harmless. So the guard abstains and
+says so: those writes are counted on their own line beside the zero, neither
+refused nor cleared. An absolute path is still refused even when a `dir_fd` is
+present, because POSIX ignores the fd in that case. The dangerous shapes are
+unaffected -- `shutil.rmtree("eval/results")` and every `open`/`os.open` with a
+spelled-out target are named, so they still refuse.
 """
 import argparse
 import builtins
@@ -58,9 +72,19 @@ def _resolve(path):
     """`path` as an absolute real path, or None if it is not a path at all.
 
     Symlinks are resolved because the question is which store the bytes land in,
-    not how the caller spelled it. File descriptors (`os.open` results passed to
-    a `dir_fd=`-style call) and non-path objects resolve to None and are neither
-    denied nor counted -- the guard reports what it can name.
+    not how the caller spelled it. A file descriptor passed *as the path* and any
+    non-path object resolve to None and are neither denied nor counted -- the
+    guard reports what it can name.
+
+    What this cannot do alone is resolve a *relative* path that the caller means
+    against an open directory, because `abspath` joins it to the process cwd
+    instead. That is not hypothetical: `shutil.rmtree` walks with
+    `os.unlink(entry.name, dir_fd=topfd)`, so arg 0 is a bare filename and the
+    path tested here is unrelated to the directory being emptied. It mislabels a
+    temp-dir teardown as a repo-root write in one direction and, in the other,
+    would let an fd-relative write into a denied root resolve outside it and be
+    permitted. `_fd_relative` is how the caller declares that case so the guard
+    can abstain rather than guess; see `Ledger.check`.
     """
     if isinstance(path, int) or isinstance(path, bool):
         return None
@@ -76,6 +100,28 @@ def _resolve(path):
         return os.path.realpath(os.path.abspath(value))
     except (TypeError, ValueError, OSError):
         return None
+
+
+def _fd_relative(path, kwargs, fd_keyword):
+    """True when `path` is resolved against a directory fd and cannot be named.
+
+    Two conditions, both required. The call has to supply a non-None directory
+    fd, and the path has to be relative -- POSIX says an absolute path ignores
+    `dir_fd` entirely, so an absolute one is still nameable and must still be
+    denied. Only `kwargs` is inspected because every `dir_fd`-style parameter in
+    `os` is keyword-only, so there is no positional index to guess at.
+    """
+    if fd_keyword is None or kwargs.get(fd_keyword) is None:
+        return False
+    if isinstance(path, int) or isinstance(path, bool):
+        return False               # the path is itself an fd; `_resolve` has it
+    try:
+        value = os.fspath(path)
+    except TypeError:
+        return False
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return isinstance(value, str) and not os.path.isabs(value)
 
 
 def denied_root(path):
@@ -116,11 +162,13 @@ class Refused(Exception):
 
 
 class Ledger(object):
-    """What the guard saw. Refusals are listed; permitted writes are bucketed."""
+    """What the guard saw: refusals listed, permitted writes bucketed, and the
+    writes whose target no spelling could name counted apart from both."""
 
     def __init__(self):
         self.refused = []
         self.allowed = collections.Counter()
+        self.abstained = 0
 
     def refuse(self, entry_point, path):
         root = denied_root(path)
@@ -131,46 +179,67 @@ class Ledger(object):
     def allow(self, path):
         self.allowed[_bucket(path)] += 1
 
-    def check(self, entry_point, path):
-        """Refuse `path` if it is inside a denied root, otherwise count it."""
+    def check(self, entry_point, path, fd_based=False):
+        """Refuse `path` if it is inside a denied root, otherwise count it.
+
+        `fd_based` is the caller declaring that `path` is resolved against a
+        directory fd, so no spelling of it names a store. The guard then abstains
+        outright: it does not refuse, because the target may be outside every
+        denied root, and it does not bucket the write as permitted-and-elsewhere,
+        because the target may be inside one. Abstentions are counted and printed
+        beside the zero -- a zero reached by not looking is a different claim from
+        a zero reached by looking, and the report has to be able to say which.
+        """
+        if fd_based:
+            self.abstained += 1
+            return
         if denied_root(path) is not None:
             self.refuse(entry_point, path)
         self.allow(path)
 
     def take(self):
-        """Read and clear, so the self-test's own refusals are not the suite's."""
-        refused, allowed = self.refused, self.allowed
-        self.refused, self.allowed = [], collections.Counter()
-        return refused, allowed
+        """Read and clear, so the self-test's own records are not the suite's."""
+        taken = (self.refused, self.allowed, self.abstained)
+        self.refused, self.allowed, self.abstained = [], collections.Counter(), 0
+        return taken
 
 
 # Write *targets* by argument position, with the keyword spelling that reaches the
-# same argument. Sources are deliberately absent: `eval/results/` is read-only,
-# not read-denied, so `shutil.copyfile(eval/results/x, /tmp/y)` must succeed --
-# only index 1 of a copy is a write. `os.replace`/`os.rename` and `shutil.move`
-# name both, because they unlink the source as well as creating the destination.
+# same argument and the `dir_fd`-style keyword, if any, that argument is resolved
+# against. Sources are deliberately absent: `eval/results/` is read-only, not
+# read-denied, so `shutil.copyfile(eval/results/x, /tmp/y)` must succeed -- only
+# index 1 of a copy is a write. `os.replace`/`os.rename` and `shutil.move` name
+# both, because they unlink the source as well as creating the destination.
+#
+# The third slot is None wherever the function has no such parameter, so a
+# `dir_fd=` that cannot exist is never inferred: `os.makedirs`, `os.truncate`,
+# `os.renames` and every `shutil` entry point take no directory fd in 3.9.
+# `os.symlink`'s single `dir_fd` resolves the link it creates, which is index 1,
+# the argument guarded here.
 _TARGETS = (
-    ("os.mkdir", os, "mkdir", ((0, "path"),)),
-    ("os.makedirs", os, "makedirs", ((0, "name"),)),
-    ("os.remove", os, "remove", ((0, "path"),)),
-    ("os.unlink", os, "unlink", ((0, "path"),)),
-    ("os.rmdir", os, "rmdir", ((0, "path"),)),
-    ("os.truncate", os, "truncate", ((0, "path"),)),
-    ("os.replace", os, "replace", ((0, "src"), (1, "dst"))),
-    ("os.rename", os, "rename", ((0, "src"), (1, "dst"))),
-    ("os.renames", os, "renames", ((0, "old"), (1, "new"))),
-    ("os.symlink", os, "symlink", ((1, "dst"),)),
-    ("os.link", os, "link", ((1, "dst"),)),
-    ("os.chmod", os, "chmod", ((0, "path"),)),
-    ("shutil.rmtree", shutil, "rmtree", ((0, "path"),)),
-    ("shutil.move", shutil, "move", ((0, "src"), (1, "dst"))),
-    ("shutil.copyfile", shutil, "copyfile", ((1, "dst"),)),
-    ("shutil.copy", shutil, "copy", ((1, "dst"),)),
-    ("shutil.copy2", shutil, "copy2", ((1, "dst"),)),
-    ("shutil.copytree", shutil, "copytree", ((1, "dst"),)),
-    ("shutil.copymode", shutil, "copymode", ((1, "dst"),)),
-    ("shutil.copystat", shutil, "copystat", ((1, "dst"),)),
-    ("shutil.make_archive", shutil, "make_archive", ((0, "base_name"),)),
+    ("os.mkdir", os, "mkdir", ((0, "path", "dir_fd"),)),
+    ("os.makedirs", os, "makedirs", ((0, "name", None),)),
+    ("os.remove", os, "remove", ((0, "path", "dir_fd"),)),
+    ("os.unlink", os, "unlink", ((0, "path", "dir_fd"),)),
+    ("os.rmdir", os, "rmdir", ((0, "path", "dir_fd"),)),
+    ("os.truncate", os, "truncate", ((0, "path", None),)),
+    ("os.replace", os, "replace", ((0, "src", "src_dir_fd"),
+                                   (1, "dst", "dst_dir_fd"))),
+    ("os.rename", os, "rename", ((0, "src", "src_dir_fd"),
+                                 (1, "dst", "dst_dir_fd"))),
+    ("os.renames", os, "renames", ((0, "old", None), (1, "new", None))),
+    ("os.symlink", os, "symlink", ((1, "dst", "dir_fd"),)),
+    ("os.link", os, "link", ((1, "dst", "dst_dir_fd"),)),
+    ("os.chmod", os, "chmod", ((0, "path", "dir_fd"),)),
+    ("shutil.rmtree", shutil, "rmtree", ((0, "path", None),)),
+    ("shutil.move", shutil, "move", ((0, "src", None), (1, "dst", None))),
+    ("shutil.copyfile", shutil, "copyfile", ((1, "dst", None),)),
+    ("shutil.copy", shutil, "copy", ((1, "dst", None),)),
+    ("shutil.copy2", shutil, "copy2", ((1, "dst", None),)),
+    ("shutil.copytree", shutil, "copytree", ((1, "dst", None),)),
+    ("shutil.copymode", shutil, "copymode", ((1, "dst", None),)),
+    ("shutil.copystat", shutil, "copystat", ((1, "dst", None),)),
+    ("shutil.make_archive", shutil, "make_archive", ((0, "base_name", None),)),
 )
 
 _WRITE_FLAGS = (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
@@ -178,14 +247,30 @@ _WRITE_FLAGS = (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
 
 def _wrap_positional(ledger, label, original, targets):
     def guarded(*args, **kwargs):
-        for index, keyword in targets:
+        for index, keyword, fd_keyword in targets:
             if len(args) > index:
-                ledger.check(label, args[index])
+                target = args[index]
             elif keyword in kwargs:
-                ledger.check(label, kwargs[keyword])
+                target = kwargs[keyword]
+            else:
+                continue
+            ledger.check(label, target,
+                         _fd_relative(target, kwargs, fd_keyword))
         return original(*args, **kwargs)
     guarded.__name__ = "guarded_" + label.replace(".", "_")
+    guarded.__wrapped__ = original       # `_unwrap`: the patch stays inspectable
     return guarded
+
+
+def _unwrap(function):
+    """The unpatched function behind `function`, or `function` itself.
+
+    `os.supports_dir_fd` is a set of the *original* function objects, so a
+    membership test against a patched `os.unlink` is always false and would make
+    every abstention probe skip itself -- silently, and only while the guard is
+    working.
+    """
+    return getattr(function, "__wrapped__", function)
 
 
 def install(ledger):
@@ -201,6 +286,10 @@ def install(ledger):
     real_open = builtins.open
 
     def guarded_open(file, mode="r", *args, **kwargs):
+        # No `dir_fd` to declare: `builtins.open` has no such parameter. A caller
+        # can still reach one through `opener=`, and then the inner `os.open` is
+        # the guarded call that sees the fd and abstains -- so that route is
+        # recorded at the layer that can actually name the condition.
         if isinstance(mode, str) and any(ch in mode for ch in "wxa+"):
             ledger.check("open(mode=%r)" % mode, file)
         return real_open(file, mode, *args, **kwargs)
@@ -209,7 +298,8 @@ def install(ledger):
 
     def guarded_os_open(path, flags, *args, **kwargs):
         if flags & _WRITE_FLAGS:
-            ledger.check("os.open", path)
+            ledger.check("os.open", path,
+                         _fd_relative(path, kwargs, "dir_fd"))
         return real_os_open(path, flags, *args, **kwargs)
 
     builtins.open = guarded_open
@@ -249,6 +339,81 @@ def _discard(handle, target):
             continue
 
 
+def _abstention_probe(ledger):
+    """Prove the guard abstains on an fd-relative path, and only on that.
+
+    Returns `(ok, lines)`. Two claims, because the fix turns on the difference
+    between them. A *relative* name against a directory fd must be counted as
+    unnameable and let through -- the guard cannot say which store it lands in,
+    and inventing an answer is how `shutil.rmtree`'s internal
+    `os.unlink(name, dir_fd=topfd)` came to be reported as a repo-root write. An
+    *absolute* name must still be refused even with the same fd present, because
+    POSIX says `dir_fd` is ignored outright in that case, so the path still names
+    a store and abstaining there would open the hole the other way.
+
+    Nothing is created and nothing is deleted: both spellings target a name that
+    does not exist, so the permitted branch reaches `unlinkat` and fails with
+    `FileNotFoundError` -- which is also the evidence that the guard passed the
+    call through rather than silently absorbing it.
+    """
+    root = os.path.join(REPO, DENIED[0])
+    if not os.path.isdir(root) or _unwrap(os.unlink) not in os.supports_dir_fd:
+        return True, ["  skip  %-19s no unlinkat here, or %s/ absent: nothing to "
+                      "abstain from" % ("dir_fd abstains", DENIED[0])]
+
+    fd = os.open(root, os.O_RDONLY)      # a read: no write flag, so not checked
+    lines = []
+    ok = True
+    try:
+        before_abstained = ledger.abstained
+        before_refused = len(ledger.refused)
+        reached = refused = False
+        try:
+            os.unlink(_PROBE, dir_fd=fd)
+        except Refused:
+            refused = True
+        except FileNotFoundError:
+            reached = True
+        except OSError:
+            pass
+        abstained = ledger.abstained - before_abstained
+        if reached and abstained == 1 and not refused:
+            lines.append("  ok    %-19s relative name + dir_fd counted unnameable, "
+                         "not guessed at" % "dir_fd abstains")
+        else:
+            ok = False
+            lines.append("  FAIL  %-19s reached_real_call=%s abstained=%d "
+                         "refused=%s" % ("dir_fd abstains", reached, abstained,
+                                         refused))
+
+        absolute = os.path.join(root, _PROBE)
+        before_abstained = ledger.abstained
+        blocked = False
+        try:
+            os.unlink(absolute, dir_fd=fd)
+        except Refused:
+            blocked = True
+        except OSError:
+            pass
+        recorded = len(ledger.refused) - before_refused
+        if blocked and recorded == 1 and ledger.abstained == before_abstained:
+            lines.append("  ok    %-19s absolute name ignores dir_fd, so it is "
+                         "still refused" % "dir_fd is not cover")
+        else:
+            ok = False
+            lines.append("  FAIL  %-19s refused=%s recorded=%d abstained=%d"
+                         % ("dir_fd is not cover", blocked, recorded,
+                            ledger.abstained - before_abstained))
+
+        if os.path.exists(absolute):
+            ok = False
+            lines.append("  FAIL  %-19s left %s on disk"
+                         % ("dir_fd probe", os.path.relpath(absolute, REPO)))
+    finally:
+        os.close(fd)
+    return ok, lines
+
+
 def self_test(ledger):
     """Drive one real write through each entry point into a denied root.
 
@@ -256,6 +421,10 @@ def self_test(ledger):
     `Refused`, add exactly one line to the ledger, and leave nothing on disk.
     Blocked-but-unrecorded is a failure too -- a guard whose report is empty
     because it never wrote the report down is the case this exists to catch.
+
+    `_abstention_probe` runs last and is counted separately: it is not an
+    interception, so folding it into the "N of M intercepted" tally would inflate
+    that number with a probe that proves the guard declined to answer.
     """
     scratch = tempfile.mkdtemp(prefix="guard-self-test-")
     source = os.path.join(scratch, "source")
@@ -306,11 +475,15 @@ def self_test(ledger):
             lines.append("  FAIL  %-19s refused=%s recorded=%d left_on_disk=%s  %s"
                          % (label, blocked, recorded, leaked, shown))
 
+    intercepted = sum(1 for line in lines if line.startswith("  ok"))
+    abstains_ok, abstain_lines = _abstention_probe(ledger)
+    if not abstains_ok:
+        passed = False
+
     shutil.rmtree(scratch, ignore_errors=True)
     head = ("GUARD: self-test %s -- %d of %d write entry points intercepted"
-            % ("PASSED" if passed else "FAILED",
-               sum(1 for line in lines if line.startswith("  ok")), len(probes)))
-    return passed, [head] + lines
+            % ("PASSED" if passed else "FAILED", intercepted, len(probes)))
+    return passed, [head] + lines + abstain_lines
 
 
 def _module_name(target):
@@ -318,7 +491,7 @@ def _module_name(target):
     return name[:-3] if name.endswith(".py") else name
 
 
-def report(refused, allowed):
+def report(refused, allowed, abstained=0):
     roots = " or ".join(name + "/" for name in DENIED)
     lines = []
     if refused:
@@ -326,12 +499,20 @@ def report(refused, allowed):
         for entry_point, root, path in refused:
             lines.append("  %-24s %s" % (entry_point, path))
     else:
-        lines.append("GUARD: 0 writes attempted into %s" % roots)
+        lines.append("GUARD: 0 nameable writes attempted into %s" % roots)
     lines.append("GUARD: %d write(s) elsewhere, permitted and counted, "
                  "across %d distinct prefix(es):"
                  % (sum(allowed.values()), len(allowed)))
     for prefix, count in sorted(allowed.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append("  %7d  %s" % (count, prefix))
+    # Printed beside the zero rather than folded into it. These are writes whose
+    # target is resolved against an open directory fd, so the guard cannot name
+    # the store they land in and declines to claim either way. The line has to
+    # appear even when the count is 0, or its absence would be read as the
+    # stronger claim.
+    lines.append("GUARD: %d write(s) with a target the guard could not name "
+                 "(relative path + dir_fd): neither refused nor cleared."
+                 % abstained)
     return lines
 
 
@@ -388,9 +569,9 @@ def main(argv=None):
     finally:
         restore()
 
-    refused, allowed = ledger.take()
+    refused, allowed, abstained = ledger.take()
     print("")
-    for line in report(refused, allowed):
+    for line in report(refused, allowed, abstained):
         print(line)
     if failure is not None:
         print("GUARD: the suite raised %s: %s"

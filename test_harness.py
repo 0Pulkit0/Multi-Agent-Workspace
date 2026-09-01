@@ -299,10 +299,39 @@ def test_no_code_path():
 
 
 def test_workdir_cleanup():
-    import glob
+    """Cleanup of the workdirs *this call* made, not of every `harness-*` in tmp.
+
+    A scope narrowing. The assertion is unchanged -- a graded run leaves no
+    workdir behind, driven by a real `verify_output` -- but it no longer globs
+    `<tmp>/harness-*` process-wide, which counted any other harness user in
+    flight (the other suite, or a live calibration sweep) as this test's
+    leftover and produced a spurious failure. `ExecResult` does not carry the
+    workdir and `harness.py` is not editable here, so recording what
+    `tempfile.mkdtemp` handed out is how the test learns which directories are
+    its own. The non-vacuity check is what keeps the narrowing honest: a wrapper
+    that recorded nothing would leave `leftovers` empty for the wrong reason,
+    which is the same failure mode the write guard's self-test exists to catch.
+    """
     import tempfile
-    harness.verify_output("```python\nopen('scratch.txt','w').write('x')\nprint('ok')\n```")
-    leftovers = glob.glob(tempfile.gettempdir() + "/harness-*")
+    made = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        made.append(path)
+        return path
+
+    tempfile.mkdtemp = recording_mkdtemp
+    try:
+        harness.verify_output(
+            "```python\nopen('scratch.txt','w').write('x')\nprint('ok')\n```")
+    finally:
+        tempfile.mkdtemp = real_mkdtemp
+
+    mine = [p for p in made if os.path.basename(p).startswith("harness-")]
+    check("this call really did create a harness workdir, so the cleanup check "
+          "is not vacuous", mine, made[:3])
+    leftovers = [p for p in mine if os.path.exists(p)]
     check("temp workdirs are cleaned up", not leftovers, leftovers[:3])
 
 
