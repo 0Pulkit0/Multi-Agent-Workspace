@@ -1,0 +1,28 @@
+{
+  "attempted": 1,
+  "attempts": [
+    {
+      "at": "2026-08-31T19:43:58",
+      "attempt": 1,
+      "detail": "Error code: 404 - [{'error': {'code': 404, 'message': 'This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.', 'status': 'NOT_FOUND'}}]",
+      "ok": false,
+      "quota_id": "",
+      "quota_value": null,
+      "status": 404,
+      "verdict": "SLUG_UNAVAILABLE"
+    }
+  ],
+  "finished": "2026-08-31T19:43:58",
+  "gap_seconds": 5.0,
+  "key_shape": {
+    "aiza_prefix": false,
+    "interior_whitespace": false,
+    "length": 53
+  },
+  "model": "gemini-2.0-flash",
+  "provider": "gemini",
+  "requested": 21,
+  "started": "2026-08-31T19:43:57",
+  "succeeded": 0,
+  "verdict": "SLUG_UNAVAILABLE"
+}

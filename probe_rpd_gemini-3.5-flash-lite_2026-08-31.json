@@ -1,0 +1,144 @@
+{
+  "attempted": 21,
+  "attempts": [
+    {
+      "at": "2026-08-31T19:48:55",
+      "attempt": 1,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:01",
+      "attempt": 2,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:07",
+      "attempt": 3,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:13",
+      "attempt": 4,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:18",
+      "attempt": 5,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:24",
+      "attempt": 6,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:30",
+      "attempt": 7,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:36",
+      "attempt": 8,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:42",
+      "attempt": 9,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:48",
+      "attempt": 10,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:49:54",
+      "attempt": 11,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:00",
+      "attempt": 12,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:06",
+      "attempt": 13,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:12",
+      "attempt": 14,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:18",
+      "attempt": 15,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:24",
+      "attempt": 16,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:31",
+      "attempt": 17,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:36",
+      "attempt": 18,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:42",
+      "attempt": 19,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:48",
+      "attempt": 20,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:50:54",
+      "attempt": 21,
+      "ok": true,
+      "status": null
+    }
+  ],
+  "finished": "2026-08-31T19:50:54",
+  "gap_seconds": 5.0,
+  "key_shape": {
+    "aiza_prefix": false,
+    "interior_whitespace": false,
+    "length": 53
+  },
+  "model": "gemini-3.5-flash-lite",
+  "provider": "gemini",
+  "requested": 21,
+  "started": "2026-08-31T19:48:53",
+  "succeeded": 21,
+  "verdict": "CAP_ABOVE_PROBE"
+}

@@ -1,0 +1,142 @@
+{
+  "attempted": 20,
+  "attempts": [
+    {
+      "at": "2026-08-31T19:53:06",
+      "attempt": 1,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:53:19",
+      "attempt": 2,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:53:31",
+      "attempt": 3,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:53:43",
+      "attempt": 4,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:53:56",
+      "attempt": 5,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:54:09",
+      "attempt": 6,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:54:21",
+      "attempt": 7,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:54:48",
+      "attempt": 8,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:55:02",
+      "attempt": 9,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:55:14",
+      "attempt": 10,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:55:26",
+      "attempt": 11,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:55:39",
+      "attempt": 12,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:55:52",
+      "attempt": 13,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:56:06",
+      "attempt": 14,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:56:20",
+      "attempt": 15,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:56:33",
+      "attempt": 16,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:56:46",
+      "attempt": 17,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:56:58",
+      "attempt": 18,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:57:11",
+      "attempt": 19,
+      "ok": true,
+      "status": null
+    },
+    {
+      "at": "2026-08-31T19:57:19",
+      "attempt": 20,
+      "detail": "Error code: 429 - [{'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.5-flash\\nPlease retry in 40.879283985s.', 'status': 'RESOURCE_EXHAUSTED', 'details': [{'@type': 'type.googleapis.com/google.rpc.Help', 'links': [{'description': 'Learn more about Gemini API quotas', 'url': 'https://ai.google.dev/gemini-api/docs/rate-limits'}]}, {'@type': 'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [{'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_requests', 'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', 'quotaDimensions': {'location': 'global', 'model': 'gemini-3.5-flash'}, 'quotaValue': '20'}]}, {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '40s'}]}}]",
+      "ok": false,
+      "quota_id": "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+      "quota_value": 20,
+      "status": 429,
+      "verdict": "PER_DAY_CAP_HIT"
+    }
+  ],
+  "finished": "2026-08-31T19:57:19",
+  "gap_seconds": 5.0,
+  "key_shape": {
+    "aiza_prefix": false,
+    "interior_whitespace": false,
+    "length": 53
+  },
+  "model": "gemini-3.5-flash",
+  "provider": "gemini",
+  "requested": 21,
+  "started": "2026-08-31T19:52:57",
+  "succeeded": 19,
+  "verdict": "PER_DAY_CAP_HIT"
+}
