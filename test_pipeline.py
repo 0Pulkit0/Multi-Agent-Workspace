@@ -7850,6 +7850,89 @@ def test_the_import_refuses_everything_it_cannot_establish():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_the_import_verifies_the_lock_before_it_opens_the_ledger():
+    """The guard is at `main`'s `:328`, and the ordering is the fragile half.
+
+    `eval/import_pin_plans.py:328` calls `pin_executor.locked_tasks()`, which
+    regenerates the task set and refuses through `verify_lock_or_reason`; the
+    ledger is not touched until `convert` reads it at `:237`. That is the ordering
+    the module docstring claims at `:31`, and addendum J corrects addendum I's
+    account of it: the guard was recorded as absent by a pass that grepped for
+    `verify_lock` and `load_lock`, neither of which `locked_tasks()` spells.
+
+    What can break is the order, not the refusal. A refusal that fired after the
+    ledger had been opened would still refuse, so a check on the refusal alone
+    would notice nothing if `locked_tasks()` were moved below `convert()` or
+    swapped for a bare `gen_tasks.generate()` -- the only way this guard
+    realistically dies. So what is asserted is that `load_ledger` was never
+    called. Deliberately not asserted: the message text, which belongs to
+    `pin_executor`, and which of the two non-zero shapes the refusal takes, since
+    `locked_tasks` raises `SystemExit` and `main`'s own refusals return 2.
+    """
+    imp = _import_import_pin_plans()
+    pin = _import_pin_executor()
+    gen_tasks = _import_gen_tasks()
+    tasks = gen_tasks.generate(limit=2)
+    src_root, ledger = _import_source_ledger(
+        pin, [task.task_id for task in tasks])
+    out = tempfile.mkdtemp(prefix="import-order-")
+    store = os.path.join(out, "store")
+    reads = []
+    real_load_ledger = pin.load_ledger
+
+    def watched(path):
+        reads.append(path)
+        return real_load_ledger(path)
+
+    def run(lock_path):
+        """`(status, whether the ledger was read)`, either refusal shape."""
+        del reads[:]
+        thunk = lambda: imp.main(["--ledger", ledger, "--out", store,
+                                  "--dry-run"])
+        try:
+            status = _lock_scoped(lock_path,
+                                  lambda: _capture_streams(thunk))[0]
+        except SystemExit as exit_error:
+            status = exit_error.code
+        return status, bool(reads)
+
+    # The two ways a lock can lie: one internally consistent and no longer
+    # reproducible from the generator, one edited by hand so its body digest is
+    # stale. Neither may reach the ledger.
+    drifted = copy.deepcopy(gen_tasks.load_lock())
+    drifted["tasks"][0]["tests_sha256"] = "3" * 64
+    drifted["body_sha256"] = gen_tasks.body_digest(drifted)
+    hand_edited = copy.deepcopy(gen_tasks.load_lock())
+    hand_edited["tasks"][0]["tests_sha256"] = "4" * 64   # body_sha256 left stale
+    try:
+        pin.load_ledger = watched
+        for name, lock, lie in (("drifted", drifted,
+                                 "that the generator no longer reproduces"),
+                                ("hand-edited", hand_edited,
+                                 "that was edited by hand, body_sha256 left "
+                                 "stale")):
+            path = os.path.join(out, "%s.lock" % name)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(lock, handle)
+            status, was_read = run(path)
+            check("an import against a lock %s is refused, by whichever of the "
+                  "two non-zero shapes" % lie, status not in (0, None),
+                  str(status)[:90])
+            check("and the %s lock is refused before the ledger is opened, which "
+                  "is the ordering `import_pin_plans` claims at `:31` and the "
+                  "only part of it a later edit can break silently" % name,
+                  not was_read and not os.path.exists(store), reads[:1])
+        status, was_read = run(gen_tasks.LOCK_PATH)
+        check("the control: against the real lock the same call proceeds and "
+              "does read the ledger, so the two refusals above are the lock's "
+              "and not the fixture's",
+              status == 0 and was_read, (str(status)[:60], was_read))
+    finally:
+        pin.load_ledger = real_load_ledger
+        shutil.rmtree(src_root, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # a record is written whole or not at all
 #
@@ -8100,6 +8183,9 @@ def main():
         # sprint 11, task 2: importing the paid-for specs into calibration
         test_an_imported_spec_is_the_spec_the_sweep_then_measures,
         test_the_import_refuses_everything_it_cannot_establish,
+        # sprint 17: the lock guard at import_pin_plans.py:328 already exists;
+        # what is pinned is that it still fires before the ledger is opened
+        test_the_import_verifies_the_lock_before_it_opens_the_ledger,
         # sprint 11 follow-up: an interrupted write is not a completed draw
         test_an_interrupted_record_is_not_a_completed_draw,
     ):
