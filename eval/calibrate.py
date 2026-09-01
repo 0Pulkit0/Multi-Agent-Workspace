@@ -75,6 +75,20 @@ FINISH_REASON_OK = "stop"
 # string "null", so a reader looking for the unknown column would find nothing.
 FINISH_REASON_UNKNOWN = ""
 
+# What a stored draw file says produced it when it does not say anything usable.
+# Both are distinct from `None`, which is a real identity meaning "a live
+# provider answered this draw": `record.get("stub")` would collapse all three
+# into one value and read an unmarked stub draw as a live one, which is the
+# confusion the resume check below exists to prevent.
+STUB_UNRECORDED = "<no stub field>"
+STUB_UNREADABLE = "<unreadable>"
+
+# How many conflicting paths the refusal names before it stops naming them. The
+# whole selected range can conflict -- 360 files on the default grid -- and a
+# message that scrolls the store off the screen is not louder than one that names
+# ten of them, the total and the directory, which is what a human needs to look.
+CONFLICT_PATHS_SHOWN = 10
+
 # The go/no-go threshold: the number of tasks whose `d_t` must fall strictly
 # inside the band. ONE constant, read in one place, printed with the verdict and
 # recorded in the manifest.
@@ -212,6 +226,17 @@ def draw_path(root, seed, task_id, draw):
                         "%s__d%d.json" % (task_id, draw))
 
 
+def stub_identity(stub):
+    """What produced a draw: the stub's quality string, or `None` when live.
+
+    Read off the stub object at both of its call sites -- the draw record below
+    and the resume check in `main` -- rather than off `args.stub` at one and the
+    object at the other. One function so the field a run writes and the field it
+    compares against cannot drift into two answers to the same question.
+    """
+    return None if stub is None else stub.quality
+
+
 def one_draw(task, plan, keys, instrument, draw):
     """One Executor sample from the stored spec, graded by the hidden suite."""
     instrument.reset()
@@ -221,7 +246,19 @@ def one_draw(task, plan, keys, instrument, draw):
               "seed": task.seed,
               "spec_sha256": plan.get("spec_sha256", ""),
               "hidden_tests_sha256": gen_tasks.digest(task.tests),
-              "measurement_mode": agents_core.MEASUREMENT_MODE}
+              "measurement_mode": agents_core.MEASUREMENT_MODE,
+              # What answered this draw. Taken from the instrument because that
+              # is the object which actually substitutes `call_model`, so a
+              # record cannot claim a live draw that a stub answered. Attribute
+              # access and not `getattr(instrument, "stub", None)`: a stand-in
+              # that cannot say would then be written down as "live", which is
+              # the one wrong answer this field exists to make impossible.
+              #
+              # Written on every record including the live one, where it is an
+              # explicit `None`. An absent field is a third state and the resume
+              # check treats it as one -- it is not evidence of a live draw, it
+              # is evidence of a file written before anything recorded this.
+              "stub": stub_identity(instrument.stub)}
     try:
         sample = run_eval._draw(plan["spec"], keys)
         record.update({"provider_last": sample["provider"],
@@ -471,6 +508,51 @@ def load_json(path):
         return None
 
 
+def describe_stub_identity(identity):
+    """`identity` as a phrase for the refusal. `None` prints as "None" and reads
+    as "nothing", when what it means is that a real provider answered."""
+    if identity is None:
+        return "live draws (no --stub)"
+    if identity in (STUB_UNRECORDED, STUB_UNREADABLE):
+        return identity
+    return "--stub %s" % identity
+
+
+def recorded_stub_identity(record):
+    """What a stored draw file says produced it. Absence is not `None`.
+
+    Three outcomes and not two, because the field's absence and the field's
+    `None` mean opposite things: `None` is a positive claim that a live provider
+    answered, while an absent field is a file that never made the claim either
+    way. Collapsing them is how a stub draw written before this field existed
+    would be resumed onto by a live sweep without a word.
+    """
+    if not isinstance(record, dict):
+        return STUB_UNREADABLE
+    if "stub" not in record:
+        return STUB_UNRECORDED
+    return record["stub"]
+
+
+def stub_conflicts(tasks, root, seed, draws, identity):
+    """Stored draw files a run writing `identity` must not resume onto.
+
+    Every existing file in the selected range rather than the first one found: a
+    mixed store is a property of the store, and a reader who moves one path aside
+    and re-runs should not discover the next one a run at a time.
+    """
+    found = []
+    for task in tasks:
+        for index in range(1, draws + 1):
+            path = draw_path(root, seed, task.task_id, index)
+            if not os.path.exists(path):
+                continue
+            recorded = recorded_stub_identity(load_json(path))
+            if recorded != identity:
+                found.append((path, recorded))
+    return found
+
+
 def _finish_reason_counts(stored):
     """How the *graded* draws stopped: ``{reason: count}``, `""` for unknown.
 
@@ -564,7 +646,10 @@ def _parse_args(argv):
                         help="recompute the verdict from stored draws; makes "
                              "no calls")
     parser.add_argument("--force", action="store_true",
-                        help="redraw tasks that already have draw files")
+                        help="redraw tasks that already have draw files. This "
+                             "is the one way past the mixed-store refusal: an "
+                             "explicit instruction to recompute, so it may "
+                             "overwrite draws a differently-stubbed run wrote.")
     parser.add_argument("--no-preflight", action="store_true",
                         help="skip the one-call-per-pair validation and spend "
                              "the sweep even if a configured model is dead")
@@ -726,6 +811,50 @@ def main(argv=None):
               "(provider, model) pair 404s, preflight included."
               % ", ".join(sorted(live_models) or ["<nothing>"]))
     stub = make_stub(args.stub, live_models=live_models) if args.stub else None
+
+    # Resume trusts a draw file that exists. `wanted` below is an
+    # `os.path.exists` check and nothing re-reads what it finds, so a run pointed
+    # at a store some other kind of run filled skips those draws and reports a
+    # `d_t` computed partly out of them. The two runs that collide most easily are
+    # the two that matter: `--out` defaults to the real store, and a `--stub`
+    # sweep is the obvious way to eyeball this script's own output, so the
+    # accident is one flag and one forgotten `--out` away in either direction.
+    #
+    # Refused rather than warned about, and in the same posture as the
+    # `--out`-inside-results check above: a live sweep finding stub draws is a
+    # wrong-store accident, and the safe response is to stop and let a human look
+    # at why the two are mixed. Not overwritten, not skipped, and `--force` is
+    # deliberately not suggested in the message -- it is the right answer only
+    # once someone has decided it is, and a refusal that recommends the flag that
+    # silences it is a warning wearing a refusal's clothes.
+    #
+    # Ahead of the key check below, not after it: the store is a fact about the
+    # disk and does not depend on whether a key happens to be set, and a guard
+    # that only fires once one is would be unreachable from the offline half of
+    # this script -- which is the half that writes the stub draws. Also therefore
+    # before the preflight, so nothing has been spent when it fires.
+    identity = stub_identity(stub)
+    if not args.force:
+        conflicts = stub_conflicts(tasks, root, args.seed, args.draws, identity)
+        if conflicts:
+            print("refusing to run: %d stored draw file(s) under %s were not "
+                  "written by a run like this one. This run writes %s:"
+                  % (len(conflicts), root, describe_stub_identity(identity)),
+                  file=sys.stderr)
+            for path, recorded in conflicts[:CONFLICT_PATHS_SHOWN]:
+                print("  %s  <- %s" % (path, describe_stub_identity(recorded)),
+                      file=sys.stderr)
+            if len(conflicts) > CONFLICT_PATHS_SHOWN:
+                print("  ... and %d more"
+                      % (len(conflicts) - CONFLICT_PATHS_SHOWN),
+                      file=sys.stderr)
+            print("Resume skips a draw whose file already exists, so this run "
+                  "would leave those in place and compute d_t partly from them. "
+                  "Point --out somewhere else, or move that store aside, and "
+                  "find out why the two are mixed before re-running.",
+                  file=sys.stderr)
+            return 2
+
     if stub is None:
         needed = sorted(set([agents_core.ROLE_PROVIDER["planner"],
                              agents_core.ROLE_PROVIDER["executor"]]))

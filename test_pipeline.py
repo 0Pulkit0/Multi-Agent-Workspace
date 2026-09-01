@@ -2405,6 +2405,11 @@ class _FakeInstrument(object):
     """
 
     def __init__(self):
+        # Set here and not in `reset`, exactly as the real `Instrument` sets it:
+        # `calibrate.one_draw` resets the instrument and *then* reads this, so a
+        # stand-in that cleared it per draw would record every stubbed draw as
+        # live and pass while doing it.
+        self.stub = None
         self.reset()
 
     def reset(self):
@@ -4978,12 +4983,19 @@ def test_a_truncated_draw_is_recorded_wherever_a_draw_is_recorded():
           clean["finish_reason"] == "stop", clean)
 
 
-def _write_draws(root, seed, task_id, draws):
+_NO_STUB_FIELD = object()
+
+
+def _write_draws(root, seed, task_id, draws, stub=_NO_STUB_FIELD):
     """Write draw JSONs by hand. `draws` is ``[(outcome, finish_reason, passed)]``.
 
     Written rather than swept, because the mix that matters -- one clean draw, one
     truncation, one infra loss on the same task -- is exactly what a run cannot be
     asked for on demand. `collect` reads files, so files are the honest input.
+
+    `stub` is left off the record entirely unless given, which is the third state
+    the resume check has to tell from a live `None`: a draw file written before
+    anything recorded what produced it.
     """
     calibrate = _import_calibrate()
     run_eval = _import_run_eval()
@@ -4993,6 +5005,8 @@ def _write_draws(root, seed, task_id, draws):
             os.makedirs(os.path.dirname(path))
         record = {"task_id": task_id, "draw": index, "outcome": outcome,
                   "seed": seed, "tier": 2, "family": "fake", "variant": 0}
+        if stub is not _NO_STUB_FIELD:
+            record["stub"] = stub
         if outcome == run_eval.OUTCOME_GRADED:
             record["passed"] = passed
             record["finish_reason"] = reason
@@ -5119,6 +5133,161 @@ def test_one_calibration_draw_records_why_the_executor_stopped():
           "fact about the draw, not a reason to drop it",
           record["outcome"] == run_eval.OUTCOME_GRADED
           and "passed" in record, record.get("outcome"))
+
+
+def test_a_calibration_draw_records_what_produced_it():
+    """The identity is on the record, and it is not inferable from anything else.
+
+    `one_draw` reads it off the instrument -- the object that actually
+    substitutes `call_model` -- so a record cannot claim a live draw that a stub
+    answered. The tempting shortcut is to read it back off `finish_reason`, on
+    the grounds that a stub never produces one; the second case below is the
+    counterexample, a stubbed draw reporting `stop`. That inference was only ever
+    true by accident of which field was added first, and it stops being true the
+    moment a live provider omits the field.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    task = _FakeTask()
+    plan = {"spec": agents_core.extract_spec(PLAN), "spec_sha256": "abc"}
+    keys = {"groq": "k" * 12}
+
+    def draw(instrument):
+        agents_core.reset_call_log()
+        record = _with_detailed_stub(
+            "stop", lambda: _with_measurement(
+                True, lambda: calibrate.one_draw(task, plan, keys,
+                                                 instrument, 1)))
+        agents_core.reset_call_log()
+        return record
+
+    live = draw(_FakeInstrument())
+    check("a live draw records an explicit None rather than leaving the field "
+          "off: an absent field is a third state and resume treats it as one",
+          "stub" in live and live["stub"] is None, sorted(live.items()))
+
+    stubbed_instrument = _FakeInstrument()
+    stubbed_instrument.stub = calibrate.make_stub("sampled")
+    stubbed = draw(stubbed_instrument)
+    check("a stubbed draw records the quality that produced it",
+          stubbed["stub"] == "sampled", sorted(stubbed.items()))
+    check("and not by inference from `finish_reason`: this draw stopped at "
+          "`stop` and is still a stub draw, so the two fields are independent",
+          (stubbed["finish_reason"], stubbed["stub"]) == ("stop", "sampled"),
+          (stubbed["finish_reason"], stubbed["stub"]))
+    check("one function answers it for both, off the stub object rather than off "
+          "a flag carried beside it",
+          calibrate.stub_identity(None) is None
+          and calibrate.stub_identity(calibrate.make_stub("perfect"))
+          == "perfect", calibrate.stub_identity(calibrate.make_stub("flaky")))
+
+    # On the real object, because this is where it would break silently:
+    # `one_draw` calls `instrument.reset()` and *then* reads `.stub`.
+    instrument = run_eval.Instrument(run_eval.RateGovernor(),
+                                    stub=calibrate.make_stub("perfect"))
+    instrument.reset()
+    check("`Instrument.reset` does not clear the identity, so resetting per draw "
+          "does not turn every stubbed draw into a live-looking one",
+          calibrate.stub_identity(instrument.stub) == "perfect",
+          instrument.stub)
+
+
+def test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote():
+    """Resume trusts a file that exists. This is the check that it stops doing so.
+
+    `--out` defaults to the real calibration store and `--stub` is the obvious
+    way to eyeball this script's own output, so stub draws landing in the store
+    the live sweep resumes onto is one forgotten flag away -- and `d_t` would then
+    be computed partly from a local random number generator with nothing on the
+    manifest saying so. Refused rather than warned about, in both directions, and
+    before anything is spent.
+    """
+    calibrate = _import_calibrate()
+    out = tempfile.mkdtemp(prefix="calib-store-")
+    argv = ["--stub", "sampled", "--limit", "1", "--draws", "2", "--out", out]
+    try:
+        code, _text = _with_scoped_runs(
+            os.path.join(out, "runs"), lambda: _calibrate(argv))
+        paths = sorted(glob.glob(
+            os.path.join(out, "seed-0", "draws", "*.json")))
+        check("a stub sweep writes its own identity onto every draw it produces",
+              code in (0, 1) and len(paths) == 2
+              and [_read_json(p)["stub"] for p in paths] == ["sampled"] * 2,
+              (code, paths))
+
+        code_same, _same = _with_scoped_runs(
+            os.path.join(out, "runs"), lambda: _calibrate(argv))
+        check("the same command resumes onto its own draws, so the guard is a "
+              "guard and not a wall",
+              code_same == code, (code, code_same))
+
+        # The live direction, which is the one the brief is about: a real sweep
+        # pointed at a store a stub run filled. Every key is taken away for this
+        # call, through the seam `_keys_from_env`'s own docstring names, for two
+        # reasons. It makes the assertion load-bearing -- the key check *would*
+        # have fired, and did not, because the store check is ahead of it -- and
+        # it means a regression in the guard cannot turn this check into two real
+        # provider calls on whatever key the machine running the suite has set.
+        run_eval = _import_run_eval()
+        held_keys = run_eval._keys_from_env
+        run_eval._keys_from_env = lambda: {}
+        try:
+            code_live, live_text = _with_scoped_runs(
+                os.path.join(out, "runs"),
+                lambda: _calibrate(["--limit", "1", "--draws", "2",
+                                    "--out", out]))
+        finally:
+            run_eval._keys_from_env = held_keys
+        check("a live run refuses on the mixed store rather than resuming onto "
+              "stub draws, and refuses before it looks for a key",
+              code_live == 2 and "refusing to run" in live_text
+              and "no key for" not in live_text, live_text[-500:])
+        check("and names the paths, what wrote them and what this run writes, "
+              "because the reader has to find the store to fix it",
+              all(os.path.basename(p) in live_text for p in paths)
+              and "--stub sampled" in live_text
+              and "live draws (no --stub)" in live_text, live_text[-500:])
+        check("nothing was spent: the refusal is ahead of the preflight, which "
+              "is the first thing in this script that calls a provider",
+              "preflight" not in live_text, live_text[:400])
+
+        held = [_read_json(p) for p in paths]
+        for path in paths:
+            record = _read_json(path)
+            del record["stub"]
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(record, handle)
+        code_absent, absent_text = _with_scoped_runs(
+            os.path.join(out, "runs"), lambda: _calibrate(argv))
+        check("a draw file with no identity at all is refused too, rather than "
+              "read as live -- it is a file written before anything recorded "
+              "this, and what produced it is unknown, not None",
+              code_absent == 2 and calibrate.STUB_UNRECORDED in absent_text,
+              absent_text[-400:])
+        check("and the refused run left those files exactly as it found them",
+              [_read_json(p) for p in paths]
+              == [dict((k, v) for k, v in record.items() if k != "stub")
+                  for record in held], [_read_json(p) for p in paths])
+
+        with open(paths[0], "w", encoding="utf-8") as handle:
+            handle.write("not json")
+        code_bad, bad_text = _with_scoped_runs(
+            os.path.join(out, "runs"), lambda: _calibrate(argv))
+        check("a draw file that cannot be read is refused rather than silently "
+              "skipped by resume and dropped by `collect`",
+              code_bad == 2 and calibrate.STUB_UNREADABLE in bad_text,
+              bad_text[-400:])
+
+        code_force, _force_text = _with_scoped_runs(
+            os.path.join(out, "runs"),
+            lambda: _calibrate(argv + ["--force"]))
+        check("--force is the one way past it, because recomputing every draw is "
+              "an explicit instruction rather than an accident",
+              code_force == code
+              and [_read_json(p)["stub"] for p in paths] == ["sampled"] * 2,
+              (code_force, [_read_json(p).get("stub") for p in paths]))
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def test_the_finish_reason_channel_reports_this_call_or_nothing():
@@ -7515,6 +7684,9 @@ def main():
         test_a_calibration_truncation_reads_as_an_artifact_not_a_model_failure,
         test_one_calibration_draw_records_why_the_executor_stopped,
         test_the_finish_reason_channel_reports_this_call_or_nothing,
+        # sprint 12, task 1: a stub draw must not be able to become a real one
+        test_a_calibration_draw_records_what_produced_it,
+        test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote,
         test_the_task_order_is_a_seeded_permutation_not_generation_order,
         test_the_manifest_records_the_order_the_sweep_actually_walked,
         # sprint 7, task 2: the calibration sweep and the go/no-go gate
