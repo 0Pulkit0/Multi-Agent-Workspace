@@ -129,7 +129,31 @@ ROLE_MODEL = {}
 # given and recorded as sent, because a provider that needs a parameter the
 # others do not -- a reasoning-effort knob, a max-tokens floor -- otherwise
 # either cannot be configured or is sent without appearing in the record.
-ROLE_PARAMS = {}
+#
+# The Executor entry INSTALLS D-6, which registers `reasoning_format="hidden"` on
+# every Groq call. It was registered and not installed: this dict was `{}`, both
+# sweep entry points resolve through `configure_models()`, and with no
+# `models.json` and no `MAW_MODELS` present that left `sampling_for("executor")`
+# as temperature and top_p alone. Only `eval/pin_executor.py` supplied the
+# parameter, through the role's `params`, which is why the pin was measured with
+# it and a calibration sweep would not have reproduced that.
+#
+# The reason is the gap and not a preference: `reasoning_format: "hidden"` is on
+# 57 of 57 Executor calls in `eval/results/pin-executor/ledger.jsonl` and on 57 of
+# 57 in `eval/results/pin-replay-1/ledger.jsonl` -- the run D-13 pinned from -- so
+# a sweep without it measures `d_t` in an environment the pin was never measured
+# in. D-6 also measured what unset costs: `gpt-oss-20b` with it unset returned
+# zero fenced code blocks while 568 characters went to a separate `reasoning`
+# field, so the Executor's extractor saw no code at all. Registered as D-14 in
+# `eval/prereg/DECISIONS_R3_ADDENDUM_E.md`.
+#
+# One consequence, stated rather than left to be found: `sampling_for` is keyed by
+# role and not by provider, so a *failover* to Gemini outside measurement mode
+# would send a Groq extension to Google. Measurement mode has no failover -- the
+# provider order is one long -- so no sweep can reach it; the Streamlit app can.
+# Not repaired here, because making sampling provider-aware changes the contract
+# that the record and the wire are the same dict.
+ROLE_PARAMS = {"executor": {"reasoning_format": "hidden"}}
 
 # Sampling is pinned here rather than left to the endpoint. Free tiers override
 # unpinned parameters with their own defaults and change them without notice, so
@@ -708,6 +732,36 @@ def split_params(params):
     return keywords, extra
 
 
+# The detail of the most recent completion `call_model` obtained, or `{}`.
+#
+# A side channel, and named as one rather than disguised. `call_model` returns a
+# string because roughly two dozen stand-ins across the offline suites replace
+# that exact symbol with a function that returns a string, so its return type
+# cannot be widened to carry `finish_reason` without rewriting all of them -- and
+# `_attempt_provider` calls `call_model`, not `call_model_detailed`, precisely so
+# those stand-ins reach the retry layer.
+#
+# The staleness hazard is closed by clearing, not by trusting: `_attempt_provider`
+# clears this before every attempt and reads it after, so `{}` means "no real
+# completion was observed on this attempt" -- a stubbed call -- and never a value
+# left behind by an earlier draw. That is the same rule `pin_executor.CaptureDetail`
+# states for `replies[-1]`, which is not a retry's ghost because a failed attempt
+# raises before it appends.
+_LAST_COMPLETION = {}
+
+
+def last_completion():
+    """The most recent completion's detail, or ``{}``. A copy, not the dict."""
+    return dict(_LAST_COMPLETION)
+
+
+def note_completion(detail):
+    """Record (or, with a falsy ``detail``, forget) the last completion."""
+    _LAST_COMPLETION.clear()
+    if detail:
+        _LAST_COMPLETION.update(detail)
+
+
 def call_model_detailed(provider, api_key, system, user, role=None):
     """One model call, with the accounting a bare string cannot carry.
 
@@ -791,9 +845,14 @@ def call_model(provider, api_key, system, user, role=None):
     the pipeline calls: roughly two dozen stand-ins across the offline suites
     replace *this* symbol with a function returning a string. A caller that wants
     the usage block or the model the API actually returned asks for the detail.
+
+    The detail is also parked in `_LAST_COMPLETION` on the way past, so
+    `_attempt_provider` can put `finish_reason` on the call record without this
+    function's return type -- or those two dozen stand-ins -- having to change.
     """
-    return call_model_detailed(provider, api_key, system, user,
-                               role=role)["text"]
+    detail = call_model_detailed(provider, api_key, system, user, role=role)
+    note_completion(detail)
+    return detail["text"]
 
 
 # ------------------------------------------------------------------- preflight
@@ -1589,6 +1648,17 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         "error": None,
         "status": None,
         "exc_class": "",
+        # Why generation stopped, as the provider said. `None` until a real
+        # completion is observed, and `None` for a stubbed call, because the only
+        # honest value for "nothing answered" is not "stop". A `length` here is
+        # the difference between a model that answered wrongly and a model that
+        # was cut off mid-answer, and without it the second is graded as the
+        # first: 2 of the 57 draws in `eval/results/pin-replay-1/ledger.jsonl`
+        # returned 0 characters at the endpoint's own 2048-token default, which is
+        # the whole of D-13 caveat 4. Both were the runner-up `gpt-oss-20b`, not
+        # the pinned Executor -- so what this records is a known behaviour of the
+        # endpoint, not a known defect in the model the sweep will use.
+        "finish_reason": None,
         "attempts": 0,
         "retried": 0,
         "seconds_paced": 0.0,
@@ -1623,6 +1693,11 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
             # bypass whenever MEASUREMENT_MODE is on. Prefer a content-addressed
             # artifact store: that gives resume without ever handing back an old
             # sample as if it had just been drawn.
+            #
+            # Cleared immediately before the call, never after: what is read below
+            # is then this attempt's completion or nothing at all, and a stub that
+            # sets nothing cannot inherit the previous attempt's `finish_reason`.
+            note_completion(None)
             text = call_model(provider, key, system, user, role=role)
         except ProviderError as exc:
             error = exc
@@ -1671,6 +1746,7 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         record["error"] = None
         record["status"] = None
         record["exc_class"] = ""
+        record["finish_reason"] = last_completion().get("finish_reason")
         _emit_call_event(record)
         return text, record, None
     _emit_call_event(record)

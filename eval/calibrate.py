@@ -53,6 +53,28 @@ CALIBRATION_DRAWS = 10
 BAND_LOW = 0.1
 BAND_HIGH = 0.9
 
+# The one `finish_reason` that means "the model decided it was done". Everything
+# else is an artifact of the call rather than a fact about the model: `length` is
+# a draw cut off at the endpoint's token ceiling, `content_filter` is a refusal
+# imposed on the way out. Both land in `d_t`'s denominator as graded failures and
+# pull the rate down exactly as if the model had answered and been wrong, which is
+# why the count is printed with the rates instead of left in the draw files.
+#
+# 2 of the 57 draws in `eval/results/pin-replay-1/ledger.jsonl` came back `length`
+# with 0 characters at the endpoint's own 2048-token default -- D-13 caveat 4 --
+# so this is a measured shape of this project's traffic, not a hypothetical. Both
+# were `openai/gpt-oss-20b`, the runner-up; the pinned Executor finished at `stop`
+# on 38 of 38 draws across both pin ledgers. So this is not a known defect in the
+# model the sweep will use -- it is a known behaviour of the endpoint it will use,
+# on the two hardest tasks in the set, and D-14 registers that the ceiling stays
+# at the endpoint's default.
+FINISH_REASON_OK = "stop"
+
+# The key a graded draw with no reason at all is counted under. Not `None`: this
+# dict is written to the manifest, and `json.dump` renders a `None` key as the
+# string "null", so a reader looking for the unknown column would find nothing.
+FINISH_REASON_UNKNOWN = ""
+
 # The go/no-go threshold: the number of tasks whose `d_t` must fall strictly
 # inside the band. ONE constant, read in one place, printed with the verdict and
 # recorded in the manifest.
@@ -204,6 +226,13 @@ def one_draw(task, plan, keys, instrument, draw):
         sample = run_eval._draw(plan["spec"], keys)
         record.update({"provider_last": sample["provider"],
                        "raw_len": sample["raw_len"],
+                       # Why generation stopped. A `length` here says this draw
+                       # was cut off, not that the model got the task wrong, and
+                       # `d_t` cannot tell those apart without it: a truncation
+                       # lands in the denominator as a graded failure and pulls
+                       # the rate down as if the model had answered. `None` for a
+                       # stubbed call; never defaulted to `"stop"`.
+                       "finish_reason": sample.get("finish_reason"),
                        "code_sha256": agents_core.sha256_of(sample["code"] or "")})
         record.update(run_eval.grade(sample["code"], task))
         record["outcome"] = run_eval.OUTCOME_GRADED
@@ -384,6 +413,54 @@ def print_rates(per_task):
                  "" if in_band(entry["d_t"]) else "   <- out of band"))
 
 
+def finish_reason_totals(per_task):
+    """Every task's `finish_reason_counts`, summed. ``{reason: count}``."""
+    totals = {}
+    for entry in per_task:
+        for reason, count in (entry.get("finish_reason_counts") or {}).items():
+            totals[reason] = totals.get(reason, 0) + count
+    return totals
+
+
+def print_finish_reasons(per_task):
+    """How the graded draws stopped, and which tasks were affected.
+
+    Printed unconditionally, including the clean case. A line that appears only
+    when something is wrong is a line whose absence is ambiguous -- the reader
+    cannot tell "no truncations" from "this version did not look".
+    """
+    totals = finish_reason_totals(per_task)
+    graded = sum(totals.values())
+    artifacts = dict((reason, count) for reason, count in totals.items()
+                     if reason not in (FINISH_REASON_OK, FINISH_REASON_UNKNOWN))
+    unknown = totals.get(FINISH_REASON_UNKNOWN, 0)
+    print("\n  finish reasons over %d graded draw(s): %s"
+          % (graded,
+             ", ".join("%s=%d" % (reason or "<none>", totals[reason])
+                       for reason in sorted(totals)) or "none recorded"))
+    print("  non-%s: %d" % (FINISH_REASON_OK, sum(artifacts.values())))
+    if artifacts:
+        # Named per task, because the aggregate says a truncation happened and
+        # the reader's next question is which `d_t` to stop trusting.
+        print("  these draws were cut off or filtered, not wrong: they are "
+              "graded failures in d_t and the rate below is lower than the "
+              "model's by that much.")
+        for entry in sorted(per_task, key=lambda e: e["task_id"]):
+            hits = [(index + 1, reason) for index, reason
+                    in enumerate(entry.get("draw_finish_reasons") or [])
+                    if reason and reason != FINISH_REASON_OK]
+            if hits:
+                print("    %-26s %s"
+                      % (entry["task_id"],
+                         ", ".join("draw %d=%s" % pair for pair in hits)))
+    if unknown:
+        # Separated from the artifact count rather than folded into it. Under a
+        # stub every draw lands here, so folding them together would print a
+        # large "non-stop" number for a run that called no provider at all.
+        print("  no finish reason recorded: %d (every draw, under --stub; a "
+              "provider that omits the field otherwise)" % unknown)
+
+
 # ------------------------------------------------------------------------ loading
 
 def load_json(path):
@@ -392,6 +469,27 @@ def load_json(path):
             return json.load(handle)
     except Exception:
         return None
+
+
+def _finish_reason_counts(stored):
+    """How the *graded* draws stopped: ``{reason: count}``, `""` for unknown.
+
+    Graded draws only, because those are `d_t`'s denominator and a truncation is
+    only misread where it is being divided by. An infra loss never reached a
+    completion and is already visible as its own outcome; counting it here would
+    report one lost draw twice and inflate the unknown column into a defect.
+
+    `""` and not `None` as the unknown key so this survives a JSON round trip:
+    `json.dump` turns a `None` key into `"null"`, and a reader who then looked up
+    `""` would find nothing and report every draw as accounted for.
+    """
+    counts = {}
+    for record in stored:
+        if record.get("outcome") != run_eval.OUTCOME_GRADED:
+            continue
+        reason = record.get("finish_reason") or FINISH_REASON_UNKNOWN
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 def collect(tasks, root, seed, draws):
@@ -420,6 +518,16 @@ def collect(tasks, root, seed, draws):
                  and by_index[i].get("outcome") == run_eval.OUTCOME_GRADED
                  else None)
                 for i in range(1, draws + 1)],
+            # Aligned with `draw_passed`, so the reader who sees a 0 in the marks
+            # column can see whether that draw was cut off rather than wrong.
+            # `None` in the same positions, for the same two reasons.
+            "draw_finish_reasons": [
+                (by_index[i].get("finish_reason")
+                 if i in by_index
+                 and by_index[i].get("outcome") == run_eval.OUTCOME_GRADED
+                 else None)
+                for i in range(1, draws + 1)],
+            "finish_reason_counts": _finish_reason_counts(stored),
             "hidden_tests_sha256": gen_tasks.digest(task.tests)})
     return per_task
 
@@ -591,13 +699,7 @@ def main(argv=None):
     except agents_core.ConfigError as exc:
         print("refusing to run: model configuration: %s" % exc, file=sys.stderr)
         return 2
-    print("models (%s):" % agents_core.model_config_source())
-    for entry in resolved:
-        print("  %-12s %-8s %s  (temperature=%g top_p=%g)"
-              % (entry["role"], entry["provider"], entry["model"],
-                 entry["temperature"], entry["top_p"]))
-    for line in agents_core.independence_warnings():
-        print("  WARNING: %s" % line)
+    run_eval.print_resolved_models(resolved)
 
     projection = project_calls(tasks, root, args.seed, args.draws)
 
@@ -605,6 +707,7 @@ def main(argv=None):
         per_task = collect(tasks, root, args.seed, args.draws)
         verdict = gate(per_task, threshold)
         print_rates(per_task)
+        print_finish_reasons(per_task)
         print_verdict(verdict, lock["counts"]["tasks"])
         return 0 if verdict["go"] else 1
 
@@ -771,6 +874,7 @@ def main(argv=None):
              or "none"))
     print("%d event(s) written to %s" % (events.count, events.path))
     print_rates(per_task)
+    print_finish_reasons(per_task)
     print_verdict(verdict, lock["counts"]["tasks"])
     print("\nmanifest: %s" % manifest_path)
     # 0 GO, 1 NO-GO, 2 could not run. A NO-GO is a real answer, not an error,

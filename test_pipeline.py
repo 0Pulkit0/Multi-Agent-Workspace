@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 import agents_core
 import harness
@@ -1301,9 +1302,16 @@ def test_all_four_arms_run_offline():
         check("the plan-consuming arms share one Planner call",
               all(r["plan_calls"] == 1 and r["plan_shared"] for r in plan_arms),
               [(r["arm"], r.get("plan_calls")) for r in plan_arms])
+        # A second, hardcoded copy of `_call_log_slice`'s `keep` tuple, and
+        # deliberately not read from it: a check that imports the list it is
+        # checking widens itself every time the list widens, which is the one
+        # thing this check exists to prevent. So it grows by an edit, here, per
+        # field. `finish_reason` was added this sprint and is declared in
+        # `_ADDED_RECORD_KEYS`; the check below independently pins that no prompt
+        # or error text came with it.
         allowed = set(("role", "requested", "used", "model", "temperature",
                        "top_p", "at", "measurement_mode", "ok", "status",
-                       "exc_class", "attempts", "retried"))
+                       "exc_class", "attempts", "retried", "finish_reason"))
         stray = [sorted(set(entry) - allowed) for r in records
                  for entry in r["call_log"] + r.get("plan_call_log", [])
                  if set(entry) - allowed]
@@ -2404,6 +2412,10 @@ class _FakeInstrument(object):
         self.failed_calls = 0
         self.retries = 0
         self.providers = []
+        # The real `Instrument` has this and `calibrate.one_draw` reads it. A
+        # stand-in missing a field the thing it stands in for carries is a
+        # stand-in usable from only half the call sites.
+        self.calls_by_provider = {}
         self.slept = 0.0
 
 
@@ -3740,7 +3752,28 @@ _ADDED_RECORD_KEYS = (
     # is part of the shape on purpose -- a count without it cannot be told from
     # an unmeasured zero, and a reader who cannot tell will average them.
     "candidates[].checks_passed", "candidates[].checks_total",
-    "candidates[].checks_trusted")
+    "candidates[].checks_trusted",
+    # Sprint 12: why generation stopped, and the parameter that makes the
+    # Executor's answers arrive as code at all.
+    #
+    # `finish_reason` is on the arm record, on every stored candidate, and in
+    # both call-log slices. Four places and not one, because a truncation is
+    # invisible in a different way at each: the arm record says which draw was
+    # returned, the candidates say which of the three discarded draws was cut
+    # off, and the call log is the *only* place it can appear for arm B, whose
+    # record comes back from `run_workspace` and never passes through `_draw`.
+    # Without it a draw that was cut off at the token ceiling is graded as a
+    # draw that answered wrongly -- 2 of the 57 in `pin-replay-1` were exactly
+    # that.
+    #
+    # `models[].reasoning_format` is not a new field but a new *value*: the
+    # resolved-role table already reported whatever `sampling_for` returned, and
+    # D-6's parameter now being installed rather than only registered means the
+    # table has a third sampling key for the Executor. It appears here so that
+    # the record growing a sampling parameter is a declared event and not a
+    # diff nobody reads.
+    "call_log[].finish_reason", "candidates[].finish_reason", "finish_reason",
+    "models[].reasoning_format", "plan_call_log[].finish_reason")
 
 def _shape_into(value, path, out):
     """Leaf paths of a JSON value to the set of types seen at each."""
@@ -4623,10 +4656,22 @@ def test_the_defaults_reproduce_todays_behaviour_exactly():
     check("with no configuration present the source is 'defaults'",
           agents_core.model_config_source() == "defaults",
           agents_core.model_config_source())
-    check("no role carries an override, which is what makes `model_for` fall "
-          "through to the provider's model exactly as the old code did",
-          agents_core.ROLE_MODEL == {} and agents_core.ROLE_PARAMS == {},
-          (agents_core.ROLE_MODEL, agents_core.ROLE_PARAMS))
+    check("no role carries a model override, which is what makes `model_for` "
+          "fall through to the provider's model exactly as the old code did",
+          agents_core.ROLE_MODEL == {}, agents_core.ROLE_MODEL)
+    # Renamed and split from "no role carries an override", which asserted
+    # `ROLE_MODEL == {} and ROLE_PARAMS == {}`. The model half is unchanged and is
+    # above. The params half asserted the absence of D-6's `reasoning_format`, and
+    # is now a pin on its presence: `ROLE_PARAMS` is exactly one entry for exactly
+    # one role. Equally tight, not stronger -- `== {}` was already an exact pin --
+    # but on the value the project actually sends. What makes the pair stronger
+    # than the old single check is the wire half, in
+    # `test_d6_reasoning_format_is_installed_not_merely_registered`: this line can
+    # pass while the parameter never leaves the process.
+    check("ROLE_PARAMS is exactly D-6's one Executor entry -- no second role, no "
+          "second parameter",
+          agents_core.ROLE_PARAMS == {"executor": {"reasoning_format": "hidden"}},
+          agents_core.ROLE_PARAMS)
     check("and every role resolves to its provider's default model",
           all(entry["model"]
               == agents_core.PROVIDERS[entry["provider"]]["model"]
@@ -4649,10 +4694,28 @@ def test_the_defaults_reproduce_todays_behaviour_exactly():
           and agents_core.model_for("executor") not in (
               "openai/gpt-oss-20b", "qwen/qwen3.8-27b"),
           agents_core.model_for("executor"))
-    check("sampling is still the two pinned values and nothing else",
+    # Renamed from "sampling is still the two pinned values and nothing else",
+    # which asserted D-6 was not installed. The "and nothing else" is the part
+    # worth keeping: a fourth parameter appearing here is a parameter going to a
+    # provider that nobody registered.
+    check("sampling is the two pinned values plus D-6's reasoning_format, and "
+          "nothing else",
           agents_core.sampling_for("executor") == {"temperature": 0.4,
-                                                  "top_p": 1.0},
+                                                  "top_p": 1.0,
+                                                  "reasoning_format": "hidden"},
           agents_core.sampling_for("executor"))
+    # The role-keyed consequence, checked rather than only written down in the
+    # comment at `ROLE_PARAMS`: `sampling_for` takes a role, not a provider, so an
+    # entry added for a Groq role would ride along to Gemini if it were ever keyed
+    # any wider. The two Gemini roles must carry the two pinned values and nothing
+    # else, or a Groq extension is being sent to Google.
+    check("the two Gemini roles carry no Groq extension, so no provider is sent "
+          "a parameter belonging to another",
+          all(sorted(agents_core.sampling_for(role))
+              == ["temperature", "top_p"]
+              for role in ("planner", "test_writer")),
+          [(role, agents_core.sampling_for(role))
+           for role in ("planner", "test_writer")])
     check("and the pair list a preflight would validate is two, because "
           "planner and test_writer share one",
           [(provider, model) for provider, model, _roles
@@ -4666,6 +4729,494 @@ def test_the_defaults_reproduce_todays_behaviour_exactly():
           agents_core.model_for(None, "groq")
           == agents_core.PROVIDERS["groq"]["model"],
           agents_core.model_for(None, "groq"))
+
+
+class _FakeChoice(object):
+    def __init__(self, text, finish_reason):
+        self.message = type("M", (), {"content": text, "reasoning": None})()
+        self.finish_reason = finish_reason
+
+
+class _FakeCompletions(object):
+    """Records the kwargs `call_model_detailed` hands the SDK, and answers."""
+
+    def __init__(self, sink, text, finish_reason):
+        self._sink, self._text, self._finish = sink, text, finish_reason
+
+    def create(self, **kwargs):
+        self._sink.append(kwargs)
+        return type("R", (), {"choices": [_FakeChoice(self._text, self._finish)],
+                              "usage": None, "model": kwargs.get("model")})()
+
+
+def _fake_openai(sink, text="ok", finish_reason="stop"):
+    """A stand-in `openai` module, for the one thing no other seam can show.
+
+    Every other stub in these suites replaces `call_model` or
+    `call_model_detailed`, which means the SDK call inside
+    `call_model_detailed` -- the actual wire -- is the one line no check has ever
+    executed. `split_params` can be right and that line can still drop
+    `extra_body`. Faking the module is legitimate here because
+    `call_model_detailed` imports it lazily, inside the function, so the
+    substitution is seen by exactly one call and needs no import-order tricks.
+    """
+    module = types.ModuleType("openai")
+
+    class OpenAI(object):
+        def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
+            self.chat = type("C", (), {"completions": _FakeCompletions(
+                sink, text, finish_reason)})()
+
+    module.OpenAI = OpenAI
+    return module
+
+
+def _with_fake_openai(sink, thunk, text="ok", finish_reason="stop"):
+    held = sys.modules.get("openai")
+    sys.modules["openai"] = _fake_openai(sink, text, finish_reason)
+    try:
+        return thunk()
+    finally:
+        if held is None:
+            del sys.modules["openai"]
+        else:
+            sys.modules["openai"] = held
+
+
+def test_d6_reasoning_format_is_installed_and_not_merely_registered():
+    """D-6's parameter in the resolved table, on the call record, and on the wire.
+
+    Three checks and not one, because they can disagree and did. From 2026-08-30
+    until this sprint `reasoning_format="hidden"` was registered in D-6, installed
+    by `eval/pin_executor.py`, and absent from every call either sweep entry point
+    made: `ROLE_PARAMS` was `{}`, both sweeps configure through
+    `configure_models()`, and with no `models.json` and no `MAW_MODELS` present
+    `sampling_for("executor")` resolved to temperature and top_p alone. A guard on
+    the resolved table alone would have passed throughout, because under the pin's
+    own `configure()` the table was correct -- it was the sweep that was not.
+
+    The reason this is installed is the gap and not a preference.
+    `reasoning_format: "hidden"` is on 57 of 57 Executor calls in
+    `eval/results/pin-executor/ledger.jsonl` and on 57 of 57 in
+    `eval/results/pin-replay-1/ledger.jsonl`, the run D-13 pinned from, so a
+    calibration sweep without it measures `d_t` in an environment the Executor pin
+    was never measured in. D-6 also measured what unset costs: `gpt-oss-20b` with
+    it unset returned zero fenced code blocks while 568 characters went to a
+    separate `reasoning` field.
+    """
+    row = _resolved_by_role(agents_core.resolved_roles())["executor"]
+    check("the resolved Executor row carries D-6's reasoning_format, which is "
+          "the row that reaches every manifest",
+          row.get("reasoning_format") == "hidden", sorted(row.items()))
+
+    # The record half. `resolved_roles` and `_attempt_provider` both ask
+    # `sampling_for`, so today they cannot disagree -- and that is the point:
+    # this fails the moment one of them stops asking, which is the shape of the
+    # drift being guarded against, not a hypothetical one.
+    #
+    # The log is reset rather than sliced from its current length: `CALL_LOG` is
+    # capped at `MAX_CALL_LOG` entries and drops from the front when it fills, so
+    # a remembered index is only stable while the suite has made fewer than 200
+    # calls in total. `_run_one_against` already resets for the same reason.
+    sink = []
+    held = agents_core.PACER
+    agents_core.reset_call_log()
+    try:
+        # A pacer that neither waits nor sleeps: the point here is the shape of
+        # one call, and the real interval would put a real delay in the suite.
+        agents_core.set_pacer(agents_core.Pacer({}, default=0,
+                                                sleep=lambda seconds: None))
+        _with_fake_openai(
+            sink,
+            lambda: agents_core.call_role("executor", {"groq": "k" * 12},
+                                          "sys", "usr"),
+            text="```python\ndef f():\n    return 1\n```")
+    finally:
+        agents_core.set_pacer(held)
+    logged = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("and the record written while that call was in flight carries it too, "
+          "which the resolved table cannot vouch for",
+          len(logged) == 1 and logged[0].get("reasoning_format") == "hidden"
+          and logged[0]["role"] == "executor" and logged[0]["ok"] is True,
+          logged)
+    check("the parameter reaches the SDK in extra_body and not as a keyword "
+          "argument, which is the only claim neither of the two above can make",
+          len(sink) == 1
+          and sink[0].get("extra_body") == {"reasoning_format": "hidden"}
+          and "reasoning_format" not in sink[0], sorted(sink[0]))
+    check("and no token ceiling is sent, because the endpoint's own default is "
+          "the environment D-13 was measured under",
+          "max_tokens" not in sink[0], sorted(sink[0]))
+
+
+def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0):
+    """A `call_model_detailed` stand-in that stops for a reason of your choosing.
+
+    It replaces `call_model_detailed` rather than `call_model`, unlike nearly
+    every other stand-in in these suites, and the difference is the point:
+    `call_model` is the only caller of `note_completion`, so replacing *it*
+    removes the side channel from the path under test and every record comes back
+    with no finish reason. That is the correct answer for a stub -- it is checked
+    in `test_the_finish_reason_channel_reports_this_call_or_nothing` -- but it
+    cannot show a `length` arriving anywhere, so this seam sits one layer down.
+
+    `fail_first` raises a retryable 429 on that many leading attempts, so the
+    "which attempt does the record describe" question can be asked.
+    """
+    state = {"attempts": 0}
+
+    def stub(provider, api_key, system, user, role=None):
+        state["attempts"] += 1
+        if counter is not None:
+            counter.append(role)
+        if state["attempts"] <= fail_first:
+            raise agents_core.ProviderError("%s failed: 429" % provider,
+                                            status=429,
+                                            exc_class="RateLimitError",
+                                            retry_after=0.0)
+        model = agents_core.model_for(role, provider)
+        params = agents_core.sampling_for(role)
+        return {"text": text, "model_requested": model, "model_returned": model,
+                "usage": None, "finish_reason": finish_reason, "params": params,
+                "extra_body": agents_core.split_params(params)[1],
+                "reasoning_chars": 0}
+    return stub
+
+
+def _with_detailed_stub(finish_reason, thunk, text=GOOD_CODE, counter=None,
+                        fail_first=0):
+    """Run `thunk` with that stand-in installed, a free pacer and no backoff.
+
+    The pacer and the retry sleep are both replaced because the real ones are
+    right in a sweep and wrong in an offline suite: the interval alone would put
+    minutes of real waiting into a check about a record field.
+    """
+    held = (agents_core.call_model_detailed, agents_core.PACER)
+    previous_sleep = agents_core.set_retry_sleep(lambda seconds: None)
+    agents_core.call_model_detailed = _detailed_stub(
+        finish_reason, text, counter, fail_first)
+    agents_core.set_pacer(agents_core.Pacer({}, default=0,
+                                            sleep=lambda seconds: None))
+    try:
+        return thunk()
+    finally:
+        agents_core.call_model_detailed = held[0]
+        agents_core.set_pacer(held[1])
+        agents_core.set_retry_sleep(previous_sleep)
+
+
+def test_a_truncated_draw_is_recorded_wherever_a_draw_is_recorded():
+    """`finish_reason` on every arm's record, not only on the call it came from.
+
+    Without it a draw that was cut off at the endpoint's own 2048-token default
+    scores exactly like a draw that answered badly: it lands in `d_t`'s
+    denominator as a graded failure and pulls the rate down with nothing in the
+    record saying why. That is measured, not hypothetical -- 2 of the 57 draws in
+    `eval/results/pin-replay-1/ledger.jsonl`, the run D-13 pinned from, came back
+    at `finish_reason: "length"` with 0 characters, which is the whole of that
+    decision's caveat 4. Both were the runner-up `gpt-oss-20b`; the pinned
+    Executor finished at `stop` on 38 of 38 draws across both pin ledgers, so what
+    is guarded here is a known behaviour of the endpoint, not a known defect in
+    the model the sweep will use.
+
+    Four places and not one, because no single record is written by every arm: A'
+    and A'@3 return `_draw`'s value, A builds its own, and arm B has no top-level
+    finish reason at all -- its text comes back from `run_workspace`. For the arm
+    that makes the most calls, `call_log[]` is the only place a truncated repair
+    round can be seen, which is why the slice keeps the key too.
+    """
+    run_eval = _import_run_eval()
+    plan = _plan_fixture()
+    keys = {"groq": "k" * 12}
+
+    def four_records():
+        return (run_eval._draw(plan["spec"], keys),
+                run_eval.run_arm_a(_FakeTask(), keys),
+                run_eval.run_arm_a_prime(_FakeTask(), keys, plan),
+                run_eval.run_arm_a_prime3(_FakeTask(), keys, plan))
+
+    # Reset rather than sliced from the current length: `CALL_LOG` is capped at
+    # `MAX_CALL_LOG` and drops from the front once it fills, so a remembered
+    # index is stable only while the whole suite has made fewer than 200 calls.
+    agents_core.reset_call_log()
+    draw, arm_a, prime, prime3 = _with_detailed_stub(
+        "length", lambda: _with_measurement(True, four_records))
+    check("`_draw` hands the finish reason up with the code, so the sample that "
+          "gets graded carries why it stopped",
+          draw["finish_reason"] == "length", draw)
+    check("arm A records it too, though its draw does not come through `_draw`",
+          arm_a["finish_reason"] == "length", sorted(arm_a.items()))
+    check("A' records it at the top level and on its one candidate",
+          prime["finish_reason"] == "length"
+          and [c["finish_reason"] for c in prime["candidates"]] == ["length"],
+          prime["candidates"])
+    # Every candidate and not just the winner: A'@3 stores the discarded draws so
+    # the blind gate loss is computable off them later, and a discarded draw that
+    # was truncated is a draw the gate rejected for the wrong reason.
+    check("A'@3 records it on the chosen draw and on all three candidates, the "
+          "two discarded ones included",
+          prime3["finish_reason"] == "length"
+          and [c["finish_reason"] for c in prime3["candidates"]]
+          == ["length"] * 3, prime3["candidates"])
+    sliced = run_eval._call_log_slice(0)
+    check("and the call-log slice keeps it, which is the only place arm B -- "
+          "whose record comes from `run_workspace` -- can show a truncated "
+          "repair round",
+          len(sliced) == 6 and all(entry.get("finish_reason") == "length"
+                                   for entry in sliced),
+          [(entry.get("role"), entry.get("finish_reason")) for entry in sliced])
+    agents_core.reset_call_log()
+    # A constant "length" would pass every check above. This is the one that says
+    # the field is read off the completion rather than written by this project.
+    clean = _with_detailed_stub(
+        "stop", lambda: _with_measurement(
+            True, lambda: run_eval._draw(plan["spec"], keys)))
+    check("a draw that finished normally records `stop`, so the field tracks the "
+          "provider rather than being a constant either way",
+          clean["finish_reason"] == "stop", clean)
+
+
+def _write_draws(root, seed, task_id, draws):
+    """Write draw JSONs by hand. `draws` is ``[(outcome, finish_reason, passed)]``.
+
+    Written rather than swept, because the mix that matters -- one clean draw, one
+    truncation, one infra loss on the same task -- is exactly what a run cannot be
+    asked for on demand. `collect` reads files, so files are the honest input.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    for index, (outcome, reason, passed) in enumerate(draws, start=1):
+        path = calibrate.draw_path(root, seed, task_id, index)
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+        record = {"task_id": task_id, "draw": index, "outcome": outcome,
+                  "seed": seed, "tier": 2, "family": "fake", "variant": 0}
+        if outcome == run_eval.OUTCOME_GRADED:
+            record["passed"] = passed
+            record["finish_reason"] = reason
+        else:
+            record["error"] = "provider: boom"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+
+
+def test_a_calibration_truncation_reads_as_an_artifact_not_a_model_failure():
+    """The draw record carries it, `collect` aggregates it, the summary says it.
+
+    `d_t` is the share of *graded* draws that passed, and a truncated draw is
+    graded: it produced no usable code, so it fails the hidden suite and lowers
+    the rate exactly as a wrong answer would. The number is not wrong -- that is
+    what the sweep saw -- but reading it as "the model can do this task half the
+    time" is, and nothing in the record distinguished the two before this. So the
+    count is printed unconditionally, including the clean case, because a line
+    that only appears when something is wrong is a line whose absence cannot be
+    told from a version that never looked.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    graded, lost = run_eval.OUTCOME_GRADED, run_eval.OUTCOME_INFRA_LOSS
+    task = _FakeTask()
+
+    out = tempfile.mkdtemp(prefix="calib-finish-")
+    try:
+        # Draw 1 answered and passed, draw 2 was cut off and so failed, draw 3
+        # never reached a completion at all.
+        _write_draws(out, 0, task.task_id,
+                     [(graded, "stop", True), (graded, "length", False),
+                      (lost, None, None)])
+        entry = calibrate.collect([task], out, 0, 3)[0]
+        check("the per-draw reasons line up index-for-index with `draw_passed`, "
+              "so the reader who sees a 0 in the marks column can see whether "
+              "that draw was cut off rather than wrong",
+              entry["draw_finish_reasons"] == ["stop", "length", None]
+              and entry["draw_passed"] == [True, False, None],
+              (entry["draw_finish_reasons"], entry["draw_passed"]))
+        # Graded draws only. An infra loss never reached a completion and is
+        # already visible as its own outcome; counting it here would report one
+        # lost draw twice and turn a rate limit into an unexplained unknown.
+        check("the counts cover the graded draws and only those, because those "
+              "are the denominator a truncation is misread inside",
+              entry["finish_reason_counts"] == {"stop": 1, "length": 1},
+              entry["finish_reason_counts"])
+        check("and the truncated draw is inside that denominator: d_t is 0.5 "
+              "over two graded draws, of which one was never really answered",
+              (entry["graded"], entry["passed"], entry["d_t"]) == (2, 1, 0.5),
+              (entry["graded"], entry["passed"], entry["d_t"]))
+
+        text = _capture_streams(
+            lambda: calibrate.print_finish_reasons([entry]))[1]
+        check("the summary counts the non-stop draws",
+              "non-stop: 1" in text, text)
+        check("and names the task and the draw, because the reader's next "
+              "question is which d_t to stop trusting",
+              "draw 2=length" in text and task.task_id in text, text)
+        check("and says plainly that those draws were cut off rather than wrong",
+              "not wrong" in text, text)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+    # The clean case and the stub case, which must not look alike.
+    clean = [{"task_id": "t-clean", "finish_reason_counts": {"stop": 10},
+              "draw_finish_reasons": ["stop"] * 10}]
+    clean_text = _capture_streams(
+        lambda: calibrate.print_finish_reasons(clean))[1]
+    check("a clean sweep still prints the line, with a zero, so its absence is "
+          "never mistaken for a version that did not look",
+          "non-stop: 0" in clean_text and "finish reasons over 10 graded" in
+          clean_text, clean_text)
+    check("and names no task, because there is nothing to distrust",
+          "t-clean" not in clean_text, clean_text)
+
+    # Under `--stub` every draw lands here: `Instrument.__enter__` replaces
+    # `call_model` itself, above the only caller of `note_completion`, so a stub
+    # sweep cannot produce a `length` at all and must not be reported as if it
+    # had produced ten of them.
+    stubbed = [{"task_id": "t-stub",
+                "finish_reason_counts": {calibrate.FINISH_REASON_UNKNOWN: 10},
+                "draw_finish_reasons": [None] * 10}]
+    stub_text = _capture_streams(
+        lambda: calibrate.print_finish_reasons(stubbed))[1]
+    check("an unrecorded reason is counted apart from a truncation, so a stub "
+          "run does not print ten artifacts and teach the reader to skip the line",
+          "non-stop: 0" in stub_text
+          and "no finish reason recorded: 10" in stub_text, stub_text)
+    check("the unknown key survives a JSON round trip, which a None key would "
+          "not: `json.dump` renders it as \"null\"",
+          calibrate.FINISH_REASON_UNKNOWN == ""
+          and json.loads(json.dumps(
+              stubbed[0]["finish_reason_counts"])) ==
+          {"": 10}, calibrate.FINISH_REASON_UNKNOWN)
+    check("and the totals are summed across tasks rather than per task",
+          calibrate.finish_reason_totals(clean + stubbed)
+          == {"stop": 10, "": 10},
+          calibrate.finish_reason_totals(clean + stubbed))
+
+
+def test_one_calibration_draw_records_why_the_executor_stopped():
+    """`calibrate.one_draw`'s own record, which is the file `collect` reads.
+
+    Separate from the aggregation above because they fail separately: `collect`
+    can be right about a key `one_draw` never writes, and every draw file on disk
+    would then say nothing while the summary said "none recorded".
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    task = _FakeTask()
+    plan = {"spec": agents_core.extract_spec(PLAN), "spec_sha256": "abc"}
+    keys = {"groq": "k" * 12}
+
+    agents_core.reset_call_log()
+    record = _with_detailed_stub(
+        "length", lambda: _with_measurement(
+            True, lambda: calibrate.one_draw(task, plan, keys,
+                                             _FakeInstrument(), 1)))
+    agents_core.reset_call_log()
+    check("a graded calibration draw records why generation stopped",
+          record["finish_reason"] == "length", sorted(record.items()))
+    check("and it is still graded, which is the point -- the truncation is a "
+          "fact about the draw, not a reason to drop it",
+          record["outcome"] == run_eval.OUTCOME_GRADED
+          and "passed" in record, record.get("outcome"))
+
+
+def test_the_finish_reason_channel_reports_this_call_or_nothing():
+    """`None` never means "stop", and one call never inherits another's reason.
+
+    `_LAST_COMPLETION` is a process-wide side channel, which is the only way to
+    get this onto the record without changing `call_model`'s return type and with
+    it the roughly two dozen stand-ins across these suites that replace that
+    symbol with a function returning a string. A side channel that is written but
+    never cleared reports the last call that happened to set it, so a stubbed
+    call, a failed call and a real call would all claim the previous success's
+    reason. It is therefore cleared immediately before every attempt, and read
+    only on the success path.
+    """
+    run_eval = _import_run_eval()
+    keys = {"groq": "k" * 12}
+    plan = _plan_fixture()
+
+    # A real completion, then a `call_model` stand-in of exactly the shape every
+    # older check in these suites installs. The second record must not inherit
+    # the first's reason -- that is the whole of `note_completion(None)`.
+    agents_core.reset_call_log()
+    first = _with_detailed_stub(
+        "length", lambda: _with_measurement(
+            True, lambda: run_eval._draw(plan["spec"], keys)))
+    held = (agents_core.call_model, agents_core.PACER)
+    try:
+        agents_core.set_pacer(agents_core.Pacer({}, default=0,
+                                                sleep=lambda seconds: None))
+        agents_core.call_model = (
+            lambda provider, api_key, system, user, role=None: GOOD_CODE)
+        second = _with_measurement(True, lambda: run_eval._draw(plan["spec"],
+                                                               keys))
+    finally:
+        agents_core.call_model = held[0]
+        agents_core.set_pacer(held[1])
+    check("a real completion is reported", first["finish_reason"] == "length",
+          first)
+    check("and the stubbed call that followed it reports nothing, rather than "
+          "inheriting the previous call's reason",
+          second["finish_reason"] is None, second)
+    check("`last_completion` is empty after the clear, so the record is written "
+          "from this attempt's completion or from nothing",
+          agents_core.last_completion() == {},
+          agents_core.last_completion())
+    agents_core.reset_call_log()
+
+    # A call that failed outright: no completion was observed, so there is no
+    # reason to report and the initialised `None` must survive.
+    agents_core.reset_call_log()
+    previous_attempts = agents_core.set_retry_attempts(1)
+
+    def draw_and_catch():
+        try:
+            run_eval._draw(plan["spec"], keys)
+        except agents_core.ProviderError as exc:
+            return str(exc)
+        return ""
+
+    try:
+        raised = _with_detailed_stub(
+            "length", lambda: _with_measurement(True, draw_and_catch),
+            fail_first=1)
+    finally:
+        agents_core.set_retry_attempts(previous_attempts)
+    records = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("a call that raised is recorded with no finish reason at all, not with "
+          "the last successful call's",
+          "429" in raised and len(records) == 1 and records[0]["ok"] is False
+          and records[0]["finish_reason"] is None
+          and "finish_reason" in records[0],
+          (raised, [(r["ok"], r["finish_reason"]) for r in records]))
+
+    # And a retried call: the record describes the attempt that answered.
+    agents_core.reset_call_log()
+    previous_attempts = agents_core.set_retry_attempts(2)
+    try:
+        retried = _with_detailed_stub(
+            "stop", lambda: _with_measurement(
+                True, lambda: run_eval._draw(plan["spec"], keys)),
+            fail_first=1)
+    finally:
+        agents_core.set_retry_attempts(previous_attempts)
+    records = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("a call whose first attempt was rate limited reports the attempt that "
+          "answered, and reports that it had to retry to get there",
+          retried["finish_reason"] == "stop" and len(records) == 1
+          and records[0]["retried"] == 1 and records[0]["attempts"] == 2,
+          [(r["retried"], r["attempts"], r["finish_reason"]) for r in records])
+
+    # The other end of the same wire: a `call_role` stand-in that hands back a
+    # plain 2-tuple has no record to read, and must read as the same `None`.
+    check("a `call_role` stand-in with no record on it reads as no reason, not "
+          "as an error -- `test_pipeline.py` installs exactly that one",
+          run_eval._finish_reason(("some text", "groq")) is None
+          and run_eval._finish_reason(None) is None)
 
 
 # The permutation `_task_order` produces for a ten-item list, read off the
@@ -5749,10 +6300,20 @@ def test_a_provider_extension_parameter_is_sent_and_recorded():
           "whole", dict(keywords, **extra) == {"temperature": 0.4, "top_p": 1.0,
                                                "reasoning_format": "hidden"},
           (keywords, extra))
-    check("with today's defaults extra_body is empty, which is what makes this "
-          "split invisible to every call the pipeline already makes",
-          agents_core.split_params(agents_core.sampling_for("executor"))[1] == {},
-          agents_core.sampling_for("executor"))
+    # Renamed from "with today's defaults extra_body is empty, which is what makes
+    # this split invisible to every call the pipeline already makes". That was
+    # true only while D-6 was registered and not installed; the split is now
+    # load-bearing on every Executor call the pipeline makes, which is the whole
+    # of D-14. The claim is stronger in the direction that matters: it no longer
+    # says the mechanism is unused, it says the mechanism carries exactly the one
+    # registered parameter and invents nothing beside it.
+    keywords_now, extra_now = agents_core.split_params(
+        agents_core.sampling_for("executor"))
+    check("with today's defaults extra_body carries exactly D-6's parameter, so "
+          "this split is on the path of every Executor call rather than dormant",
+          extra_now == {"reasoning_format": "hidden"}
+          and keywords_now == {"temperature": 0.4, "top_p": 1.0},
+          (keywords_now, extra_now))
 
     pin = _import_pin_executor()
     held = (dict(agents_core.ROLE_MODEL), dict(agents_core.ROLE_PARAMS),
@@ -6948,6 +7509,12 @@ def main():
         test_a_provider_is_a_base_url_and_a_key_and_needs_no_code_edit,
         test_a_bad_model_config_is_refused_whole_rather_than_half_applied,
         test_the_defaults_reproduce_todays_behaviour_exactly,
+        # sprint 12: D-6 installed in the defaults, and truncation made visible
+        test_d6_reasoning_format_is_installed_and_not_merely_registered,
+        test_a_truncated_draw_is_recorded_wherever_a_draw_is_recorded,
+        test_a_calibration_truncation_reads_as_an_artifact_not_a_model_failure,
+        test_one_calibration_draw_records_why_the_executor_stopped,
+        test_the_finish_reason_channel_reports_this_call_or_nothing,
         test_the_task_order_is_a_seeded_permutation_not_generation_order,
         test_the_manifest_records_the_order_the_sweep_actually_walked,
         # sprint 7, task 2: the calibration sweep and the go/no-go gate

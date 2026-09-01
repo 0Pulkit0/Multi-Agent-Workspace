@@ -544,13 +544,42 @@ def _spec_only_prompt(spec):
     return agents_core.build_context(spec, [])
 
 
+def _finish_reason(call):
+    """Why generation stopped, off a `call_role` return, or `None`.
+
+    `None` means "no real completion was observed", never "stop": a truncated
+    draw and a well-formed wrong answer are different findings, and the whole
+    point of recording this is that they stop looking alike. `agents_core`
+    initialises the key on every real record, so a real call always answers.
+
+    Read through `getattr` for one specific reason, not out of caution: a
+    `call_role` stand-in may hand back a plain 2-tuple -- `test_pipeline.py` has
+    one -- and a stub has no finish reason to lose, so it reads as the same
+    `None` a stubbed provider call gets. That is the rule `agents_core` already
+    states for `_LAST_COMPLETION`, applied at the other end of the same wire.
+    """
+    return getattr(call, "record", {}).get("finish_reason")
+
+
 def _draw(spec, keys):
-    """One independent Executor sample from the spec."""
-    text, provider = agents_core.call_role(
+    """One independent Executor sample from the spec.
+
+    `finish_reason` rides along because without it a truncation is graded as bad
+    code: 2 of the 57 draws in `eval/results/pin-replay-1/ledger.jsonl` came back
+    empty at the endpoint's own 2048-token default, and a draw that was cut off
+    mid-answer scores exactly like a draw that answered badly. Both were the
+    runner-up `gpt-oss-20b` rather than the pinned Executor, so this records a
+    known behaviour of the endpoint and not a known defect in the model the sweep
+    uses. `call_role` hands this call's own record back on `.record`, so this is
+    the provenance of *this* call and not the tail of a process-wide log.
+    """
+    call = agents_core.call_role(
         "executor", keys, agents_core.PROMPTS["executor"],
         _spec_only_prompt(spec))
+    text, provider = call
     code, _lang = harness.extract_code_block(text, allow_tests=False)
-    return {"code": code, "provider": provider, "raw_len": len(text)}
+    return {"code": code, "provider": provider, "raw_len": len(text),
+            "finish_reason": _finish_reason(call)}
 
 
 def _gate(code, plan):
@@ -597,8 +626,9 @@ def _gate(code, plan):
 
 def run_arm_a(task, keys, plan=None):
     """One call. No verdict of its own, so `verdict` is left as UNVERIFIED."""
-    text, provider = agents_core.call_role(
+    call = agents_core.call_role(
         "executor", keys, agents_core.PROMPTS["executor"], task.prompt)
+    text, provider = call
     code, _lang = harness.extract_code_block(text, allow_tests=False)
     return {"verdict": harness.VERDICT_UNVERIFIED,
             "pipeline_says_passed": None,
@@ -608,7 +638,8 @@ def run_arm_a(task, keys, plan=None):
             "steps": 1,
             "provider_last": provider,
             "code": code,
-            "raw_len": len(text)}
+            "raw_len": len(text),
+            "finish_reason": _finish_reason(call)}
 
 
 def run_arm_a_prime(task, keys, plan):
@@ -633,9 +664,11 @@ def run_arm_a_prime(task, keys, plan):
             "provider_last": draw["provider"],
             "code": draw["code"],
             "raw_len": draw["raw_len"],
+            "finish_reason": draw["finish_reason"],
             "candidates": [{"draw": 1, "code": draw["code"],
                             "provider": draw["provider"],
-                            "gate_verdict": verdict}]}
+                            "gate_verdict": verdict,
+                            "finish_reason": draw["finish_reason"]}]}
 
 
 # How A'@3's returned draw was chosen. Three different events, three different
@@ -671,7 +704,8 @@ def run_arm_a_prime3(task, keys, plan):
         verdict, approved = _gate(draw["code"], plan)
         draws.append({"draw": index + 1, "code": draw["code"],
                       "provider": draw["provider"], "gate_verdict": verdict,
-                      "gate_approved": approved, "raw_len": draw["raw_len"]})
+                      "gate_approved": approved, "raw_len": draw["raw_len"],
+                      "finish_reason": draw["finish_reason"]})
     gate_available = bool(plan["tests_trusted"])
     winner = next((d for d in draws if d["gate_approved"]), None)
     chosen = winner or draws[0]
@@ -699,9 +733,11 @@ def run_arm_a_prime3(task, keys, plan):
             "provider_last": chosen["provider"],
             "code": chosen["code"],
             "raw_len": chosen["raw_len"],
+            "finish_reason": chosen["finish_reason"],
             "candidates": [{"draw": d["draw"], "code": d["code"],
                             "provider": d["provider"],
-                            "gate_verdict": d["gate_verdict"]} for d in draws]}
+                            "gate_verdict": d["gate_verdict"],
+                            "finish_reason": d["finish_reason"]} for d in draws]}
 
 
 def run_arm_b(task, keys, plan=None):
@@ -812,13 +848,16 @@ def _call_log_slice(start):
     An allow-list, not the whole record: the record is a working object that grows,
     and a results file is a published artifact. `status`, `exc_class`, `attempts`
     and `retried` were added so a 429 that was survived by retrying is visible in
-    the record rather than only in the wall clock. `error` is still deliberately
-    out -- it is provider text, and the redacted copy already lives on the record's
-    own `error` field.
+    the record rather than only in the wall clock. `finish_reason` is here for the
+    same reason and one more: arm B's record has no top-level `finish_reason` --
+    it comes back from `run_workspace`, not from `_draw` -- so for the arm that
+    makes the most calls this slice is the only place a truncated repair round can
+    be seen at all. `error` is still deliberately out -- it is provider text, and
+    the redacted copy already lives on the record's own `error` field.
     """
     keep = ("role", "requested", "used", "model", "temperature", "top_p", "at",
             "measurement_mode", "ok", "status", "exc_class", "attempts",
-            "retried")
+            "retried", "finish_reason")
     return [{name: entry.get(name) for name in keep}
             for entry in agents_core.CALL_LOG[start:]]
 
@@ -1289,6 +1328,45 @@ def load_records(root, seed, arms):
 
 # -------------------------------------------------------------------------- cli
 
+# The keys `resolved_roles` puts on a row that are not sampling parameters. Named
+# here so the header below can print "everything else", which is the only form of
+# that line that stays correct when a role gains a parameter.
+_RESOLVED_IDENTITY_KEYS = ("role", "provider", "model", "base_url")
+
+
+def sampling_extras_text(entry):
+    """A resolved row's sampling parameters beyond temperature and top_p.
+
+    Rendered by exclusion rather than by name, because the failure this closes is
+    a parameter that is being *sent* while the run's own header says it is not.
+    `ROLE_PARAMS` carries `reasoning_format="hidden"` for the Executor (D-6, and
+    D-14 for why it is installed rather than only registered): a header hardcoded
+    to `(temperature=%g top_p=%g)` printed a two-parameter call while a
+    three-parameter call went out on the wire.
+
+    Shared by both sweep entry points on purpose. Two copies of this line drifted
+    once already -- `run_eval` printed the extras and `calibrate` did not -- and
+    the reader of a calibration log has no way to tell which of the two they are
+    looking at.
+    """
+    return "".join(
+        " %s=%r" % pair for pair in sorted(entry.items())
+        if pair[0] not in _RESOLVED_IDENTITY_KEYS + ("temperature", "top_p"))
+
+
+def print_resolved_models(resolved, source=None):
+    """The models header, identically in both sweeps."""
+    print("models (%s):"
+          % (agents_core.model_config_source() if source is None else source))
+    for entry in resolved:
+        print("  %-12s %-8s %s  (temperature=%g top_p=%g%s)"
+              % (entry["role"], entry["provider"], entry["model"],
+                 entry["temperature"], entry["top_p"],
+                 sampling_extras_text(entry)))
+    for line in agents_core.independence_warnings():
+        print("  WARNING: %s" % line)
+
+
 def _keys_from_env():
     """Delegated, so a provider added by configuration gets a key channel too.
 
@@ -1579,16 +1657,7 @@ def main(argv=None):
         print("refusing to run: model configuration: %s" % exc, file=sys.stderr)
         return 2
     keys = _keys_from_env()
-    print("models (%s):" % agents_core.model_config_source())
-    for entry in resolved:
-        print("  %-12s %-8s %s  (temperature=%g top_p=%g%s)"
-              % (entry["role"], entry["provider"], entry["model"],
-                 entry["temperature"], entry["top_p"],
-                 "".join(" %s=%r" % pair for pair in sorted(entry.items())
-                         if pair[0] not in ("role", "provider", "model",
-                                            "base_url", "temperature", "top_p"))))
-    for line in agents_core.independence_warnings():
-        print("  WARNING: %s" % line)
+    print_resolved_models(resolved)
 
     live_models = None
     if args.bad_slug:
