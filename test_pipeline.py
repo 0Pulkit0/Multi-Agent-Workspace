@@ -1479,6 +1479,113 @@ def test_retention_reaches_the_run_json():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ------------- sprint 14: the two identities addendum H registers as checks
+#
+# Both already hold. Neither had a check, so nothing would have noticed if the
+# retention logic stopped satisfying them -- which is the whole of why D-19
+# writes them down. Driven through `_retention_run` above, so every assertion
+# reads a step the real `_verify_step` produced rather than a record built by
+# hand: a constructed `StepResult` would satisfy either identity by fiat.
+
+
+def _approved_at_round(number):
+    """A run whose Executor answers wrongly until `number`, then correctly.
+
+    `Stub` repeats its last reply, so the list only has to reach the round that
+    should pass.
+    """
+    replies = [PARTIAL_CODE] * (number - 1) + [DEEP_GOOD_CODE]
+    run, _ = _retention_run(replies)
+    return run.steps[0]
+
+
+def _scratch_run(stub):
+    """`run_with` in mode 3 with the run JSON going to a scratch directory."""
+    scratch = tempfile.mkdtemp(prefix="round-axis-")
+    try:
+        return run_with(stub, runs_dir=scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_an_approved_cell_satisfies_the_registered_round_identity():
+    """D-18's free identity, at every round the axis has rather than at one."""
+    for number in range(1, agents_core.MAX_REVISION_ROUNDS + 2):
+        step = _approved_at_round(number)
+        check("the fixture approves at round %d and nowhere else" % number,
+              step.verdict == harness.VERDICT_APPROVED
+              and step.retained_round == number,
+              (step.verdict, step.retained_round))
+        # D-19.1: the approved exit appends the passing candidate last, so there
+        # is never a later round to be worse than it.
+        check("round %d approval has final_round_worse False" % number,
+              step.final_round_worse is False, step.final_round_worse)
+        # `rounds` counts rounds *spent* and is written only after a revision
+        # call succeeds, so it trails the retained round by exactly one.
+        check("round %d approval satisfies retained_round == repair_rounds + 1"
+              % number, step.retained_round == step.rounds + 1,
+              (step.retained_round, step.rounds))
+        # D-19.2: the rung label is recoverable on this group and only this one.
+        rung = "" if number == 1 else agents_core.ESCALATION[number - 2]
+        check("round %d approval names the rung that produced it" % number,
+              step.escalation == rung, (step.escalation, rung))
+
+
+def test_a_graded_step_always_carries_a_round():
+    """`:2743` precedes every exit, so a graded step cannot report round 0."""
+    top = agents_core.MAX_REVISION_ROUNDS + 1
+    read = {}
+    runs = (
+        ("approved", _retention_run([PARTIAL_CODE, DEEP_GOOD_CODE])[0]),
+        # Every round dies on import, so the ladder runs out.
+        ("exhausted", _retention_run([BAD_CODE])[0]),
+        # Clean-exit code with no trustworthy suite: APPROVED is downgraded and
+        # the loop leaves by the exit that applies no retention at all.
+        ("unverified", _scratch_run(Stub({"planner": PLAN_NO_TESTS,
+                                          "test_writer": "no code here",
+                                          "executor": GOOD_CODE}))[0]),
+    )
+    for name, run in runs:
+        # The filter `eval/run_eval.py:751-752` applies before it reads the axis.
+        graded = [step for step in run.steps if (step.code or "").strip()]
+        check("the %s run leaves a graded step" % name, len(graded) >= 1,
+              [(s.number, s.verdict, bool(s.code)) for s in run.steps])
+        check("every graded step of the %s run is on the 1..%d axis"
+              % (name, top),
+              all(1 <= s.retained_round <= top for s in graded),
+              [s.retained_round for s in graded])
+        read[name] = graded[-1] if graded else None
+    by_name = dict(runs)
+    # D-19.3 with a run behind it rather than a hypothetical: this plan has two
+    # steps, so the cell's axis is one step's round out of two, and the other
+    # step's repair history is not on it. `steps_approved` counts over both.
+    two_step = by_name["unverified"]
+    check("a two-step run's axis is its last graded step and not the run",
+          len(two_step.steps) == 2 and read["unverified"] is two_step.steps[-1],
+          (len(two_step.steps), read["unverified"].number))
+    exhausted = read["exhausted"]
+    check("the exhausted run reached the end of the ladder",
+          exhausted.escalation == "exhausted", exhausted.escalation)
+    unverified = read["unverified"]
+    check("the unverified run left by the unverified exit",
+          unverified.verdict == harness.VERDICT_UNVERIFIED, unverified.verdict)
+    check("that exit applies no retention, so final_round_worse is a default "
+          "and not a measurement",
+          unverified.final_round_worse is False, unverified.final_round_worse)
+    check("and it still carries a round, because :2743 precedes it",
+          unverified.retained_round >= 1, unverified.retained_round)
+    # Where 0 does come from: a step with no code at all, dropped by the reader's
+    # filter and reported as 0 by `eval/run_eval.py:769`'s `else` branch. The
+    # step itself still has a round -- 0 is the reader's absent state, not one.
+    codeless = _retention_run(["nothing but prose, and no code block"])[0]
+    step = codeless.steps[0]
+    check("a step with no code is dropped before the axis is read",
+          not [s for s in codeless.steps if (s.code or "").strip()],
+          [(s.number, repr(s.code)[:40]) for s in codeless.steps])
+    check("the dropped step still carries a round of its own",
+          step.retained_round >= 1, step.retained_round)
+
+
 # ------------------------------- sprint 5, task 2: one suite gates every arm
 
 # A plan whose own TESTS block fails the vacuity audit -- the same rejection
@@ -7894,6 +8001,9 @@ def main():
         test_an_approved_candidate_wins_outright,
         test_equal_rank_candidates_keep_the_earliest_round,
         test_retention_reaches_the_run_json,
+        # sprint 14: the two identities addendum H's D-19 turns into checks
+        test_an_approved_cell_satisfies_the_registered_round_identity,
+        test_a_graded_step_always_carries_a_round,
         # sprint 5, task 2: one resolved suite gates every arm
         test_injected_suite_skips_the_test_writer,
         test_user_tests_still_beat_an_injected_suite,
