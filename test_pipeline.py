@@ -5290,6 +5290,277 @@ def test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# The nine families whose both variants have an imported Planner spec: the
+# selection D-16's void condition is written against, and the one the queued sweep
+# runs. Spelled here so a check can assert the count the registration depends on.
+_NINE_IMPORTED_FAMILIES = (
+    "aggregation", "byte_formatting", "date_arithmetic", "grouping",
+    "interval_logic", "path_canonicalization", "ranking",
+    "run_length_encoding", "text_normalization")
+
+
+def _family_argv(names):
+    argv = []
+    for name in names:
+        argv.extend(["--family", name])
+    return argv
+
+
+class _Selectors(object):
+    """The two attributes `unknown_selectors` reads, without an argparse run."""
+
+    def __init__(self, families=None, tiers=None):
+        self.families = families
+        self.tiers = tiers
+
+
+def test_a_selection_value_that_matches_nothing_refuses():
+    """An unmatched --family or --tier value shrinks the run instead of failing it.
+
+    `gen_tasks.generate` filters with `fam.name not in families`, so a value that
+    matches nothing is simply absent from the comparison and the sweep runs on
+    whatever did match. Family names are underscored and task IDs are hyphenated,
+    which makes `--family byte-formatting` the natural spelling and a silent
+    no-match: of the nine families the queued sweep selects, three -- aggregation,
+    grouping, ranking -- contain no underscore, so hyphenating the whole list still
+    matches those three and runs 6 tasks rather than 18.
+
+    The worse case is one typo among correct names: eight right and one wrong
+    selects 16 tasks and prints a projection whose every other line, `planner
+    gemini 0` included, is true. Nothing downstream can tell that run from the one
+    that was asked for, so it is refused here, by value, before the disk is read.
+    """
+    calibrate = _import_calibrate()
+    gen_tasks = _import_gen_tasks()
+    families, tiers = calibrate.valid_selectors()
+
+    check("the selectable values are read off the generator's own family table, "
+          "which is the object `generate` filters against",
+          families == sorted(fam.name for fam in gen_tasks.FAMILIES)
+          and tiers == sorted(set(fam.tier for fam in gen_tasks.FAMILIES)),
+          (len(families), tiers))
+    check("a fully correct selection is left alone, which is what makes the "
+          "refusal below a guard rather than a wall",
+          calibrate.unknown_selectors(
+              _Selectors(list(_NINE_IMPORTED_FAMILIES), [1, 2])) == ([], []),
+          calibrate.unknown_selectors(
+              _Selectors(list(_NINE_IMPORTED_FAMILIES), [1, 2])))
+    check("values are reported in the order given and only once each, so the "
+          "message reads back against the command line as typed",
+          calibrate.unknown_selectors(
+              _Selectors(["zeta", "alpha", "zeta"], [9, 4, 9]))
+          == (["zeta", "alpha"], [9, 4]),
+          calibrate.unknown_selectors(_Selectors(["zeta", "alpha", "zeta"],
+                                                 [9, 4, 9])))
+
+    # The spelling is handed over, not applied. A hyphen folded into an underscore
+    # inside the selection would make `--family byte-formatting` work today and
+    # quietly select something else the day a family name contains a hyphen.
+    check("a hyphenated family name and a whole task ID both point at the "
+          "underscored spelling",
+          (calibrate.family_suggestion("byte-formatting", families),
+           calibrate.family_suggestion("byte-formatting-01", families))
+          == ("byte_formatting", "byte_formatting"),
+          calibrate.family_suggestion("byte-formatting-01", families))
+    check("and a value that folds onto nothing gets no suggestion, because the "
+          "message's job is to hand over a spelling that is certain",
+          calibrate.family_suggestion("text_normalisation", families) is None
+          and calibrate.family_suggestion("nope", families) is None,
+          calibrate.family_suggestion("text_normalisation", families))
+    check("the fold is never applied to the selection: the hyphenated name still "
+          "matches no family, so the refusal is not covering for a silent fixup",
+          gen_tasks.generate(seed=0, per_family=2,
+                             families={"byte-formatting"}) == [],
+          len(gen_tasks.generate(seed=0, per_family=2,
+                                 families={"byte-formatting"})))
+
+    out = tempfile.mkdtemp(prefix="calib-select-")
+    try:
+        # The selection D-16 is written against, asserted through `main` rather
+        # than through `generate`, because the void condition is about the count
+        # this command prints.
+        queued = ["--gate-only", "--draws", "10", "--per-family", "2",
+                  "--out", out] + _family_argv(_NINE_IMPORTED_FAMILIES)
+        code, text = _calibrate(queued)
+        check("the nine imported families still select 18 tasks, which is the "
+              "count D-16's void condition is written against",
+              code == 1 and "in band: 0 of 18" in text, text[-400:])
+
+        hyphenated = [name.replace("_", "-") for name in _NINE_IMPORTED_FAMILIES]
+        code_hyphen, hyphen = _calibrate(
+            ["--draws", "10", "--out", out] + _family_argv(hyphenated))
+        check("the same nine names hyphenated refuse instead of quietly running "
+              "the three that happen to contain no underscore",
+              code_hyphen == 2
+              and "6 selection value(s) match nothing" in hyphen
+              and "projected cost" not in hyphen, hyphen[-700:])
+        check("and the message hands over the underscored spelling of each one, "
+              "which is the fix the reader needs and the one they cannot guess "
+              "from a task ID",
+              "--family byte-formatting  <- no such family; the spelling is "
+              "`byte_formatting`" in hyphen, hyphen[:600])
+        check("the three that did match are not named as unmatched, so the list "
+              "is the values that failed and not the whole command line",
+              "--family aggregation  <-" not in hyphen
+              and "--family grouping  <-" not in hyphen, hyphen[:600])
+
+        typo = list(_NINE_IMPORTED_FAMILIES[:8]) + ["text_normalisation"]
+        code_typo, typo_text = _calibrate(
+            ["--draws", "10", "--out", out] + _family_argv(typo))
+        check("one typo among eight correct names refuses rather than running 16 "
+              "tasks under a projection whose every other line is true",
+              code_typo == 2 and "text_normalisation" in typo_text
+              and "projected cost" not in typo_text, typo_text[-500:])
+        check("and it prints every family name, because the failure mode is a "
+              "reader who does not know how these are spelled",
+              all(name in typo_text for name in families), typo_text[-900:])
+
+        code_tier, tier_text = _calibrate(["--tier", "4", "--out", out])
+        check("a tier outside the locked set is refused the same way, and the "
+              "tiers that exist are printed",
+              code_tier == 2 and "--tier 4  <- no such tier" in tier_text
+              and "tiers: %s" % ", ".join(str(t) for t in tiers) in tier_text,
+              tier_text[-400:])
+
+        # Ordering, shown rather than asserted about the source: with no lock on
+        # disk, a valid selection refuses on the lock and an invalid one refuses on
+        # the selection. A selection error is a fact about the command line and
+        # does not wait behind a disk read.
+        missing = os.path.join(out, "no-such-lock.json")
+        no_lock = "nothing states which task set this is"
+        code_lock, lock_text = _lock_scoped(
+            missing, lambda: _calibrate(["--family", "aggregation",
+                                        "--out", out]))
+        code_first, first_text = _lock_scoped(
+            missing, lambda: _calibrate(["--family", "byte-formatting",
+                                        "--out", out]))
+        check("with no lock to verify, a valid selection refuses on the lock",
+              code_lock == 2 and no_lock in lock_text, lock_text[-300:])
+        check("and an invalid one refuses on the selection first, so the reader "
+              "is told which of the two problems is theirs to fix",
+              code_first == 2 and no_lock not in first_text
+              and "byte_formatting" in first_text, first_text[-400:])
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def _edit_draw(path, key, value=_NO_STUB_FIELD):
+    """Set one key of a stored draw record, or remove it when `value` is left off.
+
+    An explicit sentinel rather than a `None` default, because `None` is a value
+    this field carries: setting `stub` to `None` is a draw claiming a live provider
+    answered, removing it is a draw that never said either way, and a helper that
+    collapsed those two would be the defect these checks are about.
+    """
+    record = _read_json(path)
+    if value is _NO_STUB_FIELD:
+        record.pop(key, None)
+    else:
+        record[key] = value
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+
+
+def test_gate_only_refuses_a_store_that_is_not_all_of_one_kind():
+    """The last path that could still compute a verdict half out of stub answers.
+
+    The resume guard compares a store against the identity of the run about to
+    write into it. `--gate-only` writes nothing and so has no identity of its own
+    to compare against, which left it the one path a mixed store could reach. The
+    requirement here is therefore internal -- one kind, whichever kind, with no
+    claim about which it should have been -- because a verdict is a single count
+    over the whole task set, and a count taken half from a local random number
+    generator and half from a provider belongs to neither.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    graded = run_eval.OUTCOME_GRADED
+    task = _FakeTask()
+
+    out = tempfile.mkdtemp(prefix="calib-kinds-")
+    try:
+        _write_draws(out, 0, task.task_id, [(graded, "stop", True)] * 4,
+                     stub="sampled")
+        found = calibrate.stored_identities([task], out, 0, 4)
+        check("a store every draw of which was written by one kind of run is one "
+              "group, so the check has nothing to say about it",
+              list(found) == ["sampled"] and len(found["sampled"]) == 4, found)
+
+        paths = sorted(glob.glob(os.path.join(out, "seed-0", "draws", "*.json")))
+        _edit_draw(paths[0], "stub", None)
+        _edit_draw(paths[1], "stub")
+        found = calibrate.stored_identities([task], out, 0, 4)
+        check("a draw claiming a live provider and a draw claiming nothing are "
+              "two more kinds and not one: absent is not None, here as well as "
+              "on the write side",
+              sorted(map(str, found)) == ["<no stub field>", "None", "sampled"]
+              and len(found["sampled"]) == 2, found)
+        check("the groups are ordered largest first, so the majority kind is the "
+              "line the reader sees before the exceptions",
+              [len(paths) for _identity, paths
+               in calibrate.identity_groups(found)] == [2, 1, 1],
+              calibrate.identity_groups(found))
+
+        with open(paths[2], "w", encoding="utf-8") as handle:
+            handle.write("not json")
+        unreadable = calibrate.stored_identities([task], out, 0, 4)
+        check("a file that cannot be read is a kind of its own rather than a file "
+              "`collect` drops out of the denominator without a word",
+              calibrate.STUB_UNREADABLE in unreadable, sorted(map(str, unreadable)))
+
+        text = _capture_streams(
+            lambda: calibrate.print_mixed_store(found, out))[1]
+        check("the refusal names every kind with its count",
+              "--stub sampled: 2 draw(s)" in text
+              and "live draws (no --stub): 1 draw(s)" in text
+              and "%s: 1 draw(s)" % calibrate.STUB_UNRECORDED in text, text)
+        check("and names the files in the smaller groups, because which kind is "
+              "the minority cannot be read off the counts",
+              os.path.basename(paths[0]) in text
+              and os.path.basename(paths[1]) in text, text)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+    # Through `main`, on a store a real offline sweep wrote, because the unit
+    # checks above would all pass with the refusal never wired into the CLI.
+    out = tempfile.mkdtemp(prefix="calib-gate-")
+    try:
+        argv = ["--limit", "1", "--draws", "2", "--out", out]
+        code_sweep, _sweep = _with_scoped_runs(
+            os.path.join(out, "runs"),
+            lambda: _calibrate(["--stub", "sampled"] + argv))
+        paths = sorted(glob.glob(os.path.join(out, "seed-0", "draws", "*.json")))
+        code_clean, clean = _calibrate(["--gate-only"] + argv)
+        check("a single-kind store still gets its verdict, so this is a guard and "
+              "not a wall in front of --gate-only",
+              code_sweep in (0, 1) and code_clean in (0, 1)
+              and "in band: " in clean, (code_sweep, code_clean, clean[-300:]))
+
+        held = [_read_json(path) for path in paths]
+        _edit_draw(paths[0], "stub", None)
+        code_mixed, mixed = _calibrate(["--gate-only"] + argv)
+        check("one draw claiming a live provider is enough to refuse, and no "
+              "verdict is printed beside the refusal",
+              code_mixed == 2 and "refusing to compute a verdict" in mixed
+              and "in band: " not in mixed, mixed[-600:])
+        check("and both kinds are named with their counts, which is what a reader "
+              "needs to decide which half of the store is the mistake",
+              "--stub sampled: 1 draw(s)" in mixed
+              and "live draws (no --stub): 1 draw(s)" in mixed, mixed[-600:])
+        check("--force does not buy a verdict here: it means redraw, there is "
+              "nothing to redraw on a path that makes no calls, and the only "
+              "thing it could force is the verdict this refuses to compute",
+              _calibrate(["--gate-only", "--force"] + argv)[0] == 2,
+              _calibrate(["--gate-only", "--force"] + argv)[1][-300:])
+        check("and the refused runs left the store exactly as they found it",
+              [_read_json(path) for path in paths]
+              == [dict(record, stub=None) if index == 0 else record
+                  for index, record in enumerate(held)],
+              [_read_json(path).get("stub") for path in paths])
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_the_finish_reason_channel_reports_this_call_or_nothing():
     """`None` never means "stop", and one call never inherits another's reason.
 
@@ -7687,6 +7958,9 @@ def main():
         # sprint 12, task 1: a stub draw must not be able to become a real one
         test_a_calibration_draw_records_what_produced_it,
         test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote,
+        # sprint 13: the selection and the gate-only store, both stop being trusted
+        test_a_selection_value_that_matches_nothing_refuses,
+        test_gate_only_refuses_a_store_that_is_not_all_of_one_kind,
         test_the_task_order_is_a_seeded_permutation_not_generation_order,
         test_the_manifest_records_the_order_the_sweep_actually_walked,
         # sprint 7, task 2: the calibration sweep and the go/no-go gate

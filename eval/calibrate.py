@@ -89,6 +89,10 @@ STUB_UNREADABLE = "<unreadable>"
 # ten of them, the total and the directory, which is what a human needs to look.
 CONFLICT_PATHS_SHOWN = 10
 
+# How many family names the selection refusal prints per line. The point of that
+# list is the *spelling*, so it has to be readable rather than compact.
+FAMILIES_PER_LINE = 3
+
 # The go/no-go threshold: the number of tasks whose `d_t` must fall strictly
 # inside the band. ONE constant, read in one place, printed with the verdict and
 # recorded in the manifest.
@@ -553,6 +557,72 @@ def stub_conflicts(tasks, root, seed, draws, identity):
     return found
 
 
+def stored_identities(tasks, root, seed, draws):
+    """What the stored draws in the selected range say produced them.
+
+    ``{identity: [path, ...]}``. `stub_conflicts` above asks whether the store
+    matches the run about to write into it; this answers the question that has no
+    run to compare against -- whether the store is of one kind *at all*.
+
+    An unparseable file counts as its own kind, because `recorded_stub_identity`
+    reports it as one. That is deliberate: `collect` drops such a file from `d_t`'s
+    denominator without a word, so a store containing one is not a store of one
+    kind, and saying so is better than quietly averaging over what is left.
+    """
+    found = {}
+    for task in tasks:
+        for index in range(1, draws + 1):
+            path = draw_path(root, seed, task.task_id, index)
+            if not os.path.exists(path):
+                continue
+            recorded = recorded_stub_identity(load_json(path))
+            found.setdefault(recorded, []).append(path)
+    return found
+
+
+def identity_groups(found):
+    """`[(identity, paths)]`, largest group first, then by name.
+
+    Ordered rather than whatever the dict yields, so the majority kind is the
+    first line a reader sees and the message does not reshuffle between runs.
+    """
+    return sorted(found.items(),
+                  key=lambda item: (-len(item[1]),
+                                    describe_stub_identity(item[0])))
+
+
+def print_mixed_store(found, root):
+    """The refusal for a store that is not internally of one kind.
+
+    Names every identity with its count, then the files in the smaller groups --
+    those are the ones a reader is going to move aside, and which kind is in the
+    minority is not knowable from the counts alone.
+    """
+    groups = identity_groups(found)
+    total = sum(len(paths) for _identity, paths in groups)
+    print("refusing to compute a verdict: the %d stored draw file(s) under %s "
+          "are of %d different kinds:" % (total, root, len(groups)),
+          file=sys.stderr)
+    for identity, paths in groups:
+        print("  %s: %d draw(s)"
+              % (describe_stub_identity(identity), len(paths)), file=sys.stderr)
+    minority = [(path, identity)
+                for identity, paths in groups[1:] for path in paths]
+    print("the smaller group(s), which are the files to look at first:",
+          file=sys.stderr)
+    for path, identity in minority[:CONFLICT_PATHS_SHOWN]:
+        print("  %s  <- %s" % (path, describe_stub_identity(identity)),
+              file=sys.stderr)
+    if len(minority) > CONFLICT_PATHS_SHOWN:
+        print("  ... and %d more" % (len(minority) - CONFLICT_PATHS_SHOWN),
+              file=sys.stderr)
+    print("A verdict is one count over the whole task set, so a mixed store puts "
+          "stub answers and provider answers inside the same in-band total and "
+          "the number belongs to neither. --gate-only reads the store and makes "
+          "no calls, so nothing was spent: decide which kind this store is meant "
+          "to be, move the others aside, and re-run.", file=sys.stderr)
+
+
 def _finish_reason_counts(stored):
     """How the *graded* draws stopped: ``{reason: count}``, `""` for unknown.
 
@@ -636,15 +706,24 @@ def _parse_args(argv):
     parser.add_argument("--per-family", type=int, default=2,
                         help="variants per family (default 2, matching "
                              "run_eval and the lock)")
-    parser.add_argument("--tier", type=int, action="append", dest="tiers")
-    parser.add_argument("--family", action="append", dest="families")
+    parser.add_argument("--tier", type=int, action="append", dest="tiers",
+                        help="tier to keep, repeatable. A value outside the "
+                             "locked tiers refuses rather than selecting less.")
+    parser.add_argument("--family", action="append", dest="families",
+                        help="family name to keep, repeatable. Family names are "
+                             "underscored (byte_formatting) while task IDs are "
+                             "hyphenated (byte-formatting-01); a value that "
+                             "matches no family refuses rather than being "
+                             "dropped from the selection.")
     parser.add_argument("--stub", choices=STUBS,
                         help="run offline against a local generator. `sampled` "
                              "is the only one whose draws vary per draw, so it "
                              "is the only one that can demonstrate a GO.")
     parser.add_argument("--gate-only", action="store_true",
                         help="recompute the verdict from stored draws; makes "
-                             "no calls")
+                             "no calls. Refuses a store whose draws are not all "
+                             "of one kind, since one verdict cannot be half "
+                             "stub and half provider.")
     parser.add_argument("--force", action="store_true",
                         help="redraw tasks that already have draw files. This "
                              "is the one way past the mixed-store refusal: an "
@@ -663,8 +742,115 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
+def valid_selectors():
+    """`(family names, tiers)` that select something. Sorted, for the message.
+
+    Read off the generator's own family table and not off `eval/tasks.lock`: the
+    table is the object `generate` filters against, so a check against the lock
+    could pass while the selection still matched nothing. It is also answerable
+    before the lock is read, which is where a selection error belongs.
+    """
+    return (sorted(fam.name for fam in gen_tasks.FAMILIES),
+            sorted(set(fam.tier for fam in gen_tasks.FAMILIES)))
+
+
+def _unique(values):
+    """Duplicates dropped, order of first appearance kept.
+
+    The order given and not sorted, so the refusal reads back against the command
+    line the person typed rather than against an alphabetised version of it.
+    """
+    seen, out = set(), []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _fold_family(value):
+    """`value` reduced for *suggestion only*, never for selection.
+
+    Hyphens fold to underscores and a trailing variant number is dropped, so
+    `byte-formatting` and `byte-formatting-01` both point at `byte_formatting` --
+    which is the confusion this exists for: family names are underscored and task
+    IDs are hyphenated.
+
+    The fold is deliberately not applied to the selection itself. Normalising a
+    hyphen there would make `--family byte-formatting` work today and quietly
+    select something else the day a family name legitimately contains a hyphen: a
+    silent fixup is the same defect wearing a helpful face.
+    """
+    folded = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    head, sep, tail = folded.rpartition("_")
+    return head if sep and tail.isdigit() else folded
+
+
+def family_suggestion(value, families):
+    """The correct spelling of `value`, when exactly one family folds onto it.
+
+    Printed beside the refusal, not applied. Ambiguity returns nothing rather than
+    a guess: the message's job is to hand over a spelling that is certain.
+    """
+    folded = _fold_family(value)
+    hits = [name for name in families if _fold_family(name) == folded]
+    if len(hits) == 1 and hits[0] != value:
+        return hits[0]
+    return None
+
+
+def unknown_selectors(args):
+    """`(--family, --tier)` values that match nothing, in the order given.
+
+    Value by value, and not "did the selection come back empty". `generate` drops
+    a value that matches nothing instead of failing, so eight correct family names
+    plus one typo selects 16 tasks and prints a projection whose every other
+    number -- the task count's neighbours, the planner and executor call counts,
+    the resolved models -- is true. An empty-selection check never sees that run,
+    and it is the run that gets read as the one that was asked for.
+    """
+    families, tiers = valid_selectors()
+    return (_unique(v for v in (args.families or ()) if v not in families),
+            _unique(v for v in (args.tiers or ()) if v not in tiers))
+
+
+def print_unknown_selectors(bad_families, bad_tiers):
+    """The refusal. Names the values that matched nothing, then the spellings."""
+    families, tiers = valid_selectors()
+    print("refusing to run: %d selection value(s) match nothing:"
+          % (len(bad_families) + len(bad_tiers)), file=sys.stderr)
+    for value in bad_families:
+        hint = family_suggestion(value, families)
+        print("  --family %s  <- no such family%s"
+              % (value, "; the spelling is `%s`" % hint if hint else ""),
+              file=sys.stderr)
+    for value in bad_tiers:
+        print("  --tier %s  <- no such tier" % value, file=sys.stderr)
+    print("An unmatched value is dropped by the selection rather than refused, so "
+          "this would have run a smaller task set than the command names with "
+          "every other line of the projection still true. A task set that is not "
+          "the one asked for is not a smaller version of it.", file=sys.stderr)
+    if bad_families:
+        print("family names are underscored; task IDs are hyphenated. The %d "
+              "family names:" % len(families), file=sys.stderr)
+        for start in range(0, len(families), FAMILIES_PER_LINE):
+            print("  %s" % ", ".join(families[start:start + FAMILIES_PER_LINE]),
+                  file=sys.stderr)
+    if bad_tiers:
+        print("tiers: %s" % ", ".join(str(tier) for tier in tiers),
+              file=sys.stderr)
+
+
 def _select(args):
     """The task set and the lock check. Refuses rather than warning."""
+    # Ahead of `generate`, and so ahead of the lock read below: a value that
+    # matches nothing is a fact about the command line and not about the store, so
+    # it should not wait behind a disk check to be reported.
+    bad_families, bad_tiers = unknown_selectors(args)
+    if bad_families or bad_tiers:
+        print_unknown_selectors(bad_families, bad_tiers)
+        return None, None
     tasks = gen_tasks.generate(seed=args.seed, per_family=args.per_family,
                               tiers=set(args.tiers or ()),
                               families=set(args.families or ()),
@@ -789,6 +975,20 @@ def main(argv=None):
     projection = project_calls(tasks, root, args.seed, args.draws)
 
     if args.gate_only:
+        # The write-side refusal below compares the store against the identity of
+        # the run about to write into it. --gate-only writes nothing, so it has no
+        # identity of its own to compare against -- which left it the one path
+        # that could still turn a store half-filled with stub draws into a single
+        # verdict. The requirement here is therefore internal: one kind, whichever
+        # kind, with no claim about which kind it should have been.
+        #
+        # --force does not reach this. It means "redraw", there is nothing to
+        # redraw on a path that makes no calls, and the only thing it could force
+        # here is the verdict this refuses to compute.
+        found = stored_identities(tasks, root, args.seed, args.draws)
+        if len(found) > 1:
+            print_mixed_store(found, root)
+            return 2
         per_task = collect(tasks, root, args.seed, args.draws)
         verdict = gate(per_task, threshold)
         print_rates(per_task)
