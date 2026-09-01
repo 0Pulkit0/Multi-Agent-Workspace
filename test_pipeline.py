@@ -8048,6 +8048,110 @@ def test_an_interrupted_record_is_not_a_completed_draw():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# the write guard proves its own interception
+#
+# `guard_writes.py` is an external wrapper, so nothing in this suite depends on
+# it and a guard that stopped working could not fail a check by going missing.
+# What it can do is print "0 writes attempted into eval/calibration/ or
+# eval/results/" because it never patched anything -- the identical line a
+# working guard prints. Its `--self-test` exists to separate those two cases, and
+# the separation is what is worth pinning here, because a self-test that cannot
+# fail is decoration and reads exactly like one that can. So the guard is aimed
+# at a fake repo under a temp directory and sabotaged three ways, each of which
+# it must catch. The real `eval/calibration/` and `eval/results/` are never
+# touched: the sabotaged runs really do write into whatever roots the guard is
+# pointed at, which is the whole reason it is pointed somewhere else first.
+#
+# Also checked, because it has no self-test of its own: that the guard does not
+# over-deny. `eval/results/` is read-only, not read-denied, and copying *out of*
+# a denied root is a read of it.
+# ---------------------------------------------------------------------------
+
+def _guard_pointed_at(guard, root):
+    """Aim `guard`'s deny-list at a fake repo. Returns the restore callable."""
+    saved = (guard.REPO, guard._DENIED_ABS)
+    guard.REPO = root
+    guard._DENIED_ABS = tuple(
+        (name, os.path.realpath(os.path.join(root, name)))
+        for name in guard.DENIED)
+
+    def restore():
+        guard.REPO, guard._DENIED_ABS = saved
+
+    return restore
+
+
+def test_the_write_guard_proves_its_own_interception():
+    """Three sabotages the self-test must catch, and two things it must not deny.
+
+    The three are the ways a guard reports a clean run without having earned it:
+    the patches were never installed; it raises but records nothing, so its
+    report is empty for the wrong reason; it records but lets the write through.
+    Each is applied to the guard's own `Ledger` or skipped at `install`, so the
+    self-test under test is the shipped one and not a copy of it.
+
+    Deliberately not asserted: the wording of any line the guard prints, and the
+    number of probes it runs -- both are its business and both may grow.
+    """
+    import guard_writes as guard          # not a subject of this suite elsewhere
+
+    fake = tempfile.mkdtemp(prefix="guard-fake-repo-")
+    for name in guard.DENIED:
+        os.makedirs(os.path.join(fake, name))
+    readable = os.path.join(fake, guard.DENIED[1], "already-there.txt")
+    with open(readable, "w", encoding="utf-8") as handle:
+        handle.write("payload\n")
+    unaim = _guard_pointed_at(guard, fake)
+
+    def verdict(sabotage):
+        """`self_test`'s pass/fail under one sabotage, patches always restored."""
+        ledger = guard.Ledger()
+        restore = ((lambda: None) if sabotage == "not installed"
+                   else guard.install(ledger))
+        if sabotage == "records nothing":
+            def refuse(entry_point, path):
+                raise guard.Refused(entry_point)
+            ledger.refuse = refuse
+        elif sabotage == "never refuses":
+            ledger.refuse = lambda entry_point, path: None
+        try:
+            return guard.self_test(ledger)[0]
+        finally:
+            restore()
+
+    try:
+        check("the write guard's own self-test passes when the guard is whole, "
+              "which is the control the three sabotages are read against",
+              verdict("none") is True)
+        for sabotage, described in (
+                ("not installed", "its patches were never installed"),
+                ("records nothing", "it refuses the write but records nothing, so "
+                                    "its report is empty for the wrong reason"),
+                ("never refuses", "it records the write and then lets it land")):
+            check("and the self-test fails when %s" % described,
+                  verdict(sabotage) is False, sabotage)
+
+        ledger = guard.Ledger()
+        restore = guard.install(ledger)
+        copied = os.path.join(fake, "copy.txt")
+        try:
+            with open(readable, encoding="utf-8") as handle:
+                text = handle.read()
+            shutil.copyfile(readable, copied)
+        finally:
+            restore()
+        check("a read out of a write-denied root is not blocked, because "
+              "`eval/results/` is read-only and not read-denied",
+              text == "payload\n", text[:40])
+        check("and only a copy's destination counts as a write, so copying out of "
+              "a denied root is permitted rather than refused",
+              os.path.exists(copied) and not ledger.refused, ledger.refused[:1])
+    finally:
+        unaim()
+        shutil.rmtree(fake, ignore_errors=True)
+
+
 def main():
     for fn in (
         test_pipeline_is_explicit, test_mode_2_skips_execution,
@@ -8188,6 +8292,9 @@ def main():
         test_the_import_verifies_the_lock_before_it_opens_the_ledger,
         # sprint 11 follow-up: an interrupted write is not a completed draw
         test_an_interrupted_record_is_not_a_completed_draw,
+        # sprint 18: the write guard is an external wrapper, so what is pinned is
+        # that its self-test can fail, and that it does not over-deny
+        test_the_write_guard_proves_its_own_interception,
     ):
         print("\n-- %s" % fn.__name__)
         try:
