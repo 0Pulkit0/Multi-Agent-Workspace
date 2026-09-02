@@ -39,6 +39,15 @@ refused nor cleared. An absolute path is still refused even when a `dir_fd` is
 present, because POSIX ignores the fd in that case. The dangerous shapes are
 unaffected -- `shutil.rmtree("eval/results")` and every `open`/`os.open` with a
 spelled-out target are named, so they still refuse.
+
+The patches are `_Patch` instances rather than functions because a function is a
+descriptor. `pathlib._NormalAccessor` on 3.9 captures `open = os.open`,
+`unlink = os.unlink` and six more into a class body, at an import that happens
+*after* this file installs, and a captured function binds -- which crashed
+`Path.open()` and made `Path.unlink()` record the accessor object as its write
+target. `_pathlib_probe` reports which import order the run was in and whether
+that route ended up guarded, because a guard whose coverage depends on an import
+order nobody tracks is another zero reached by not looking.
 """
 import argparse
 import builtins
@@ -245,6 +254,43 @@ _TARGETS = (
 _WRITE_FLAGS = (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
 
 
+class _Patch(object):
+    """A callable that is deliberately *not* a descriptor.
+
+    `install` replaces module-level C builtins with Python callables, and any
+    class body that later evaluates `unlink = os.unlink` captures whatever is
+    bound to that name at that moment. A plain Python function captured into a
+    class body binds: the instance arrives as argument 0 and every real argument
+    shifts by one. A C builtin does not bind, which is the only reason CPython
+    can write those assignments at all -- and `pathlib._NormalAccessor` on 3.9 is
+    exactly that shape (`open = os.open`, `unlink = os.unlink`, and six more).
+    It is imported *after* this file installs, because nothing this file imports
+    pulls `pathlib` in.
+
+    The two harms are unequal, and the quiet one is the one that matters to a
+    claim rather than to a run. Bound, `Path.open()` reached
+    `guarded_os_open(<accessor>, PosixPath, flags, mode)` and died computing
+    `PosixPath & int` -- loud. `Path.unlink()` recorded the accessor object as
+    the write target *first*: `_resolve` can make nothing of it, `denied_root`
+    returns None, and `Ledger.check` therefore takes the `allow` branch and files
+    it under permitted-and-elsewhere as `<unnameable target>`. A write the guard
+    could not name, counted as cleared, and not on the abstained line.
+
+    An instance with `__call__` has no `__get__`, so it is captured as-is and
+    every argument arrives where the wrapper expects it. `__wrapped__` is a real
+    attribute on the slots, so `_unwrap` is unaffected.
+    """
+    __slots__ = ("_call", "__name__", "__wrapped__")
+
+    def __init__(self, call, wrapped):
+        self._call = call
+        self.__name__ = getattr(call, "__name__", "guarded")
+        self.__wrapped__ = wrapped
+
+    def __call__(self, *args, **kwargs):
+        return self._call(*args, **kwargs)
+
+
 def _wrap_positional(ledger, label, original, targets):
     def guarded(*args, **kwargs):
         for index, keyword, fd_keyword in targets:
@@ -258,8 +304,7 @@ def _wrap_positional(ledger, label, original, targets):
                          _fd_relative(target, kwargs, fd_keyword))
         return original(*args, **kwargs)
     guarded.__name__ = "guarded_" + label.replace(".", "_")
-    guarded.__wrapped__ = original       # `_unwrap`: the patch stays inspectable
-    return guarded
+    return _Patch(guarded, original)
 
 
 def _unwrap(function):
@@ -271,6 +316,41 @@ def _unwrap(function):
     working.
     """
     return getattr(function, "__wrapped__", function)
+
+
+def _repoint_pathlib(saved):
+    """Point `pathlib`'s already-captured `os.*` slots at the patches.
+
+    Returns the undo records, in `saved`'s own `(holder, name, original)` shape.
+
+    `_Patch` covers the case where `pathlib` is imported *after* `install()`: the
+    class body captures the patch and it does not bind. The opposite order is the
+    silent one. If anything pulled `pathlib` in first, `_NormalAccessor`'s slots
+    hold the real builtins, every `Path` write goes straight past the guard, and
+    the report says zero for that route by never having looked at it. That is the
+    one zero this file is not allowed to print (see `Ledger.check`), so the slots
+    are re-pointed rather than the coverage depending on an import order nobody
+    is tracking.
+
+    Matched by identity and only against functions this run actually patched, so
+    a slot `pathlib` wrote itself is never touched -- on POSIX its own `symlink`
+    is a `staticmethod` that calls `os.symlink` at call time and is already
+    guarded correctly, and rebinding it would shift it the other way. Identity is
+    also what catches `link_to`, whose slot name is nothing like the `os.link` it
+    holds. `_NormalAccessor` is gone from 3.11, where `pathlib` reaches `os.*` by
+    ordinary module lookup and needs no help; `getattr` covers that.
+    """
+    accessor = getattr(sys.modules.get("pathlib"), "_NormalAccessor", None)
+    if accessor is None:
+        return []
+    undo = []
+    for slot, value in sorted(vars(accessor).items()):
+        for holder, name, original in saved:
+            if holder is os and value is original:
+                setattr(accessor, slot, getattr(os, name))
+                undo.append((accessor, slot, original))
+                break
+    return undo
 
 
 def install(ledger):
@@ -297,13 +377,23 @@ def install(ledger):
     real_os_open = os.open
 
     def guarded_os_open(path, flags, *args, **kwargs):
+        if not isinstance(flags, int):
+            # Not a repair: `real_os_open` would reject the shifted arguments a
+            # moment later anyway, and a containment guard must not invent one.
+            # What this buys is that the next instance of the descriptor bug
+            # names itself here instead of surfacing three frames away as
+            # "unsupported operand type(s) for &: 'PosixPath' and 'int'".
+            raise TypeError(
+                "guard_writes: os.open received %r as `flags`, so this patch was "
+                "called as a bound method and every argument is shifted by one. "
+                "See _Patch." % (type(flags).__name__,))
         if flags & _WRITE_FLAGS:
             ledger.check("os.open", path,
                          _fd_relative(path, kwargs, "dir_fd"))
         return real_os_open(path, flags, *args, **kwargs)
 
-    builtins.open = guarded_open
-    os.open = guarded_os_open
+    builtins.open = _Patch(guarded_open, real_open)
+    os.open = _Patch(guarded_os_open, real_os_open)
 
     for label, module, name, targets in _TARGETS:
         original = getattr(module, name, None)
@@ -312,9 +402,13 @@ def install(ledger):
         saved.append((module, name, original))
         setattr(module, name, _wrap_positional(ledger, label, original, targets))
 
+    # After every `os.*` patch is in place, and given the pre-patch list so the
+    # re-pointing cannot match one of its own entries.
+    saved.extend(_repoint_pathlib(list(saved)))
+
     def restore():
-        for module, name, original in saved:
-            setattr(module, name, original)
+        for holder, name, original in saved:
+            setattr(holder, name, original)
 
     return restore
 
@@ -414,6 +508,54 @@ def _abstention_probe(ledger):
     return ok, lines
 
 
+def _pathlib_probe():
+    """Report whether `pathlib`'s write route is guarded, and say which case.
+
+    Returns `(ok, lines)`. Called twice: beside the self-test, and again just
+    before `restore()`, because the two answer different questions. At self-test
+    time `pathlib` is usually absent, so the first call can only say that nothing
+    has captured `os.*` yet. The closing call is the one that measures the run
+    that happened -- by then the suite has imported `pathlib`, and whether its
+    slots hold the guard's patch is a fact rather than a promise.
+
+    That gap is the whole reason this exists. `self_test` drives the patched
+    callables directly, so it measures the wrapper's body; it cannot measure the
+    wrapper's *installation* as a third party sees it, because no third party is
+    involved. The suite is the third party.
+
+    Deliberately mechanism-neutral: a slot holding a `_Patch` is guarded whether
+    it captured one at import or was re-pointed to one by `_repoint_pathlib`, and
+    a slot still holding a function this run patched over is a hole either way.
+    """
+    module = sys.modules.get("pathlib")
+    if module is None:
+        return True, ["  ok    %-19s pathlib is not imported, so nothing here has "
+                      "captured os.*" % "pathlib capture"]
+    accessor = getattr(module, "_NormalAccessor", None)
+    if accessor is None:
+        return True, ["  ok    %-19s pathlib has no _NormalAccessor (3.11+): it "
+                      "reaches os.* by module lookup" % "pathlib capture"]
+
+    patched = {}
+    for name in ["open"] + [entry[2] for entry in _TARGETS if entry[1] is os]:
+        current = getattr(os, name, None)
+        original = _unwrap(current)
+        if current is not original:
+            patched[name] = original
+
+    slots = sorted(vars(accessor).items())
+    escaped = ["%s (holds the real os.%s)" % (slot, name)
+               for slot, value in slots
+               for name, original in patched.items() if value is original]
+    held = sum(1 for _, value in slots if isinstance(value, _Patch))
+    if escaped:
+        return False, ["  FAIL  %-19s %d captured slot(s) bypass the guard: %s"
+                       % ("pathlib capture", len(escaped), ", ".join(escaped))]
+    return True, ["  ok    %-19s %d captured slot(s) hold the guard's patch, 0 "
+                  "hold a real builtin it patched over"
+                  % ("pathlib capture", held)]
+
+
 def self_test(ledger):
     """Drive one real write through each entry point into a denied root.
 
@@ -425,6 +567,8 @@ def self_test(ledger):
     `_abstention_probe` runs last and is counted separately: it is not an
     interception, so folding it into the "N of M intercepted" tally would inflate
     that number with a probe that proves the guard declined to answer.
+    `_pathlib_probe` is excluded for the same reason and a second one -- at this
+    point it reports an import-order fact, not an interception.
     """
     scratch = tempfile.mkdtemp(prefix="guard-self-test-")
     source = os.path.join(scratch, "source")
@@ -479,11 +623,14 @@ def self_test(ledger):
     abstains_ok, abstain_lines = _abstention_probe(ledger)
     if not abstains_ok:
         passed = False
+    capture_ok, capture_lines = _pathlib_probe()
+    if not capture_ok:
+        passed = False
 
     shutil.rmtree(scratch, ignore_errors=True)
     head = ("GUARD: self-test %s -- %d of %d write entry points intercepted"
             % ("PASSED" if passed else "FAILED", intercepted, len(probes)))
-    return passed, [head] + lines + abstain_lines
+    return passed, [head] + lines + abstain_lines + capture_lines
 
 
 def _module_name(target):
@@ -535,6 +682,7 @@ def main(argv=None):
     ledger = Ledger()
     restore = install(ledger)
     failure = None
+    closing_ok, closing_lines = True, []
     code = 0
     try:
         passed, lines = self_test(ledger)
@@ -567,17 +715,25 @@ def main(argv=None):
         except BaseException as error:
             failure, code = error, 1
     finally:
+        # Read the capture state while the patches are still installed: after
+        # `restore()` every slot legitimately holds a real builtin again and the
+        # question can no longer be asked.
+        closing_ok, closing_lines = _pathlib_probe()
         restore()
 
     refused, allowed, abstained = ledger.take()
     print("")
-    for line in report(refused, allowed, abstained):
+    for line in report(refused, allowed, abstained) + closing_lines:
         print(line)
     if failure is not None:
         print("GUARD: the suite raised %s: %s"
               % (type(failure).__name__, failure), file=sys.stderr)
     if refused:
         return 2
+    if not closing_ok:
+        print("GUARD: the run's write counts do not cover pathlib, so they are "
+              "not the claim they look like.", file=sys.stderr)
+        return 5
     return 0 if code is None else int(code)
 
 

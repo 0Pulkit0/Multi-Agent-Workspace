@@ -1481,6 +1481,121 @@ def test_the_pathlib_guard_survives_a_moved_accessor():
           harness.PATHS_NAME in harness._RUNNER_SOURCE, harness.PATHS_NAME)
 
 
+def test_the_write_guard_survives_being_captured_into_a_class_body():
+    """A patch installed over a C builtin must not become a bound method.
+
+    This is `guard_writes.py`'s check, not the harness's, and it lives in a suite
+    because of where the gap is. `guard_writes.self_test` drives the patched
+    callables directly, so it measures the wrapper's *body*; it cannot measure the
+    wrapper's *installation* as a third party sees it, because no third party is
+    involved. The suite is the third party. "5 of 5 write entry points
+    intercepted" was true while a `Path.open()` anywhere in the process was a hard
+    crash.
+
+    `install` replaces `builtins.open`, `os.open` and the 21 `os.*`/`shutil.*`
+    names in `_TARGETS`. Anything whose class body later evaluates
+    `unlink = os.unlink` captures what is bound then, and a plain Python function
+    captured that way binds -- the instance lands in argument 0 and every real
+    argument shifts by one. C builtins do not bind, which is the only reason
+    CPython can write those assignments; `pathlib._NormalAccessor` is that shape
+    on 3.9 and is imported after the guard installs, because nothing
+    `guard_writes` imports pulls `pathlib` in. Eight of its slots hold something
+    this guard patches -- `open`, `chmod`, `mkdir`, `unlink`, `link_to`, `rmdir`,
+    `rename`, `replace`.
+
+    The two harms are unequal. `Path.open()` died loudly computing
+    `PosixPath & int`. `Path.unlink()` recorded the *accessor object* as the write
+    target first, which `_resolve` cannot name, so `Ledger.check` filed it under
+    permitted-and-elsewhere: a write the guard could not name, counted as cleared,
+    and not on the abstained line. So the second check below is the load-bearing
+    one -- a regression can crash or can quietly mislabel, and only one of those
+    is loud.
+
+    Both import orders are driven, because the fix for one is not the fix for the
+    other. `_Patch` covers capture-after-install; `_repoint_pathlib` covers
+    capture-before-install. A guard whose coverage depends on an import order
+    nobody is tracking is the zero-reached-by-not-looking this project bans. And
+    for capture-before-install, "the writes worked" is not evidence of anything:
+    slots still holding the real builtins let both writes through untouched. So
+    the first check requires the guard to have *seen* both entry points aimed at
+    the file, which is the claim that fails when re-pointing is removed.
+    """
+    import shutil
+    import tempfile
+
+    import guard_writes
+
+    outcomes, mislabelled = [], []
+    for order in ("pathlib imported after install", "imported before install"):
+        scratch = tempfile.mkdtemp(prefix="capture-probe-")
+        target = os.path.join(scratch, "captured.txt")
+        saved_module = sys.modules.pop("pathlib", None)
+        seen = []
+
+        class Recording(guard_writes.Ledger):
+            """Keep the raw target, not only the bucket the report would show."""
+
+            def check(self, entry_point, path, fd_based=False):
+                seen.append((entry_point, path))
+                guard_writes.Ledger.check(self, entry_point, path, fd_based)
+
+        try:
+            if order != "pathlib imported after install":
+                import pathlib          # captures whatever os.* holds right now
+            with open(target, "w") as handle:      # before install: unguarded
+                handle.write("x")
+            restore = guard_writes.install(Recording())
+            failures = []
+            try:
+                import pathlib
+                # Each write is driven in its own `try`, and the file exists
+                # already, so the loud harm cannot mask the silent one by
+                # aborting the run before `unlink` is reached.
+                try:
+                    handle = pathlib.Path(target).open("w")
+                    handle.write("x")
+                    handle.close()
+                except Exception as exc:
+                    failures.append("Path.open('w') -> %s: %s"
+                                    % (type(exc).__name__, exc))
+                try:
+                    pathlib.Path(target).unlink()
+                except Exception as exc:
+                    failures.append("Path.unlink() -> %s: %s"
+                                    % (type(exc).__name__, exc))
+            finally:
+                restore()
+            result = "; ".join(failures) if failures else "both succeeded"
+            # Which entry points the guard actually *saw* aimed at this file. An
+            # empty list is the silent failure: with the slots left holding the
+            # real builtins, both writes succeed and the guard reports zero for
+            # the route by never having been on it.
+            resolved = os.path.realpath(target)
+            outcomes.append((order, result,
+                             sorted(set(entry_point
+                                        for entry_point, path in seen
+                                        if guard_writes._resolve(path)
+                                        == resolved))))
+            # `_resolve` returning None is exactly the condition that sent an
+            # accessor object down the permitted branch, so it is the predicate
+            # to assert on rather than a type test invented here.
+            mislabelled.extend(
+                (order, entry_point, repr(path)) for entry_point, path in seen
+                if guard_writes._resolve(path) is None)
+        finally:
+            sys.modules.pop("pathlib", None)
+            if saved_module is not None:
+                sys.modules["pathlib"] = saved_module
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    check("Path.open('w') and Path.unlink() both work under the write guard and "
+          "are both seen by it, whichever order pathlib and install() happen in",
+          all(result == "both succeeded" and saw == ["os.open", "os.unlink"]
+              for _, result, saw in outcomes), outcomes)
+    check("and the guard records a path-shaped write target for them, never the "
+          "pathlib accessor object", not mislabelled, mislabelled[:3])
+
+
 def test_a_path_denial_is_the_models_failure_not_the_harnesss():
     """A refused escape must stay revisable, which is why it is not FAIL_PATH.
 
@@ -1779,6 +1894,7 @@ def main():
         test_destructive_calls_cannot_be_spelled_around_the_guard,
         test_guarded_calls_still_work_inside_the_workdir,
         test_the_pathlib_guard_survives_a_moved_accessor,
+        test_the_write_guard_survives_being_captured_into_a_class_body,
         test_the_path_guard_is_correct_on_the_interpreter_that_runs_it,
         test_a_path_denial_is_the_models_failure_not_the_harnesss,
         test_timeout_phase_attribution, test_sandbox_layers_are_honest,
