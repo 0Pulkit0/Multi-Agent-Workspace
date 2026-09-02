@@ -772,12 +772,19 @@ def echo_fixture():
     return FIXTURE_ECHO
 
 
-def cmd_controls(tasks, order=None, population=()):
+def cmd_controls(tasks, order=None, population=None):
     """Task 2: the decoy, its coverage, and the controls that say it works.
 
     `population` maps `task_id` to a stored body that passed its own true suite,
     run as an additional negative control; `None` means Task 1 did not run in this
     invocation, which is reported as not measured rather than as an absence.
+
+    The default is `None` and not `()`, which is what it used to be. An empty
+    container is falsy *and* fails `is None`, so it fell through to the branch
+    that says the store was looked at and held nothing -- printing an observation
+    of absence for a run that never observed. The `measure`-only run did exactly
+    that. The sentinel exists to keep those two apart, so nothing may default to
+    a value that defeats it.
     """
     order = sorted(tasks) if order is None else list(order)
     decoys = _coverage_table(tasks, order)
@@ -805,24 +812,41 @@ def cmd_controls(tasks, order=None, population=()):
 
 
 def _population_control(tasks, decoys, population):
-    """Task 2e, or the reason there is no Task 2e."""
-    if population:
+    """Task 2e, or the reason there is no Task 2e.
+
+    Four outcomes, and the point of the branching is that they are four different
+    claims. Not measured (Task 1 never ran here). Measured and the store held
+    nothing. Measured, the store held bodies, but none for the tasks this
+    invocation built decoys for -- a scoped absence, and the only one of the three
+    absences that says nothing about the store as a whole. Or it runs.
+    """
+    usable = sorted(t for t in (population or {}) if t in decoys)
+    if usable:
         _run_control(
             "Task 2e -- population negative control: stored bodies that pass "
             "their own true suite. They are stubs, not model output",
             "PASS the true suite and FAIL the decoy.",
-            tasks, sorted(population), decoys,
+            tasks, usable, decoys,
             lambda task: population.get(task.task_id), False)
         return
     print("")
     print("=== Task 2e -- population negative control ===")
     if population is None:
         print("Not measured: Task 1 did not run in this invocation, so which "
-              "stored bodies pass their own true suite is unknown here.")
+              "stored bodies pass their own true suite is unknown here. An "
+              "absence of observation, and not an observation of absence.")
         return
-    print("Not run: no stored body passes its own true suite, so the results store "
-          "cannot serve as a population control at all. The verdict rests on the "
-          "hand-written pair, which is what the brief provides for.")
+    if population:
+        print("Not run on these tasks: Task 1 found a passing stored body for %d "
+              "task(s), but none of them is among the %d task(s) this invocation "
+              "built a decoy for (%s). That is a statement about this task "
+              "selection and not about the store."
+              % (len(population), len(decoys), ", ".join(sorted(decoys))))
+        return
+    print("Not run: Task 1 replayed the store and no stored body passed its own "
+          "true suite, so there is no population body to grade against a decoy. "
+          "The verdict rests on the hand-written pair, which is what the brief "
+          "provides for.")
 
 
 def _controls_verdict(echo_ran, echo_ok, echo_bad, hand_ran, hand_ok, hand_bad,
@@ -981,14 +1005,21 @@ def _keys_for_groq():
     return keys
 
 
-def cmd_measure(tasks):
-    """Task 3: fresh Groq draws for three ceiling tasks, graded true and decoy."""
+def cmd_measure(tasks, population=None):
+    """Task 3: fresh Groq draws for three ceiling tasks, graded true and decoy.
+
+    `population` is passed straight through to the controls Task 3 re-runs on the
+    measurement tasks, so that in `all` mode Task 2e reports what Task 1 actually
+    found instead of reporting itself unmeasured a second time. It stays `None` in
+    a `measure`-only run, which is the truth there.
+    """
     print("=== Task 3 -- fresh draws, graded against the true and decoy suites ===")
     specs = _measure_gates(tasks)
     if specs is None:
         return 0
 
-    code, decoys = cmd_controls(tasks, order=list(MEASURE_TASKS))
+    code, decoys = cmd_controls(tasks, order=list(MEASURE_TASKS),
+                                population=population)
     if code:
         print("")
         print("GATED: the controls are off-spec on the measurement tasks, so no "
@@ -1265,7 +1296,7 @@ def main(argv=None):
             return code
         print("")
     if measure:
-        code = cmd_measure(tasks)
+        code = cmd_measure(tasks, population=population)
     return code
 
 
