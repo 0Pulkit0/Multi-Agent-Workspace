@@ -60,6 +60,16 @@ CPU_GRACE_SECONDS = 5
 # Per-stream capture ceiling. Runaway printers get cut off here.
 MAX_STREAM_CHARS = 4000
 
+# Per-stream ceiling on what a *repair prompt* may quote back, which is a smaller
+# question than what the record keeps. `format_fixes` splices the candidate's own
+# stdout and stderr into the artifact that steers the next attempt, and the caller
+# clamps the task itself to 3000 characters -- so two streams at MAX_STREAM_CHARS
+# would let candidate-controlled text outweigh the task by better than two to one.
+# 1500 each holds the pair at parity with the spec and never bites a real
+# traceback: a genuine assertion failure out of this harness measures ~720
+# characters of stderr and ~490 of stdout.
+MAX_FIXES_STREAM_CHARS = 1500
+
 # Per-stream ceiling on what the parent will *read at all*, as opposed to what
 # it keeps. MAX_STREAM_CHARS only trims after the whole stream is already in the
 # parent's memory, which is useless against `while True: print("x" * 1000)`:
@@ -1898,6 +1908,38 @@ _SANDBOX_RULES = "\n".join([
 ])
 
 
+def _fence(text):
+    """A backtick run longer than any run inside ``text``.
+
+    A bare ``` around candidate-controlled output is not a container: a program
+    that prints three backticks closes the fence, and everything it printed after
+    that reads as prompt structure rather than as program output. CommonMark's
+    rule is that a fenced block ends only on a run at least as long as the one
+    that opened it, so one backtick more than the longest run in the payload
+    cannot be closed from inside it.
+    """
+    longest = run = 0
+    for char in text:
+        run = run + 1 if char == "`" else 0
+        if run > longest:
+            longest = run
+    return "`" * max(3, longest + 1)
+
+
+def _stream_splice(heading, text, limit=MAX_FIXES_STREAM_CHARS):
+    """One fenced stream quote for a repair prompt: clamped, and un-closable.
+
+    Clamped head-and-tail through `_truncate` rather than from one end, because a
+    traceback carries its useful information at both: the failing call at the top
+    and the exception at the bottom. The elision marker names how much went, so a
+    reader can tell a short stream from a trimmed one.
+    """
+    payload = (text or "").rstrip()
+    payload, _cut = _truncate(payload, limit)
+    fence = _fence(payload)
+    return ["", heading, fence, payload, fence]
+
+
 def format_fixes(verdict, result):
     """The message handed back to the Executor. Real output, not opinions."""
     if verdict == VERDICT_APPROVED:
@@ -2009,9 +2051,13 @@ def format_fixes(verdict, result):
         ]
 
     if result.stderr.strip():
-        parts += ["", "stderr / traceback:", "```", result.stderr.rstrip(), "```"]
-    if result.stdout.strip():
-        parts += ["", "stdout before failure:", "```", result.stdout.rstrip(), "```"]
+        parts += _stream_splice("stderr / traceback:", result.stderr)
+    # Not spliced on FAIL_OUTPUT. The branch above exists to tell a printing loop
+    # that it printed too much; quoting a sample of the printing back is the
+    # branch that punishes the behaviour feeding it, and a repair can do nothing
+    # with the sample that the sentence does not already say.
+    if result.stdout.strip() and result.failure_kind != FAIL_OUTPUT:
+        parts += _stream_splice("stdout before failure:", result.stdout)
 
     parts += ["",
               "Return the complete corrected program in one ```python block.",
