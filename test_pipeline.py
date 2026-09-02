@@ -5983,6 +5983,193 @@ def test_a_model_other_than_the_one_requested_halts_the_run():
           (registered, str(still_wrong)[:120]))
 
 
+# The 26 keys every draw file under `eval/calibration/seed-0/draws/` carried
+# before the model pair was added, read off those 100 files rather than off
+# `one_draw`. Hardcoded on purpose: comparing `one_draw`'s output to `one_draw`
+# pins nothing, and this is the *store's* shape, which is a promise to every
+# reader of it rather than an internal detail.
+_DRAW_KEYS_BEFORE_THE_MODEL_PAIR = (
+    "calls", "calls_by_provider", "code_sha256", "draw", "error", "family",
+    "finish_reason", "grade_assertion", "grade_exit", "grade_failure",
+    "grade_reason", "grade_stderr", "grade_timed_out", "hidden_tests_sha256",
+    "measurement_mode", "outcome", "passed", "provider_last", "raw_len",
+    "seconds", "seed", "spec_sha256", "stub", "task_id", "tier", "variant")
+
+
+def test_a_draw_file_records_which_model_answered_it():
+    """The halt covers a live sweep. This covers what the sweep leaves behind.
+
+    `agents_core.ModelMismatch` stops a run the moment a provider answers as
+    something other than the slug requested -- but that check lives in a
+    process, and `d_t` is computed later, from files. A store that does not say
+    which model produced each draw cannot be audited for the failure the halt
+    exists to catch, and cannot be re-audited after a model is retired, which
+    has happened three times under this project and cost a run twice.
+
+    26 keys become 28. The 100 draw files already on disk were deliberately not
+    backfilled -- a written slug would be invented provenance and a written
+    `None` would be indistinguishable from a real absence -- so *absent* is a
+    third state at the store level now, the way `stub` already is at the record
+    level. What is pinned below is the half that keeps it unambiguous: every
+    record `one_draw` writes carries both keys on every outcome, so an absent
+    key can only mean the file predates the field.
+    """
+    calibrate = _import_calibrate()
+    run_eval = _import_run_eval()
+    plan = _plan_fixture()
+    keys = {"groq": "k" * 12}
+    executor_model = agents_core.model_for("executor", "groq")
+
+    agents_core.reset_call_log()
+    sample = _with_detailed_stub("stop", lambda: _with_measurement(
+        True, lambda: run_eval._draw(plan["spec"], keys)))
+    agents_core.reset_call_log()
+    check("`_draw` hands both slugs up with the code, so the sample that gets "
+          "graded carries what was asked for and what answered",
+          sample.get("model_requested") == executor_model
+          and sample.get("model_returned") == executor_model, sorted(sample))
+
+    # The `getattr` in `_model_slugs`, for the reason `_finish_reason` gives: a
+    # `call_role` stand-in may hand back a plain 2-tuple with no record on it, and
+    # a stub has no slugs to lose. `(None, None)` and not a crash, and not a pair
+    # invented from the requested slug either.
+    #
+    # Probed through a wrapper that turns a raise into a value. A bare call here
+    # would take the seven checks below it down with it, and those are the ones
+    # covering what this pair is *for*.
+    def slugs_of(call):
+        try:
+            return run_eval._model_slugs(call)
+        except Exception as exc:                                # noqa: BLE001
+            return "raised %s" % type(exc).__name__
+
+    check("a stand-in that hands back a bare 2-tuple reads as no slugs rather "
+          "than raising, the same way it reads as no finish reason",
+          slugs_of(("text", "groq")) == (None, None)
+          and slugs_of(None) == (None, None),
+          (slugs_of(("text", "groq")), slugs_of(None)))
+
+    def drawn(returned=_SAME_MODEL, fail_first=0, instrument=None):
+        """One `one_draw` record. `attempts=1` so a 429 becomes an infra loss."""
+        agents_core.reset_call_log()
+        previous = agents_core.set_retry_attempts(1)
+        try:
+            return _with_detailed_stub("stop", lambda: _with_measurement(
+                True, lambda: calibrate.one_draw(
+                    _FakeTask(),
+                    {"spec": agents_core.extract_spec(PLAN),
+                     "spec_sha256": "abc"},
+                    keys, instrument or _FakeInstrument(), 1)),
+                fail_first=fail_first, returned=returned)
+        finally:
+            agents_core.set_retry_attempts(previous)
+            agents_core.reset_call_log()
+
+    graded = drawn()
+    check("a graded draw file records both slugs, so `d_t` and the model that "
+          "produced it are readable from the same artefact",
+          graded["outcome"] == run_eval.OUTCOME_GRADED
+          and graded.get("model_requested") == executor_model
+          and graded.get("model_returned") == executor_model,
+          sorted(graded.items()))
+
+    # Declared in the initial dict and not only in the success branch, for the
+    # reason `stub` is: a key that appeared only on graded draws would make
+    # "absent" mean either "this draw died" or "this file predates the field",
+    # and those need telling apart by a reader who has only the file.
+    lost = drawn(fail_first=1)
+    check("a draw that died before the provider answered still carries both "
+          "keys, as an explicit None -- absence must mean one thing only",
+          lost["outcome"] == run_eval.OUTCOME_INFRA_LOSS
+          and "model_requested" in lost and "model_returned" in lost
+          and lost.get("model_requested") is None
+          and lost.get("model_returned") is None, sorted(lost.items()))
+
+    stubbed_instrument = _FakeInstrument()
+    stubbed_instrument.stub = calibrate.make_stub("sampled")
+    stubbed = drawn(instrument=stubbed_instrument)
+    # `_FakeInstrument` carries the stub identity for the record without
+    # substituting `call_model`, so this draw really did observe a completion.
+    # That is the same trap `test_a_calibration_draw_records_what_produced_it`
+    # names for `finish_reason`: a stubbed draw reporting `stop` is why stub-ness
+    # cannot be read back off that field, and it cannot be read off this pair
+    # either. Two independent provenance questions, two fields.
+    check("`stub` and the model pair are independent: a record can name the stub "
+          "that answered and still carry an observed slug, so neither field is "
+          "inferable from the other",
+          stubbed.get("stub") == "sampled"
+          and stubbed.get("model_returned") == executor_model,
+          (stubbed.get("stub"), stubbed.get("model_returned")))
+
+    # And the case that really observes nothing: a `call_model` stand-in, the
+    # shape roughly two dozen checks in these suites install. `None` on the file
+    # here is what makes an absent key mean "predates the field" and nothing else.
+    agents_core.reset_call_log()
+    held = (agents_core.call_model, agents_core.PACER)
+    try:
+        agents_core.set_pacer(agents_core.Pacer({}, default=0,
+                                                sleep=lambda seconds: None))
+        agents_core.call_model = (
+            lambda provider, api_key, system, user, role=None: GOOD_CODE)
+        unobserved = _with_measurement(True, lambda: calibrate.one_draw(
+            _FakeTask(),
+            {"spec": agents_core.extract_spec(PLAN), "spec_sha256": "abc"},
+            keys, _FakeInstrument(), 1))
+    finally:
+        agents_core.call_model = held[0]
+        agents_core.set_pacer(held[1])
+        agents_core.reset_call_log()
+    check("a draw whose call observed no completion still records what it asked "
+          "for and records None for what answered -- a request is a fact without "
+          "an answer, so the pair is asymmetric on purpose",
+          unobserved["outcome"] == run_eval.OUTCOME_GRADED
+          and unobserved.get("model_requested") == executor_model
+          and unobserved.get("model_returned") is None,
+          sorted(unobserved.items()))
+
+    # Three ways a file can carry no answering model, and they are not one state:
+    # the pair absent (the 100 files that predate it), `model_requested` set with
+    # `model_returned` None (asked, nothing answered), and both None (the call
+    # never reached a provider, so there was no sample to read a request off).
+    # A reader auditing the store has to be able to tell them apart, which is the
+    # whole reason none of the three is spelled the same way as another.
+    check("and the three no-answer shapes stay distinct: absent, asked-only, and "
+          "neither -- an infra loss carries both as None because `_draw` raised "
+          "before there was a sample to read a requested slug off",
+          (lost.get("model_requested"), lost.get("model_returned"))
+          == (None, None)
+          and (unobserved.get("model_requested"),
+               unobserved.get("model_returned")) == (executor_model, None)
+          and "model_requested" in lost and "model_requested" in unobserved,
+          [(lost.get("model_requested"), lost.get("model_returned")),
+           (unobserved.get("model_requested"),
+            unobserved.get("model_returned"))])
+
+    check("the store's shape moved 26 keys to 28 and by exactly these two, "
+          "checked against the key list the 100 existing draw files carry",
+          sorted(graded) == sorted(_DRAW_KEYS_BEFORE_THE_MODEL_PAIR
+                                   + ("model_requested", "model_returned"))
+          and len(graded) == 28,
+          sorted(set(graded) ^ set(_DRAW_KEYS_BEFORE_THE_MODEL_PAIR)))
+
+    # Normalisation is for the comparison, not for the record. Writing the
+    # normalised form would spend the pair's whole value: what makes a file
+    # auditable is the provider's own answer, and a store that silently rewrites
+    # `models/x` to `x` cannot later be asked which providers decorate slugs.
+    decorated = "models/" + executor_model
+    agents_core.MODEL_SLUG_NORMALISATIONS[decorated] = executor_model
+    try:
+        registered = drawn(returned=decorated)
+    finally:
+        del agents_core.MODEL_SLUG_NORMALISATIONS[decorated]
+    check("a registered decoration is written to the file as the provider said "
+          "it, not as the normalised form the comparison used",
+          registered["outcome"] == run_eval.OUTCOME_GRADED
+          and registered.get("model_returned") == decorated
+          and registered.get("model_requested") == executor_model,
+          (registered.get("model_requested"), registered.get("model_returned")))
+
+
 # The permutation `_task_order` produces for a ten-item list, read off the
 # implementation once and pinned here. Hardcoded rather than compared to a second
 # call: self-comparison pins determinism only, and every wrong-but-stable
@@ -8470,6 +8657,7 @@ def main():
         test_one_calibration_draw_records_why_the_executor_stopped,
         test_the_finish_reason_channel_reports_this_call_or_nothing,
         test_a_model_other_than_the_one_requested_halts_the_run,
+        test_a_draw_file_records_which_model_answered_it,
         # sprint 12, task 1: a stub draw must not be able to become a real one
         test_a_calibration_draw_records_what_produced_it,
         test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote,

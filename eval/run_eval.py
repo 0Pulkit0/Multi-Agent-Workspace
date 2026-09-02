@@ -561,6 +561,27 @@ def _finish_reason(call):
     return getattr(call, "record", {}).get("finish_reason")
 
 
+def _model_slugs(call):
+    """``(requested, returned)`` off a `call_role` return. Two claims, not one.
+
+    `model` on the call record is the slug this call *asked for*, resolved
+    against the provider actually attempted; `model_returned` is what the API
+    said answered. A store carrying only the first cannot be audited after the
+    fact, and a provider quietly serving a different model is the one failure in
+    that family that leaves no trace -- every other kind arrives as a 404 or an
+    empty completion.
+
+    Read through the same `getattr` as `_finish_reason` above and for the same
+    reason, not out of caution: a `call_role` stand-in may hand back a plain
+    2-tuple, and a stub has no slugs to lose, so it reads as the `(None, None)`
+    a call that never reached a provider gets. `agents_core.ModelMismatch`
+    already stops a *live* sweep the moment these two disagree; forwarding them
+    is what lets a sweep already on disk be checked for the same thing.
+    """
+    record = getattr(call, "record", {})
+    return record.get("model"), record.get("model_returned")
+
+
 def _draw(spec, keys):
     """One independent Executor sample from the spec.
 
@@ -578,8 +599,14 @@ def _draw(spec, keys):
         _spec_only_prompt(spec))
     text, provider = call
     code, _lang = harness.extract_code_block(text, allow_tests=False)
+    requested, returned = _model_slugs(call)
     return {"code": code, "provider": provider, "raw_len": len(text),
-            "finish_reason": _finish_reason(call)}
+            "finish_reason": _finish_reason(call),
+            # Named `model_requested` rather than `model` -- the call record's own
+            # spelling for the same fact -- so the pair reads as a pair here and
+            # in the draw file, and so a reader cannot mistake it for the
+            # provider. `call_model_detailed` already uses these two names.
+            "model_requested": requested, "model_returned": returned}
 
 
 def _gate(code, plan):

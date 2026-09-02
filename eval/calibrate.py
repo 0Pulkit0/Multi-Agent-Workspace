@@ -262,7 +262,34 @@ def one_draw(task, plan, keys, instrument, draw):
               # explicit `None`. An absent field is a third state and the resume
               # check treats it as one -- it is not evidence of a live draw, it
               # is evidence of a file written before anything recorded this.
-              "stub": stub_identity(instrument.stub)}
+              "stub": stub_identity(instrument.stub),
+              # What this draw asked for and what answered it. Declared here and
+              # not only in the success branch below, for the reason `stub` gives
+              # directly above: an absent field is a third state, and an infra
+              # loss must not read as a draw whose model was never in question.
+              # `None` on both means no completion was observed -- a stubbed draw,
+              # or a draw that died before the provider answered -- and never "the
+              # same as requested".
+              #
+              # On the draw file and not only on the call record, because the draw
+              # file is the artefact that outlives the process. Three models have
+              # been retired under this project mid-flight -- `gemini-2.0-flash`,
+              # `llama-3.3-70b-versatile`, `openai/gpt-oss-20b` -- and two cost a
+              # run; `d_t` computed over draws whose Executor was not the
+              # registered Executor is not a measurement of the registered
+              # Executor, and without these two fields there is nothing in the
+              # store to establish which it was. `agents_core.ModelMismatch`
+              # stops a live sweep at the first disagreement; this is how a sweep
+              # already on disk can be audited for the same thing.
+              #
+              # The 100 draw files already under `eval/calibration/seed-0/draws/`
+              # predate these keys and were deliberately not backfilled -- a
+              # written value would be invented provenance and a written `None`
+              # would be indistinguishable from a real absence -- so a reader
+              # spanning the store must treat *absent* as neither, exactly as
+              # `recorded_stub_identity` does for `stub`.
+              "model_requested": None,
+              "model_returned": None}
     try:
         sample = run_eval._draw(plan["spec"], keys)
         record.update({"provider_last": sample["provider"],
@@ -274,6 +301,13 @@ def one_draw(task, plan, keys, instrument, draw):
                        # the rate down as if the model had answered. `None` for a
                        # stubbed call; never defaulted to `"stop"`.
                        "finish_reason": sample.get("finish_reason"),
+                       # `.get` and not `[...]`, for the same reason
+                       # `finish_reason` uses it: a `_draw` stand-in that predates
+                       # these keys hands back a dict without them, and the
+                       # declared `None` above is then the honest answer rather
+                       # than a KeyError in the middle of a paid sweep.
+                       "model_requested": sample.get("model_requested"),
+                       "model_returned": sample.get("model_returned"),
                        "code_sha256": agents_core.sha256_of(sample["code"] or "")})
         record.update(run_eval.grade(sample["code"], task))
         record["outcome"] = run_eval.OUTCOME_GRADED
