@@ -183,6 +183,16 @@ class CaptureDetail(object):
         reply = agents_core.call_model_detailed(provider, api_key, system, user,
                                                 role=role)
         self.replies.append(reply)
+        # Standing in for `call_model` means keeping its whole contract, and
+        # parking the detail is part of it: `_attempt_provider` clears the channel
+        # before every attempt and reads `finish_reason` and `model_returned` off
+        # it afterwards. Without this line those two come back `None` on every
+        # call record a probe run writes -- the detail is not lost, it is in
+        # `self.replies`, but the record says no completion was observed when one
+        # was, and the requested-against-returned comparison in
+        # `_attempt_provider` has nothing to compare on the one path whose whole
+        # job is pinning a model.
+        agents_core.note_completion(reply)
         return reply["text"]
 
     def last(self):

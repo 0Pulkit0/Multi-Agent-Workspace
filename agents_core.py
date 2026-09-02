@@ -603,6 +603,67 @@ class DailyQuotaExhausted(Exception):
         self.retry_after = retry_after
 
 
+class ModelMismatch(Exception):
+    """The API answered as a model other than the one this call asked for.
+
+    Also deliberately **not** a `ProviderError`, for the reason
+    `DailyQuotaExhausted` gives above: every `except ProviderError` here means
+    "this call failed, record it and carry on", and `calibrate.one_draw` would
+    turn this into one `OUTCOME_INFRA_LOSS` and draw the next cell. A rate limit
+    is a fact about a cell. This is a fact about the whole run -- the draws
+    already on disk claim a model that did not answer them, so continuing adds
+    more of them.
+
+    Not retryable either, and for a stronger reason than a quota: a provider
+    serving an alias will serve the same alias on the next attempt, so a retry
+    spends a request to be told the same thing.
+
+    Why this is a halt and not a warning: three models have been retired under
+    this project mid-flight -- `gemini-2.0-flash`, `llama-3.3-70b-versatile`,
+    `openai/gpt-oss-20b` -- and two of them cost a run. Every other member of
+    that family announces itself as a 404 or an empty completion. A provider
+    quietly serving a different model than the slug requested is the one that
+    leaves no trace, and a warning line in a 108-cell grid is a line nobody
+    reads. A run whose Executor was not the registered Executor is not the run
+    D-16 describes, which is the same reasoning that makes a `prompt_sha256`
+    mismatch halt under addendum I rather than redraw one task.
+    """
+
+    def __init__(self, message, requested="", returned="", provider="", role=""):
+        Exception.__init__(self, message)
+        self.requested = requested or ""
+        self.returned = returned or ""
+        self.provider = provider or ""
+        self.role = role or ""
+
+
+# Slug rewrites that are known to be cosmetic, as {returned: requested}. Empty,
+# and empty on evidence rather than on optimism: across the 35 files in
+# `eval/results/` there are 133 completions carrying both fields -- 114 from groq
+# over `openai/gpt-oss-120b`, `openai/gpt-oss-20b` and `qwen/qwen3.8-27b`, and 19
+# from gemini over `gemini-3.6-flash` -- and requested equals returned in all 133,
+# including on Gemini's OpenAI-compatible endpoint, which is where a `models/`
+# prefix would have shown up if it were coming.
+#
+# It exists empty so that the *shape* of any future loosening is fixed in advance:
+# a decorated slug gets one entry here, in a diff that says which provider
+# decorated what, and never a looser comparison at the call site. `startswith`, an
+# `in`, or a strip of everything before the last `/` would each also accept a
+# genuinely different model, which is the failure this is here to catch.
+MODEL_SLUG_NORMALISATIONS = {}
+
+
+def normalise_model_slug(slug):
+    """A returned slug reduced to the form a requested slug is written in.
+
+    The identity, until a provider is *observed* decorating one. See
+    `MODEL_SLUG_NORMALISATIONS`.
+    """
+    if not slug:
+        return slug
+    return MODEL_SLUG_NORMALISATIONS.get(slug, slug)
+
+
 def _status_of(exc):
     """The HTTP status on an SDK exception, or None.
 
@@ -1659,6 +1720,14 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         # the pinned Executor -- so what this records is a known behaviour of the
         # endpoint, not a known defect in the model the sweep will use.
         "finish_reason": None,
+        # What answered, as against `model` above, which is what was asked for.
+        # Declared here for the same reason `finish_reason` is: this record is
+        # appended to CALL_LOG before the provider is touched and emitted on the
+        # failure path too, so a key that only appeared on success would make
+        # "absent" a third state that readers have to guess at. `None` means no
+        # real completion was observed -- a call that failed, or a stand-in that
+        # answered without one -- and never "the same as requested".
+        "model_returned": None,
         "attempts": 0,
         "retried": 0,
         "seconds_paced": 0.0,
@@ -1746,8 +1815,33 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         record["error"] = None
         record["status"] = None
         record["exc_class"] = ""
-        record["finish_reason"] = last_completion().get("finish_reason")
+        # One read of the side channel, not two: `finish_reason` and the returned
+        # slug are facts about the same completion, and two `last_completion()`
+        # calls could in principle straddle a `note_completion` from elsewhere.
+        detail = last_completion()
+        record["finish_reason"] = detail.get("finish_reason")
+        record["model_returned"] = detail.get("model_returned")
         _emit_call_event(record)
+        returned = normalise_model_slug(record["model_returned"])
+        # Absence is not a mismatch. `{}` from the side channel is a stubbed call
+        # -- roughly two dozen stand-ins across the offline suites replace
+        # `call_model` with something that returns a string and notes no
+        # completion -- and a provider that sends no `model` field at all is a
+        # provider that made no claim. Neither is evidence that a different model
+        # answered, and treating a falsy value as a failed comparison is how an
+        # empty container comes to answer for a measurement that never ran.
+        if returned and returned != record["model"]:
+            raise ModelMismatch(
+                "%s answered %s as %r when this call asked for %r. Not retried "
+                "and not scored as one cell's failure: a provider serving an "
+                "alias will serve it again, and a run whose %s was not the "
+                "registered model is not the run that was registered. Resolve "
+                "the slug -- or register the substitution -- before drawing "
+                "again. Draws already written claim %r."
+                % (provider, role, record["model_returned"], record["model"],
+                   role, record["model"]),
+                requested=record["model"], returned=record["model_returned"],
+                provider=provider, role=role)
         return text, record, None
     _emit_call_event(record)
     return None, record, error

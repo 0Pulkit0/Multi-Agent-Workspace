@@ -4963,7 +4963,15 @@ def test_d6_reasoning_format_is_installed_and_not_merely_registered():
           "max_tokens" not in sink[0], sorted(sink[0]))
 
 
-def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0):
+# "the slug that was requested" as a stub argument, distinct from `None`, which
+# is a provider that named no model. An empty container or a bare `None` standing
+# for "unset" is exactly how a run that never looked gets recorded as a run that
+# looked and found nothing.
+_SAME_MODEL = object()
+
+
+def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0,
+                   returned=_SAME_MODEL):
     """A `call_model_detailed` stand-in that stops for a reason of your choosing.
 
     It replaces `call_model_detailed` rather than `call_model`, unlike nearly
@@ -4976,6 +4984,12 @@ def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0):
 
     `fail_first` raises a retryable 429 on that many leading attempts, so the
     "which attempt does the record describe" question can be asked.
+
+    `returned` is what the API claims answered. The default is the slug that was
+    requested, which is what all 133 completions in `eval/results/` carrying both
+    fields did. Pass a different string for a provider that served something else,
+    or `None` for one that named no model at all -- those are different claims and
+    only the first is a mismatch.
     """
     state = {"attempts": 0}
 
@@ -4990,7 +5004,8 @@ def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0):
                                             retry_after=0.0)
         model = agents_core.model_for(role, provider)
         params = agents_core.sampling_for(role)
-        return {"text": text, "model_requested": model, "model_returned": model,
+        return {"text": text, "model_requested": model,
+                "model_returned": model if returned is _SAME_MODEL else returned,
                 "usage": None, "finish_reason": finish_reason, "params": params,
                 "extra_body": agents_core.split_params(params)[1],
                 "reasoning_chars": 0}
@@ -4998,7 +5013,7 @@ def _detailed_stub(finish_reason, text=GOOD_CODE, counter=None, fail_first=0):
 
 
 def _with_detailed_stub(finish_reason, thunk, text=GOOD_CODE, counter=None,
-                        fail_first=0):
+                        fail_first=0, returned=_SAME_MODEL):
     """Run `thunk` with that stand-in installed, a free pacer and no backoff.
 
     The pacer and the retry sleep are both replaced because the real ones are
@@ -5008,7 +5023,7 @@ def _with_detailed_stub(finish_reason, thunk, text=GOOD_CODE, counter=None,
     held = (agents_core.call_model_detailed, agents_core.PACER)
     previous_sleep = agents_core.set_retry_sleep(lambda seconds: None)
     agents_core.call_model_detailed = _detailed_stub(
-        finish_reason, text, counter, fail_first)
+        finish_reason, text, counter, fail_first, returned)
     agents_core.set_pacer(agents_core.Pacer({}, default=0,
                                             sleep=lambda seconds: None))
     try:
@@ -5764,6 +5779,208 @@ def test_the_finish_reason_channel_reports_this_call_or_nothing():
           "as an error -- `test_pipeline.py` installs exactly that one",
           run_eval._finish_reason(("some text", "groq")) is None
           and run_eval._finish_reason(None) is None)
+
+
+def test_a_model_other_than_the_one_requested_halts_the_run():
+    """"We asked for X" and "X answered" are two claims, and only one was checked.
+
+    `call_model_detailed` has recorded `model_requested` and `model_returned`
+    since it was written, and `_attempt_provider` read `finish_reason` off the
+    same side channel and left the returned slug on it. Three models have been
+    retired under this project mid-flight and two cost a run; every other member
+    of that family arrives as a 404 or an empty completion. A provider quietly
+    serving a different model is the one that leaves no trace, so it is the one
+    that needs the comparison made rather than recorded for later.
+
+    A halt and not a warning, for the reason `DailyQuotaExhausted` is not a
+    `ProviderError`: `one_draw` catches `ProviderError` and scores it as one
+    cell's infra loss, and a run whose Executor was not the registered Executor
+    is not one bad cell. It is every cell already on disk.
+    """
+    run_eval = _import_run_eval()
+    calibrate = _import_calibrate()
+    keys = {"groq": "k" * 12}
+    plan = _plan_fixture()
+    executor_model = agents_core.model_for("executor", "groq")
+
+    agents_core.reset_call_log()
+    agreed_raise = None
+    try:
+        _with_detailed_stub("stop", lambda: _with_measurement(
+            True, lambda: run_eval._draw(plan["spec"], keys)))
+    except agents_core.ModelMismatch as exc:
+        agreed_raise = str(exc)
+    agreed = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("the model that answered is on the call record beside the model that "
+          "was asked for, so the two can be compared in the store and not only "
+          "inside the call",
+          agreed_raise is None and len(agreed) == 1
+          and agreed[0]["model_returned"] == executor_model
+          and agreed[0]["model"] == executor_model,
+          agreed_raise or [(r["model"], r.get("model_returned", "<absent>"))
+                           for r in agreed])
+
+    # A `call_model` stand-in -- the shape roughly two dozen checks in these
+    # suites install -- notes no completion at all. `{}` from the side channel
+    # means nothing was observed, and an unobserved slug is not a wrong slug.
+    # This is the check that keeps a falsy value from answering for a comparison
+    # that never ran.
+    #
+    # Both absence probes catch `ModelMismatch` and report it as a value rather
+    # than letting it propagate. A test that only crashes here would take every
+    # check below it down with it, and the checks below it are the ones covering
+    # the case this one is the mirror of.
+    agents_core.reset_call_log()
+    held = (agents_core.call_model, agents_core.PACER)
+    wrongly_raised = None
+    try:
+        agents_core.set_pacer(agents_core.Pacer({}, default=0,
+                                                sleep=lambda seconds: None))
+        agents_core.call_model = (
+            lambda provider, api_key, system, user, role=None: GOOD_CODE)
+        try:
+            stubbed = _with_measurement(
+                True, lambda: run_eval._draw(plan["spec"], keys))
+        except agents_core.ModelMismatch as exc:
+            stubbed, wrongly_raised = {"code": None}, str(exc)
+    finally:
+        agents_core.call_model = held[0]
+        agents_core.set_pacer(held[1])
+    records = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("a stubbed call records no answering model and is not treated as a "
+          "mismatch, because absence of an observation is not an observation",
+          wrongly_raised is None and stubbed["code"] and len(records) == 1
+          and records[0]["model_returned"] is None
+          and "model_returned" in records[0],
+          wrongly_raised or [(r["ok"], r.get("model_returned", "<absent>"))
+                             for r in records])
+
+    # And a live provider that names no model in its response: it made no claim,
+    # so there is nothing to contradict. Distinct from the case above, which is
+    # our own stand-in, and it fails separately.
+    agents_core.reset_call_log()
+    wrongly_raised = None
+    try:
+        silent = _with_detailed_stub("stop", lambda: _with_measurement(
+            True, lambda: run_eval._draw(plan["spec"], keys)), returned=None)
+    except agents_core.ModelMismatch as exc:
+        silent, wrongly_raised = {"code": None}, str(exc)
+    records = list(agents_core.CALL_LOG)
+    agents_core.reset_call_log()
+    check("a provider that names no model in its reply is not a mismatch either "
+          "-- it made no claim, and there is nothing to contradict",
+          wrongly_raised is None and silent["code"]
+          and records[0]["model_returned"] is None,
+          wrongly_raised or records)
+
+    def draw_with(returned, attempts=3, event_path=None):
+        agents_core.reset_call_log()
+        previous = agents_core.set_retry_attempts(attempts)
+        previous_log = None
+        if event_path is not None:
+            previous_log = agents_core.set_event_log(
+                agents_core.EventLog(event_path,
+                                     context={"run_id": "run-mismatch"},
+                                     keys=keys))
+        try:
+            raised = None
+            try:
+                _with_detailed_stub("stop", lambda: _with_measurement(
+                    True, lambda: run_eval._draw(plan["spec"], keys)),
+                    returned=returned)
+            except agents_core.ModelMismatch as exc:
+                raised = exc
+        finally:
+            agents_core.set_retry_attempts(previous)
+            if event_path is not None:
+                agents_core.set_event_log(previous_log)
+        records = list(agents_core.CALL_LOG)
+        agents_core.reset_call_log()
+        return raised, records
+
+    out = tempfile.mkdtemp(prefix="mismatch-events-")
+    try:
+        events_path = os.path.join(out, "run-mismatch.events.jsonl")
+        raised, records = draw_with("openai/gpt-oss-20b",
+                                    event_path=events_path)
+        events = [json.loads(line)
+                  for line in _lines_of(events_path).splitlines()]
+        calls = [event for event in events
+                 if event["kind"] == agents_core.EVENT_CALL]
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    check("a provider answering as a different model raises, and the message "
+          "names both slugs, the provider and the role rather than leaving the "
+          "reader to diff two log lines",
+          raised is not None and "openai/gpt-oss-20b" in str(raised)
+          and executor_model in str(raised) and "groq" in str(raised)
+          and "executor" in str(raised),
+          str(raised)[:220])
+    check("and the call event is written before the raise, so the evidence for "
+          "the halt is on the run's log and not only in this process's memory",
+          len(calls) == 1 and calls[0]["model"] == executor_model
+          and calls[0]["model_returned"] == "openai/gpt-oss-20b",
+          [(event["kind"], event.get("model"), event.get("model_returned"))
+           for event in events])
+    check("not retried, though three attempts were allowed: an alias is served "
+          "again on the next attempt, so a retry spends a request to be told the "
+          "same thing",
+          len(records) == 1 and records[0]["attempts"] == 1
+          and records[0]["retried"] == 0,
+          [(r["attempts"], r["retried"]) for r in records])
+
+    check("`ModelMismatch` is not a `ProviderError`, which is the whole of how "
+          "the halt reaches the runner instead of being absorbed one cell at a "
+          "time -- the same reasoning `DailyQuotaExhausted` is built on",
+          not issubclass(agents_core.ModelMismatch, agents_core.ProviderError)
+          and not issubclass(agents_core.ModelMismatch,
+                             agents_core.DailyQuotaExhausted),
+          agents_core.ModelMismatch.__mro__)
+
+    # The claim above, exercised through the real absorber rather than asserted
+    # about the class: `one_draw`'s `except agents_core.ProviderError` is what
+    # would have turned this into one `OUTCOME_INFRA_LOSS` and drawn the next
+    # cell.
+    agents_core.reset_call_log()
+    escaped = "no"
+    try:
+        _with_detailed_stub("stop", lambda: _with_measurement(
+            True, lambda: calibrate.one_draw(
+                _FakeTask(),
+                {"spec": agents_core.extract_spec(PLAN), "spec_sha256": "abc"},
+                keys, _FakeInstrument(), 1)),
+            returned="openai/gpt-oss-20b")
+    except agents_core.ModelMismatch:
+        escaped = "yes"
+    agents_core.reset_call_log()
+    check("so `calibrate.one_draw` does not score it as that cell's infra loss: "
+          "it comes out through the draw loop instead of into a draw file",
+          escaped == "yes", escaped)
+
+    check("the slug normalisation is one named function and its table is empty, "
+          "measured rather than assumed -- all 133 completions in eval/results "
+          "carrying both fields returned exactly what was requested",
+          agents_core.MODEL_SLUG_NORMALISATIONS == {}
+          and agents_core.normalise_model_slug("models/x") == "models/x"
+          and agents_core.normalise_model_slug(None) is None,
+          agents_core.MODEL_SLUG_NORMALISATIONS)
+
+    # And the seam works when a decoration is registered, without the comparison
+    # itself being loosened: a `startswith` or a strip-to-last-slash would accept
+    # the second slug here as well as the first.
+    decorated = "models/" + executor_model
+    agents_core.MODEL_SLUG_NORMALISATIONS[decorated] = executor_model
+    try:
+        registered, _ = draw_with(decorated)
+        still_wrong, _ = draw_with("models/some-other-model")
+    finally:
+        del agents_core.MODEL_SLUG_NORMALISATIONS[decorated]
+    check("a registered decoration is accepted and an unregistered different "
+          "model is still refused, so registering one is not loosening the test",
+          registered is None and still_wrong is not None,
+          (registered, str(still_wrong)[:120]))
 
 
 # The permutation `_task_order` produces for a ten-item list, read off the
@@ -8252,6 +8469,7 @@ def main():
         test_a_calibration_truncation_reads_as_an_artifact_not_a_model_failure,
         test_one_calibration_draw_records_why_the_executor_stopped,
         test_the_finish_reason_channel_reports_this_call_or_nothing,
+        test_a_model_other_than_the_one_requested_halts_the_run,
         # sprint 12, task 1: a stub draw must not be able to become a real one
         test_a_calibration_draw_records_what_produced_it,
         test_a_run_refuses_to_resume_onto_draws_a_different_kind_of_run_wrote,
