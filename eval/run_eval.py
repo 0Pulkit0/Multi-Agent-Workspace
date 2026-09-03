@@ -184,14 +184,37 @@ class RateGovernor(object):
         return slept
 
     def note_429(self, provider, retry_after, attempt):
-        """Record the 429 and return how long to wait before retrying."""
+        """Record the 429 and return how long to wait before retrying.
+
+        The provider's header beats our own backoff when it is there -- it knows
+        when its window resets and we are guessing -- but only up to
+        `agents_core.MAX_RETRY_AFTER_SECONDS`. Registered as addendum K section 6.
+
+        That constant is `agents_core`'s and not a second one of our own on
+        purpose. `retry_environment()` publishes it into every manifest under a
+        docstring reading "This is those constants, as installed, at run time",
+        and on the eval path that sentence was false: the layer that holds the
+        constant is pinned to one attempt, and this is the layer that actually
+        sleeps. A manifest recording a 120s ceiling was written for a run that
+        slept 5h34m. Two numbers for one policy is how that happened, so there is
+        still only one number.
+
+        `retry_after` is recorded as the provider sent it and `waited` as we took
+        it, with `capped` saying which. A capped wait must not read back as a
+        short header -- the gap between the two is the evidence that a multi-hour
+        header arrived at all.
+        """
         wait = retry_after
+        capped = False
         if wait is None:
             wait = FALLBACK_BACKOFF[min(attempt, len(FALLBACK_BACKOFF) - 1)]
+        elif wait > agents_core.MAX_RETRY_AFTER_SECONDS:
+            wait = agents_core.MAX_RETRY_AFTER_SECONDS
+            capped = True
         self.rate_limits.append({
             "provider": provider, "retry_after": retry_after,
             "waited": round(wait, 2), "attempt": attempt + 1,
-            "at": round(time.time(), 3),
+            "at": round(time.time(), 3), "capped": capped,
             "source": "header" if retry_after is not None else "backoff"})
         return wait
 
@@ -2192,6 +2215,13 @@ def main(argv=None):
                          "governor_applied": stub is None,
                          "governor_max_429_retries": MAX_429_RETRIES,
                          "governor_fallback_backoff": list(FALLBACK_BACKOFF),
+                         # The cap on an honoured header, recorded on the layer
+                         # that actually sleeps. `agents_core_retry` below carries
+                         # the same number, but that block describes a layer pinned
+                         # to one attempt on this path, so on its own it was a
+                         # ceiling stated by a manifest and not in force anywhere.
+                         "governor_max_retry_after_seconds":
+                             agents_core.MAX_RETRY_AFTER_SECONDS,
                          # A separate budget from the 429 one, counted separately
                          # per call: a single 503 must not eat a quarter of the
                          # rate-limit budget and strand the run on the storm that

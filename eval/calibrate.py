@@ -989,6 +989,11 @@ def build_manifest(args, tasks, lock, verdict, per_task, projection, spent,
                    "governor_applied": stub is None,
                    "governor_max_429_retries": run_eval.MAX_429_RETRIES,
                    "governor_fallback_backoff": list(run_eval.FALLBACK_BACKOFF),
+                   # On the layer that sleeps. `agents_core_retry` carries the same
+                   # constant, but that layer is pinned to one attempt here, so read
+                   # alone it stated a ceiling nothing was enforcing.
+                   "governor_max_retry_after_seconds":
+                       agents_core.MAX_RETRY_AFTER_SECONDS,
                    "rate_limits": governor.rate_limits,
                    # Separate from `rate_limits` because that list is printed as
                    # "429 <provider> Retry-After=..." and a 503 in it would be

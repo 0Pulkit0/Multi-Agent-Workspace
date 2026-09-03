@@ -8993,6 +8993,124 @@ def test_the_wrapper_reports_its_waiting_onto_the_call_record():
         agents_core.set_measurement_mode(was)
 
 
+def _method_body(path, class_name, method_name):
+    """One method's `(def, docstring-free body)` in `path`, by AST not by grep.
+
+    Docstring-free because the checks below are about what the interpreter reads.
+    `note_429` explains in prose why the cap is not a literal in its own body, so
+    the word "120" is in that method on purpose; a grep for the number would fail
+    on the sentence that exists to justify the code being right.
+    """
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+            continue
+        for item in node.body:
+            if not (isinstance(item, ast.FunctionDef)
+                    and item.name == method_name):
+                continue
+            body = item.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]
+            return item, body
+    raise AssertionError("no %s.%s in %s" % (class_name, method_name, path))
+
+
+def test_the_governor_honours_the_cap_the_manifest_already_advertised():
+    """Addendum K section 6: the sleeping layer consults the published bound.
+
+    `agents_core.MAX_RETRY_AFTER_SECONDS` was reachable from the manifest and from
+    `_retry_after_of` -- and from nothing on the eval path, because the layer that
+    holds it is pinned to one attempt there and `note_429` is the layer that
+    actually sleeps. So a manifest could state a 120s ceiling for a run that slept
+    5h34m. These pin that the number is now in force where the sleep happens, and
+    that it is still one number rather than two.
+    """
+    run_eval = _import_run_eval()
+    cap = agents_core.MAX_RETRY_AFTER_SECONDS
+    governor = run_eval.RateGovernor()
+
+    waited = governor.note_429("groq", 20036.4, 0)
+    check("a multi-hour header is honoured only up to the cap, so the wait that "
+          "produced a 5h34m draw is no longer reachable through this path",
+          waited == cap, waited)
+    event = governor.rate_limits[-1]
+    check("the header is recorded as the provider sent it and the wait as we "
+          "took it, so a capped wait cannot read back as a short header",
+          event["retry_after"] == 20036.4 and event["waited"] == round(cap, 2)
+          and event["capped"] is True, event)
+    check("and it still says the wait came from the header, because it did -- "
+          "`capped` is the second fact, not a replacement for the first",
+          event["source"] == "header", event)
+
+    waited = governor.note_429("groq", 12.0, 0)
+    check("a header inside the cap is honoured unchanged and is not marked "
+          "capped",
+          waited == 12.0 and governor.rate_limits[-1]["capped"] is False,
+          governor.rate_limits[-1])
+    waited = governor.note_429("groq", float(cap), 0)
+    check("the cap itself is not treated as exceeding the cap",
+          waited == cap and governor.rate_limits[-1]["capped"] is False,
+          governor.rate_limits[-1])
+
+    waited = governor.note_429("groq", None, 2)
+    check("a missing header still falls back to our own schedule, uncapped by "
+          "this change because every rung of it is already under the cap",
+          waited == run_eval.FALLBACK_BACKOFF[2]
+          and governor.rate_limits[-1]["capped"] is False
+          and governor.rate_limits[-1]["source"] == "backoff",
+          governor.rate_limits[-1])
+    check("and every rung of that schedule is in fact under the cap, which is "
+          "the assumption the line above rests on",
+          all(rung <= cap for rung in run_eval.FALLBACK_BACKOFF)
+          and all(rung <= cap for rung in run_eval.FALLBACK_5XX_BACKOFF),
+          (run_eval.FALLBACK_BACKOFF, run_eval.FALLBACK_5XX_BACKOFF))
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    grid = os.path.join(here, "eval", "run_eval.py")
+    _node, body = _method_body(grid, "RateGovernor", "note_429")
+    literals, reads = set(), set()
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Constant) and isinstance(
+                    node.value, (int, float)) and not isinstance(
+                        node.value, bool):
+                literals.add(node.value)
+            elif (isinstance(node, ast.Attribute)
+                  and isinstance(node.value, ast.Name)
+                  and node.value.id == "agents_core"):
+                reads.add(node.attr)
+    check("the cap is read from `agents_core` rather than copied into a second "
+          "constant here, which is how the manifest came to disagree with the run",
+          "MAX_RETRY_AFTER_SECONDS" in reads, sorted(reads))
+    check("and the number itself is nowhere in the method, so the two cannot "
+          "drift -- by AST, because the docstring says 120 on purpose and a grep "
+          "would fail on the prose written to explain the code",
+          cap not in literals, sorted(literals))
+
+    node, body = _method_body(grid, "RateGovernor", "note_server_error")
+    named = set(argument.arg for argument in node.args.args)
+    for statement in body:
+        for child in ast.walk(statement):
+            if isinstance(child, ast.Name):
+                named.add(child.id)
+            elif isinstance(child, ast.Attribute):
+                named.add(child.attr)
+    check("and `note_server_error` reads no header at all, so the new path did "
+          "not reintroduce the hole the cap closes -- it is not passed one, and "
+          "it reaches for neither the field nor the headers it would come from",
+          not named & set(["retry_after", "headers", "response"]), sorted(named))
+
+    check("both manifests state the bound on the layer that enforces it, not "
+          "only on the pinned layer below",
+          "governor_max_retry_after_seconds" in _lines_of(grid)
+          and "governor_max_retry_after_seconds" in _lines_of(
+              os.path.join(here, "eval", "calibrate.py")), "")
+
+
 def main():
     for fn in (
         test_pipeline_is_explicit, test_mode_2_skips_execution,
@@ -9144,6 +9262,9 @@ def main():
         test_a_5xx_is_classified_off_the_status_and_never_off_the_message,
         test_every_http_attempt_is_counted_where_it_happens,
         test_the_wrapper_reports_its_waiting_onto_the_call_record,
+        # addendum K section 6: the sleeping layer honours the cap the manifest
+        # was already advertising on the layer below it
+        test_the_governor_honours_the_cap_the_manifest_already_advertised,
     ):
         print("\n-- %s" % fn.__name__)
         try:
