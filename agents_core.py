@@ -2051,7 +2051,20 @@ _TEST_RULES = (
     "Never write assertions that would pass against an unimplemented stub -- "
     "`assert callable(f)`, `assert f is not None` and `assert hasattr(...)` are "
     "rejected, because they prove nothing.\n"
-    "- Cover the normal cases AND at least one edge case.\n"
+    "- Coverage scales with the SPEC, not with a constant: at least one "
+    "assertion per behaviour the SPEC states, plus the boundaries those "
+    "behaviours imply -- empty input, one element, ties, zero, negatives, "
+    "duplicates.\n"
+    "- Error behaviour is counted separately and must be EXERCISED, not "
+    "described. For every error the SPEC states, reach it:\n"
+    "    try:\n"
+    "        median([])\n"
+    "        assert False, 'expected ValueError on empty input'\n"
+    "    except ValueError:\n"
+    "        pass\n"
+    "  Name the exception in the `except`. A suite that reaches no stated error "
+    "path is rejected and regenerated, because the SPEC's error rules are the "
+    "half of the behaviour a passing run would otherwise never test.\n"
     "- Standard library only. No network, no file I/O, no subprocesses, no "
     "input(). Must finish within %d seconds.\n"
     % harness.EXEC_TIMEOUT_SECONDS
@@ -2716,43 +2729,75 @@ def _candidates_for_log(candidates):
     return [{name: cand.get(name) for name in keep} for cand in candidates]
 
 
+def _coverage_gap(audit):
+    """The stated errors the suite never reaches, as one prose clause.
+
+    Empty string when there is no gap, so the caller can treat it as the second
+    rejection reason without a second boolean. The quoted sentence is what makes
+    the banner actionable: naming `ValueError` alone does not say which of the
+    spec's rules went untested.
+    """
+    if audit is None or not audit.uncovered:
+        return ""
+    parts = ["`%s`, from \"%s\"" % (name, clamp(text, 160))
+             for name, text in audit.uncovered]
+    return ("the SPEC states error behaviour the suite never reaches: %s"
+            % "; ".join(parts))
+
+
 def _resolve_tests(run, plan, keys, emit, user_tests):
     """Settle on an acceptance suite, and refuse to trust a vacuous one.
 
     User-supplied tests always win. A generated suite is audited; if it proves
     nothing it is regenerated exactly once, and if it still proves nothing the
     run is left UNVERIFIED rather than reporting a false APPROVED.
+
+    An error-coverage gap spends the same single regeneration and then *stops*
+    blocking: a suite that asserts real values but skips a stated error path is
+    used, loudly, with the gap named in the feed and in `tests_summary`. That is
+    a deliberate asymmetry against the vacuity gate. Vacuity means the suite
+    cannot support APPROVED at all; a coverage gap means it supports a narrower
+    claim than the spec, which is worth stating rather than worth refusing.
     """
     if user_tests and user_tests.strip():
         run.tests = user_tests if user_tests.endswith("\n") else user_tests + "\n"
         run.tests_status = TESTS_USER
-        audit = harness.audit_tests(run.tests)
+        audit = harness.audit_tests(run.tests, spec=run.spec)
         run.tests_summary = audit.summary()
         # The user's own suite wins even if the audit dislikes it -- but say so.
         if not audit.ok:
             emit("system", "Using your suite despite the audit: %s" % audit.reason)
+        gap = _coverage_gap(audit)
+        if gap:
+            emit("system", "Using your suite as given, and noting that %s" % gap)
         emit("tests", _tests_entry(run, audit))
         return
 
     candidate = extract_tests(plan)
     if candidate:
-        audit = harness.audit_tests(candidate)
-        if audit.ok:
+        audit = harness.audit_tests(candidate, spec=run.spec)
+        reason = audit.reason if not audit.ok else _coverage_gap(audit)
+        if not reason:
             run.tests, run.tests_status = candidate, TESTS_GENERATED
             run.tests_summary = audit.summary()
             emit("tests", _tests_entry(run, audit))
             return
-        emit("system", "Rejected the Planner's acceptance suite: %s" % audit.reason)
+        emit("system", "Rejected the Planner's acceptance suite: %s" % reason)
     else:
         emit("system", "The Planner emitted no TESTS block; asking for one.")
 
-    # One regeneration attempt, told exactly why the last one was rejected.
+    # One regeneration attempt, told exactly why the last one was rejected -- and
+    # for a coverage gap, told to keep what it had. A suite that asserts real
+    # values must not be thrown away to buy a `try/except`.
     request = "SPEC:\n%s" % clamp(run.spec, MAX_SPEC_CHARS)
     if candidate:
+        fix = ("Keep every assertion that already asserts a real value and ADD "
+               "one `try`/`except` per error the SPEC states."
+               if audit.ok else
+               "Write a suite that asserts real computed values.")
         request += ("\n\nYour previous suite was REJECTED because: %s\n\n"
-                    "Rejected suite:\n```python\n%s```\n"
-                    "Write a suite that asserts real computed values."
-                    % (audit.reason, clamp(candidate, MAX_SPEC_CHARS)))
+                    "Rejected suite:\n```python\n%s```\n%s"
+                    % (reason, clamp(candidate, MAX_SPEC_CHARS), fix))
     try:
         raw, _ = call_role("test_writer", keys, PROMPTS["test_writer"], request, emit)
     except ProviderError as exc:
@@ -2767,11 +2812,22 @@ def _resolve_tests(run, plan, keys, emit, user_tests):
         return
 
     retry = harness.extract_code_block(raw, allow_tests=True)[0]
-    audit2 = harness.audit_tests(retry) if retry else None
+    audit2 = harness.audit_tests(retry, spec=run.spec) if retry else None
     if audit2 is not None and audit2.ok:
         run.tests, run.tests_status = retry, TESTS_REGENERATED
         run.tests_summary = audit2.summary()
         emit("tests", _tests_entry(run, audit2))
+        gap = _coverage_gap(audit2)
+        if gap:
+            # Loud, and the run continues. Blocking here would trade a suite that
+            # tests most of the spec for no suite at all, and the honest thing is
+            # to narrow the claim rather than withdraw it.
+            emit("system",
+                 "**The suite gating this run has a coverage gap.** One "
+                 "regeneration was spent trying to close it and did not: %s. "
+                 "APPROVED below therefore means \"passed the suite that "
+                 "exists\", not \"implements the SPEC\" -- a program that skips "
+                 "the stated error handling can still reach it." % gap)
         return
 
     reason = (audit2.reason if audit2 is not None

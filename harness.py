@@ -34,6 +34,7 @@ layers were live for a given run -- never assume the strongest one was.
 """
 
 import ast
+import builtins
 import os
 import platform
 import re
@@ -46,7 +47,7 @@ import textwrap
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Wall-clock ceiling for a single execution.
 EXEC_TIMEOUT_SECONDS = 15
@@ -1693,12 +1694,27 @@ class TestAudit:
     stub_exit: Optional[int] = None
     stub_stderr: str = ""
     vacuous: bool = False
+    # Error-coverage, populated only when a spec was supplied and the suite got
+    # far enough to be worth measuring. `clauses` is what the spec states,
+    # `reached` what the suite names, `uncovered` the difference. All three stay
+    # empty when no spec is passed, which is why every caller that only wants the
+    # vacuity verdict is unaffected by this pair of gates existing.
+    clauses: List[Tuple[str, str]] = field(default_factory=list)
+    reached: List[str] = field(default_factory=list)
+    uncovered: List[Tuple[str, str]] = field(default_factory=list)
 
     def summary(self):
-        if self.ok:
-            return "%d assert(s) over %s -- fails against a stub, so it tests something" % (
-                self.assert_count, ", ".join(self.names) or "the solution module")
-        return self.reason
+        if not self.ok:
+            return self.reason
+        text = "%d assert(s) over %s -- fails against a stub, so it tests something" % (
+            self.assert_count, ", ".join(self.names) or "the solution module")
+        if self.uncovered:
+            text += "; %d of %d stated error(s) unexercised: %s" % (
+                len(self.uncovered), len(self.clauses),
+                ", ".join(name for name, _ in self.uncovered))
+        elif self.clauses:
+            text += "; all %d stated error(s) exercised" % len(self.clauses)
+        return text
 
 
 def _solution_names(tree):
@@ -1735,8 +1751,141 @@ def _stub_source(names):
     return "\n".join(lines) + "\n"
 
 
-def audit_tests(test_source, timeout=EXEC_TIMEOUT_SECONDS):
-    """Decide whether a suite is non-vacuous enough to gate APPROVED on."""
+# --------------------------------------------------------------------------
+# does the suite reach the errors the spec states?
+# --------------------------------------------------------------------------
+#
+# The prompt half of this lives in `agents_core._TEST_RULES` and is unmeasured
+# by construction: a model can be told to exercise every stated error and
+# simply not. This is the half that does not depend on a model obeying
+# anything -- the spec's prose names the exception, the suite's AST either puts
+# that name in an executable position or it does not.
+#
+# Both halves live here rather than split across modules because the *pairing*
+# is the mechanism, and the suite side has to read the tree `audit_tests`
+# already parsed.
+
+# Built from `builtins` rather than listed. `StopIteration` and
+# `KeyboardInterrupt` end in neither `Error` nor `Exception`, so no suffix rule
+# would catch them, and a hand-written list would drift from the interpreter the
+# child actually runs.
+_BUILTIN_EXCEPTIONS = frozenset(
+    name for name in dir(builtins)
+    if isinstance(getattr(builtins, name), type)
+    and issubclass(getattr(builtins, name), BaseException))
+
+# A spec may define its own, and by convention it is suffixed. Requiring the
+# suffix is what keeps `Decimal`, `Counter` and every other capitalised name out.
+_CUSTOM_EXCEPTION = re.compile(r"\A[A-Z][A-Za-z0-9_]*(?:Error|Exception)\Z")
+
+# The verb is required. A spec that merely mentions `ValueError` in passing --
+# "returns 0 rather than a ValueError" -- states no error behaviour, and reading
+# a bare mention as a clause would spend a Test Writer call on nothing.
+_RAISE_VERB = re.compile(r"\b(?:rais\w*|reject\w*|throw\w*|refus\w*|error out)\b",
+                         re.I)
+
+# The negations that invert a clause: "never raises", "does not raise",
+# "instead of raising", "without raising". Scoped to the handful of words
+# immediately before the verb, because that is where English puts them.
+_NEGATED = re.compile(
+    r"\b(?:never|not|n't|without|no|instead of|rather than|avoid\w*)\b"
+    r"[^.;:]{0,24}\Z", re.I)
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.;:!?])\s+|\n+")
+
+# A handler that names one of these reaches any error path, so it credits every
+# clause. Generous on purpose, and the vacuity gate is what stops it being a
+# hole: a suite whose asserts all sit inside a broad `except` also swallows the
+# stub's `NotImplementedError`, exits 0 against the stub, and is rejected as
+# vacuous before coverage is ever consulted.
+_CATCH_ALL = frozenset(("Exception", "BaseException"))
+
+
+def _exception_names(text):
+    """Exception-shaped names in `text`, in order of appearance, no duplicates."""
+    found = []
+    for match in re.finditer(r"\b[A-Za-z_]\w*\b", text):
+        name = match.group(0)
+        if name in found:
+            continue
+        if name in _BUILTIN_EXCEPTIONS or _CUSTOM_EXCEPTION.match(name):
+            found.append(name)
+    return found
+
+
+def spec_error_clauses(spec):
+    """The error behaviours a spec states, as ``(exception, sentence)`` pairs.
+
+    Prose in, exception names out, one clause per distinct name. Biased towards
+    false positives on purpose: a clause that is not really a clause costs one
+    Test Writer call and a banner naming it, while a missed clause costs a suite
+    that never touches the error path the candidate is graded on. The asymmetry
+    is the whole design.
+
+    Stated limits, none of them claims of completeness. A clause is scoped to one
+    sentence, so a name and its verb must co-occur there. An error stated without
+    naming an exception -- "raises on empty input" -- yields nothing, because
+    there is no name to match against the suite's AST. And the first sentence to
+    name an exception is the one quoted for it; a second mention adds no clause.
+    """
+    clauses, seen = [], set()
+    for sentence in _SENTENCE_SPLIT.split(spec or ""):
+        sentence = " ".join(sentence.split())
+        if not sentence:
+            continue
+        verb = _RAISE_VERB.search(sentence)
+        if verb is None or _NEGATED.search(sentence[:verb.start()]):
+            continue
+        for name in _exception_names(sentence):
+            if name not in seen:
+                seen.add(name)
+                clauses.append((name, sentence))
+    return clauses
+
+
+def _named_exceptions(node):
+    """Exception names inside an `except` type or a call argument."""
+    found = set()
+    for inner in ast.walk(node):
+        name = None
+        if isinstance(inner, ast.Name):
+            name = inner.id
+        elif isinstance(inner, ast.Attribute):
+            name = inner.attr
+        if name and (name in _BUILTIN_EXCEPTIONS or _CUSTOM_EXCEPTION.match(name)):
+            found.add(name)
+    return found
+
+
+def suite_error_reach(tree):
+    """Exception names the suite puts in an executable position.
+
+    Two positions count, and both are AST facts rather than text matches: the
+    type of an `except` handler, and an argument to a call -- which is how a
+    helper names the exception it expects, as in `assert_raises(ValueError, f, x)`
+    or `with raises(KeyError):`. A bare `except:` counts as nothing, because it
+    names nothing. A name in a comment or a string counts as nothing either.
+    """
+    reached = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            reached |= _named_exceptions(node.type)
+        elif isinstance(node, ast.Call):
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                reached |= _named_exceptions(arg)
+    return reached
+
+
+def audit_tests(test_source, timeout=EXEC_TIMEOUT_SECONDS, spec=None):
+    """Decide whether a suite is non-vacuous enough to gate APPROVED on.
+
+    Two gates, in order, and the order is the point. Vacuity is hard and decides
+    `ok`: a suite that passes against a stub proves nothing and cannot gate
+    anything. Error coverage is soft and only decides `uncovered`, because a
+    suite that asserts real values but skips a stated error path is worth less
+    than it should be and still worth more than nothing. `spec` is optional, so a
+    caller with no spec in hand gets exactly the old verdict.
+    """
     audit = TestAudit()
     if not test_source or not test_source.strip():
         audit.reason = "no test source was produced"
@@ -1784,6 +1933,16 @@ def audit_tests(test_source, timeout=EXEC_TIMEOUT_SECONDS):
         return audit
 
     audit.ok = True
+
+    # Second gate. Only reached by a suite that already survived the first, so
+    # `uncovered` never competes with `vacuous` for the rejection reason.
+    audit.clauses = spec_error_clauses(spec) if spec else []
+    if audit.clauses:
+        reached = suite_error_reach(tree)
+        audit.reached = sorted(reached)
+        if not reached & _CATCH_ALL:
+            audit.uncovered = [(name, text) for name, text in audit.clauses
+                               if name not in reached]
     return audit
 
 

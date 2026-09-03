@@ -465,6 +465,56 @@ def test_regeneration_can_rescue_a_vacuous_suite():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_a_coverage_gap_costs_one_regeneration_and_then_yields():
+    """A suite that skips a stated error is regenerated once, then used anyway.
+
+    The asymmetry against the vacuity gate is the thing under test: vacuity
+    blocks APPROVED outright, a coverage gap narrows the claim and says so.
+    """
+    plan = (
+        "SPEC: Build a tiny arithmetic helper exposing add(a, b) -> int. It "
+        "raises TypeError when either argument is not an int.\n"
+        "STEPS:\n1. Write an add function.\n2. Write it again.\n"
+        "TESTS:\n```python\n" + TESTS + "```\n"
+    )
+    reaches = ("```python\n" + TESTS +
+               "try:\n    add('a', 1)\n    assert False\n"
+               "except TypeError:\n    pass\n```\n")
+    for label, regenerated, closed in (("closed", reaches, True),
+                                       ("still open", "```python\n" + TESTS + "```\n",
+                                        False)):
+        stub = Stub({"planner": plan, "test_writer": regenerated,
+                     "executor": GOOD_CODE})
+        workdir = tempfile.mkdtemp(prefix="runs-")
+        try:
+            run, events = run_with(stub, mode=3, runs_dir=workdir)
+            systems = " ".join(c for role, c in events if role == "system")
+            asked = [user for _, role, _, user in stub.calls
+                     if role == "test_writer"]
+            check("a coverage gap is what got the first suite rejected (%s)" % label,
+                  "never reaches" in systems and "TypeError" in systems,
+                  systems[:300])
+            check("the gap costs exactly one regeneration (%s)" % label,
+                  len(asked) == 1, len(asked))
+            check("and the test writer is told to keep what it had (%s)" % label,
+                  asked and "Keep every assertion" in asked[0],
+                  asked[0][-200:] if asked else "")
+            check("the regenerated suite is the one recorded (%s)" % label,
+                  run.tests_status == agents_core.TESTS_REGENERATED,
+                  run.tests_status)
+            check("the run is never blocked by a coverage gap (%s)" % label,
+                  all(s.verdict == harness.VERDICT_APPROVED for s in run.steps),
+                  [s.verdict for s in run.steps])
+            banner = "coverage gap" in systems.lower()
+            check("a surviving gap is announced, a closed one is not (%s)" % label,
+                  banner == (not closed), systems[-400:])
+            check("and a surviving gap is on the record too (%s)" % label,
+                  ("unexercised" in run.tests_summary) == (not closed),
+                  run.tests_summary)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_missing_tests_cap_the_verdict():
     stub = Stub({"planner": PLAN_NO_TESTS, "test_writer": "no code here",
                  "executor": GOOD_CODE})
@@ -9400,6 +9450,7 @@ def main():
         test_import_failure_gets_different_guidance,
         test_vacuous_tests_force_unverified,
         test_regeneration_can_rescue_a_vacuous_suite,
+        test_a_coverage_gap_costs_one_regeneration_and_then_yields,
         test_missing_tests_cap_the_verdict, test_user_tests_win_over_generated,
         test_executor_cannot_weaken_the_tests,
         test_escalation_is_deterministic,

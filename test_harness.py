@@ -3,6 +3,7 @@
     python3 test_harness.py
 """
 
+import ast
 import json
 import os
 import sys
@@ -1072,6 +1073,75 @@ def test_vacuous_tests_are_caught():
           harness.run_python_sandboxed(MEDIAN, tests="   ").reason)
 
 
+def test_error_coverage_gate():
+    """The stated-error half of the audit: prose in, AST out, gap named."""
+    spec = ("Exposes median(values: list) -> float. It raises ValueError when "
+            "values is empty.")
+    clauses = harness.spec_error_clauses(spec)
+    check("a stated error becomes one clause", len(clauses) == 1, clauses)
+    check("the clause names the exception", clauses[0][0] == "ValueError", clauses)
+    check("the clause quotes the sentence that states it",
+          clauses[0][1].startswith("It raises ValueError"), clauses[0][1])
+
+    two = harness.spec_error_clauses(
+        "rejects malformed input with a ValueError, and raises TypeError for "
+        "a non-str argument")
+    check("two exceptions in one sentence become two clauses",
+          [name for name, _ in two] == ["ValueError", "TypeError"], two)
+
+    check("a negated mention is not a clause",
+          harness.spec_error_clauses(
+              "Returns 0 rather than raising ValueError on empty input.") == [],
+          harness.spec_error_clauses("Returns 0 rather than raising ValueError."))
+    check("\"never raises\" is not a clause",
+          harness.spec_error_clauses("It never raises; errors return None.") == [])
+    check("a spec stating no error yields no clause",
+          harness.spec_error_clauses("Exposes add(a, b) -> int.") == [])
+    check("an error stated without naming an exception yields no clause",
+          harness.spec_error_clauses("Raises on empty input.") == [])
+
+    reach = lambda src: sorted(harness.suite_error_reach(ast.parse(src)))
+    check("a named except handler is a reached error",
+          reach("try:\n    f()\nexcept ValueError:\n    pass\n") == ["ValueError"])
+    check("a helper call naming the exception counts too",
+          reach("expect(ValueError, f)\n") == ["ValueError"])
+    check("a bare except names nothing and reaches nothing",
+          reach("try:\n    f()\nexcept:\n    pass\n") == [])
+    check("an exception named only in a comment reaches nothing",
+          reach("f()  # ValueError\n") == [])
+
+    thin = "from solution import median\nassert median([1, 2, 3]) == 2\n"
+    covered = (thin + "try:\n    median([])\n    assert False\n"
+               "except ValueError:\n    pass\n")
+    gap = harness.audit_tests(thin, spec=spec)
+    check("a suite that skips the stated error still passes the vacuity gate",
+          gap.ok, gap.reason)
+    check("but the gap is recorded", [n for n, _ in gap.uncovered] == ["ValueError"],
+          gap.uncovered)
+    check("and the summary says so", "unexercised: ValueError" in gap.summary(),
+          gap.summary())
+
+    closed = harness.audit_tests(covered, spec=spec)
+    check("a suite that reaches it has no gap", closed.uncovered == [],
+          closed.uncovered)
+    check("the reached exception is recorded", closed.reached == ["ValueError"],
+          closed.reached)
+    check("and the summary says the errors are exercised",
+          "all 1 stated error(s) exercised" in closed.summary(), closed.summary())
+
+    broad = harness.audit_tests(
+        thin + "try:\n    median([])\nexcept Exception:\n    pass\n", spec=spec)
+    check("a catch-all handler credits every clause", broad.uncovered == [],
+          broad.uncovered)
+
+    blind = harness.audit_tests(thin)
+    check("no spec means no clauses, so the old verdict is unchanged",
+          blind.ok and blind.clauses == [] and blind.uncovered == [],
+          (blind.ok, blind.clauses))
+    check("and no coverage sentence is added to its summary",
+          "stated error" not in blind.summary(), blind.summary())
+
+
 def test_executor_cannot_supply_its_own_tests():
     both = (
         "Here is the solution:\n\n```python\n"
@@ -2023,6 +2093,7 @@ def main():
         test_import_solution_works_under_isolated_mode,
         test_tests_passing_is_approved, test_wrong_answer_that_runs_is_revised,
         test_import_failure_is_distinguished, test_vacuous_tests_are_caught,
+        test_error_coverage_gate,
         test_the_source_prologue_neutralises_annotations,
         test_the_prologue_never_makes_a_legal_file_illegal,
         test_the_prologue_survives_a_docstring_the_scan_cannot_parse,
