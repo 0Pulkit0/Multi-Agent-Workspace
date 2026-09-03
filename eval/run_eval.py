@@ -287,6 +287,21 @@ def _rate_limit_info(exc):
 
     The status and the `Retry-After` header come off `__context__` via
     `_sdk_status`; see that function for why they are still reachable.
+
+    Parsed the way `agents_core._retry_after_of` parses it, floor included: a
+    negative header is malformed, so it is passed over for the next name rather
+    than returned. What is returned here is what `note_429` sleeps on, and a
+    negative reached `time.sleep`, which raises `ValueError` -- out of the
+    `except ProviderError` handler, so a malformed header could end a draw with
+    an error that was not the provider's, after recording `waited` as a negative
+    number on the way past.
+
+    **The cap is deliberately not mirrored here.** `note_429` applies
+    `agents_core.MAX_RETRY_AFTER_SECONDS` and records `retry_after` as the
+    provider sent it against `waited` as we took it; clamping before it sees the
+    value would make `capped` unreachable and hide the multi-hour header that
+    addendum K section 6 exists to keep visible. The floor belongs on this side
+    because a negative is not a bound to honour, it is a value to reject.
     """
     status, response = _sdk_status(exc)
     is_429 = status == 429 or "429" in str(exc) or "rate limit" in str(exc).lower()
@@ -298,13 +313,16 @@ def _rate_limit_info(exc):
                 raw = headers.get(name)
             except Exception:
                 raw = None
-            if raw:
-                try:
-                    retry_after = float(str(raw).rstrip("s"))
-                except ValueError:
-                    retry_after = None
-                if retry_after is not None:
-                    break
+            if not raw:
+                continue
+            try:
+                seconds = float(str(raw).strip().rstrip("s"))
+            except (TypeError, ValueError):
+                continue
+            if seconds < 0:
+                continue
+            retry_after = seconds
+            break
     return is_429, retry_after
 
 

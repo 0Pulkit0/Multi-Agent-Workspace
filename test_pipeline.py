@@ -9111,6 +9111,265 @@ def test_the_governor_honours_the_cap_the_manifest_already_advertised():
               os.path.join(here, "eval", "calibrate.py")), "")
 
 
+def _probe_loop_bounds(path):
+    """`{builder: (target, cap, handled)}` for every probe loop, by AST not grep.
+
+    The bounds are read out of the loop's own literals rather than copied here. A
+    builder that changes its target or its attempt cap must not be able to leave
+    this check quietly testing the numbers it used to have.
+    """
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for statement in ast.walk(node):
+            if not isinstance(statement, ast.While):
+                continue
+            test = statement.test
+            if not (isinstance(test, ast.BoolOp)
+                    and isinstance(test.op, ast.And)
+                    and len(test.values) == 2):
+                continue
+            target = cap = None
+            for part in test.values:
+                if not (isinstance(part, ast.Compare)
+                        and len(part.comparators) == 1
+                        and isinstance(part.comparators[0], ast.Constant)):
+                    continue
+                bound = part.comparators[0].value
+                if (isinstance(part.left, ast.Call)
+                        and isinstance(part.left.func, ast.Name)
+                        and part.left.func.id == "len"):
+                    target = bound
+                elif (isinstance(part.left, ast.Name)
+                      and part.left.id == "attempts"):
+                    cap = bound
+            if target is None or cap is None:
+                continue
+            handled = set()
+            for child in ast.walk(statement):
+                if isinstance(child, ast.ExceptHandler) and isinstance(
+                        child.type, ast.Name):
+                    handled.add(child.type.id)
+            found[node.name] = (target, cap, handled)
+    return found
+
+
+def _probe_callers(path):
+    """The builders that call `_probe`, so a new one cannot go unmeasured."""
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    callers = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for child in ast.walk(node):
+            if (isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id == "_probe"):
+                callers.add(node.name)
+    return callers
+
+
+def _counting_reference(inner, tally, depth):
+    """Count outermost entries only, so a reference calling another is one probe.
+
+    The builders eval one candidate per attempt, so an outermost call to the
+    reference is an attempt -- which makes `attempts` and `len(calls)` at loop
+    exit observable from outside `eval/gen_tasks.py`, without editing it.
+    """
+    def proxy(*args, **kwargs):
+        outermost = not depth
+        if outermost:
+            tally["attempts"] += 1
+        depth.append(1)
+        try:
+            return inner(*args, **kwargs)
+        except BaseException as exc:
+            if outermost:
+                name = type(exc).__name__
+                tally["raised"][name] = tally["raised"].get(name, 0) + 1
+            raise
+        finally:
+            depth.pop()
+    return proxy
+
+
+def test_a_malformed_retry_after_cannot_park_or_crash_the_governor():
+    """Sprint 22 task 4 item 1: the cap landed with the floor missing.
+
+    `agents_core._retry_after_of` has had both since it was written. The eval
+    path's own parser had neither, and addendum K section 6 added only the cap, on
+    `note_429`, because that is the layer that sleeps. So a negative
+    `Retry-After` still reached `time.sleep`, which raises `ValueError` -- from
+    inside the `except ProviderError` handler, meaning a malformed header could
+    end a draw on an error that was not the provider's, having first recorded
+    `waited` as a negative number on the way past.
+
+    Pinned here: the floor rejects rather than clamps, so a malformed first header
+    falls through to the next name instead of becoming an instant retry against a
+    provider that has just rate-limited us; and the cap is still applied by
+    `note_429` alone, because `capped` and the `retry_after`/`waited` gap are the
+    only evidence that a multi-hour header arrived at all.
+    """
+    run_eval = _import_run_eval()
+
+    class _Response(object):
+        def __init__(self, headers):
+            self.headers = headers
+            self.status_code = 429
+
+    def perr(headers):
+        """A ProviderError whose `__context__` carries these response headers."""
+        original = RuntimeError("rate limited")
+        original.status_code = 429
+        original.response = _Response(headers)
+        try:
+            raise original
+        except RuntimeError:
+            try:
+                raise agents_core.ProviderError("groq failed: 429")
+            except agents_core.ProviderError as exc:
+                return exc
+
+    def parsed(headers):
+        return run_eval._rate_limit_info(perr(headers))[1]
+
+    check("a negative `Retry-After` is rejected rather than returned, so nothing "
+          "downstream has to defend against it",
+          parsed({"retry-after": "-3600"}) is None,
+          parsed({"retry-after": "-3600"}))
+    check("rejected and not clamped to zero: a malformed first header falls "
+          "through to the next name, exactly as `_retry_after_of` does",
+          parsed({"retry-after": "-1",
+                  "x-ratelimit-reset-requests": "45"}) == 45.0,
+          parsed({"retry-after": "-1", "x-ratelimit-reset-requests": "45"}))
+    check("an unparseable header still falls through to the next name",
+          parsed({"retry-after": "soon",
+                  "x-ratelimit-reset-requests": "12"}) == 12.0,
+          parsed({"retry-after": "soon", "x-ratelimit-reset-requests": "12"}))
+    check("the `s` suffix parses with surrounding whitespace, which the "
+          "un-mirrored parse dropped as unparseable",
+          parsed({"retry-after": "7s"}) == 7.0
+          and parsed({"retry-after": " 7s "}) == 7.0,
+          (parsed({"retry-after": "7s"}), parsed({"retry-after": " 7s "})))
+
+    governor = run_eval.RateGovernor()
+    slept = [governor.note_429("groq", parsed(headers), 0) for headers in (
+        {"retry-after": "-3600"}, {"retry-after": "-0.5"},
+        {"retry-after": "-1", "x-ratelimit-reset-requests": "-2"},
+        {"retry-after": "nonsense"}, {})]
+    check("so what the governor sleeps on is never negative, whatever the header "
+          "said -- which is the whole of the defect, stated end to end",
+          all(wait >= 0 for wait in slept), slept)
+    check("and a rejected header reads as no header, so the wait comes from our "
+          "own backoff rather than from a number the provider did not send",
+          all(record["source"] == "backoff" and record["retry_after"] is None
+              for record in governor.rate_limits), governor.rate_limits)
+
+    cap = agents_core.MAX_RETRY_AFTER_SECONDS
+    long_header = parsed({"retry-after": "20036.4"})
+    waited = governor.note_429("groq", long_header, 0)
+    event = governor.rate_limits[-1]
+    check("the cap is still `note_429`'s and was not mirrored into the parser: "
+          "the header arrives uncapped, `waited` is the cap, and `capped` says so",
+          long_header == 20036.4 and waited == cap and event["capped"] is True
+          and event["retry_after"] == 20036.4,
+          (long_header, waited, event))
+
+
+def test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap():
+    """Sprint 22 task 4 item 2: a precondition on a difficulty dial, not one.
+
+    Three families build their random calls by probing the reference and moving
+    the raising candidates into `raises`, under
+    `while len(calls) < TARGET and attempts < CAP`. That loop exits on either
+    condition and nothing downstream asks which. When the attempts cap binds
+    first, the family ships a suite with fewer value checks than it was written to
+    have: no error, no warning, a quietly smaller suite.
+
+    Which is the hazard a difficulty dial creates rather than one it inherits.
+    Every knob these builders already carry -- `escape`, `stray`, `duplicate`,
+    `division` -- changes how often the reference raises, and a harder setting
+    raises more often, consumes more attempts and spends the headroom. Addendum L
+    section 6a constraint 3 registers that check count is not the difficulty dial;
+    an unchecked loop exit is precisely how a dial would move the check count
+    while believing it had moved difficulty.
+
+    So this pins the precondition instead of changing the loop. `eval/gen_tasks.py`
+    is not edited, and if a future dial makes a cap bind, this fails rather than
+    the next lock silently shrinking.
+    """
+    gen_tasks = _import_gen_tasks()
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(here, "eval", "gen_tasks.py")
+    bounds = _probe_loop_bounds(source)
+    callers = _probe_callers(source)
+
+    check("every builder that probes the reference bounds the loop it probes in, "
+          "so a new probing family cannot be added outside this check",
+          callers and callers == set(bounds), (sorted(callers), sorted(bounds)))
+
+    real_probe = gen_tasks._probe
+    tally = {"attempts": 0, "raised": {}}
+    depth = []
+
+    def counting_probe(refs, consts, imports=()):
+        namespace = real_probe(refs, consts, imports)
+        for key in list(namespace):
+            if key.startswith("_") or not callable(namespace[key]):
+                continue
+            namespace[key] = _counting_reference(namespace[key], tally, depth)
+        return namespace
+
+    measured, raised_kinds = [], set()
+    gen_tasks._probe = counting_probe
+    try:
+        for fam in gen_tasks.FAMILIES:
+            if fam.builder.__name__ not in bounds:
+                continue
+            target, cap, handled = bounds[fam.builder.__name__]
+            for index in (0, 1):
+                tally["attempts"], tally["raised"] = 0, {}
+                escaped, params = None, {}
+                task_id = "%s-%02d" % (fam.name.replace("_", "-"), index + 1)
+                try:
+                    task = gen_tasks.build_task(fam, 0, index)
+                    task_id, params = task.task_id, task.params
+                except Exception as exc:
+                    escaped = "%s: %s" % (type(exc).__name__, exc)
+                attempts = tally["attempts"]
+                raised = sum(tally["raised"].values())
+                raised_kinds |= set(tally["raised"])
+                measured.append({
+                    "task": task_id, "params": params, "escaped": escaped,
+                    "target": target, "cap": cap, "handled": sorted(handled),
+                    "attempts": attempts, "raised": raised,
+                    "kept": attempts - raised})
+    finally:
+        gen_tasks._probe = real_probe
+
+    check("all six variants of the three probing families were measured, so a "
+          "silent skip cannot read as a pass",
+          len(measured) == 2 * len(bounds), len(measured))
+    for row in measured:
+        check("%s exits on its target and not on its cap, so its suite is the "
+              "size it was written to be (%d kept of %d, %d attempts of %d)"
+              % (row["task"], row["kept"], row["target"], row["attempts"],
+                 row["cap"]),
+              row["escaped"] is None and row["kept"] >= row["target"]
+              and row["attempts"] < row["cap"], row)
+    check("and no probed reference raised a type its loop does not handle: an "
+          "unhandled one leaves the builder and takes `generate` with it, which "
+          "is the other half of the same fall-through",
+          all(row["escaped"] is None for row in measured)
+          and all(raised_kinds <= set(bounds[name][2]) for name in bounds),
+          [(row["task"], row["escaped"]) for row in measured if row["escaped"]]
+          or sorted(raised_kinds))
+
+
 def main():
     for fn in (
         test_pipeline_is_explicit, test_mode_2_skips_execution,
@@ -9265,6 +9524,10 @@ def main():
         # addendum K section 6: the sleeping layer honours the cap the manifest
         # was already advertising on the layer below it
         test_the_governor_honours_the_cap_the_manifest_already_advertised,
+        # sprint 22, task 4: the floor the cap landed without, and the probe
+        # loop's unchecked exit as a precondition on any difficulty dial
+        test_a_malformed_retry_after_cannot_park_or_crash_the_governor,
+        test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap,
     ):
         print("\n-- %s" % fn.__name__)
         try:
