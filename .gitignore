@@ -25,3 +25,10 @@ runs/
 eval/results/
 eval/calibration/
 memory.json
+
+# Run output from the 2026-09-02/03 sweeps. Same rule as runs/ above: these are
+# outputs of the thing this repository freezes. The protocol must provably
+# predate the data, so data is never committed in the same tree as the protocol.
+*.log
+decoy_run_2026-09-02/
+probe_rpd_*.json
