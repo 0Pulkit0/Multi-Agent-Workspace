@@ -1181,6 +1181,113 @@ def test_executor_cannot_supply_its_own_tests():
           harness.format_fixes(verdict, result)[:300])
 
 
+def test_the_suite_is_not_readable_by_the_solution():
+    """The answer key must not be readable by the code it grades.
+
+    The suite used to be written next to solution.py, so `open(TEST_NAME)` --
+    two tokens, no traversal -- handed a candidate the exact assertions it was
+    about to be measured against. Measured exploitation was k = 0 in n = 30, so
+    this closes a channel before it was used rather than after.
+
+    Two mechanisms, and the split matters. The suite moved to a sibling
+    directory, which closes every relative name and the cwd listing at once; and
+    reads of that one path are refused from `import solution` onwards, because
+    the move alone leaves `../suite/test_solution.py` open. The deny cannot be
+    armed any earlier -- runpy has to read the suite to run it -- and cannot be
+    pushed down to the OS jail, which sees one process and cannot tell the two
+    readers apart.
+    """
+    probe = (
+        "```python\n"
+        "import io, os, sys, pathlib\n"
+        "def _r(fn):\n"
+        "    try:\n"
+        "        fn()\n"
+        "        return 'READ'\n"
+        "    except Exception as exc:\n"
+        "        return type(exc).__name__\n"
+        "print('CWD', sorted(os.listdir('.')))\n"
+        "print('rel', _r(lambda: open('test_solution.py').read()))\n"
+        "print('up', _r(lambda: open('../suite/test_solution.py').read()))\n"
+        "print('argv', _r(lambda: open(sys.argv[0]).read()))\n"
+        "print('io', _r(lambda: io.open('../suite/test_solution.py').read()))\n"
+        "print('code', _r(lambda: io.open_code(sys.argv[0]).read()))\n"
+        "print('low', _r(lambda: os.read(os.open(sys.argv[0], os.O_RDONLY), 9)))\n"
+        "print('lib', _r(lambda: pathlib.Path(sys.argv[0]).read_text()))\n"
+        "print('own', _r(lambda: open('solution.py').read()))\n"
+        "print('kill', _r(lambda: open(sys.argv[0], 'w')))\n"
+        "def median(values):\n"
+        "    return 0\n"
+        "```\n"
+    )
+    _, result = harness.verify_output(probe, tests=SUITE)
+    said = dict(line.split(" ", 1) for line in result.stdout.splitlines()
+                if " " in line)
+    cwd = said.get("CWD", "")
+    check("the suite is not in the directory the solution runs in",
+          cwd and harness.TEST_NAME not in cwd, repr(cwd))
+    check("the solution itself still is, so `from solution import` resolves",
+          harness.SCRIPT_NAME in cwd, repr(cwd))
+    check("and the phase marker is too, which is what makes the runner's "
+          "workdir derivation right now that the entry point has moved out",
+          harness.PHASE_NAME in cwd, repr(cwd))
+    for label, spelling in (
+        ("up", "a traversal into the sibling directory"),
+        ("argv", "the absolute path argv still carries"),
+        ("io", "io.open"),
+        ("code", "io.open_code, which is how runpy itself reads it"),
+        ("low", "os.open, below the io layer"),
+        ("lib", "pathlib, which routes through both"),
+    ):
+        check("refused: %s" % spelling,
+              said.get(label) == "PermissionError", said.get(label))
+    check("the naive read is not even a denial any more, just a missing file",
+          said.get("rel") == "FileNotFoundError", said.get("rel"))
+    check("writing over the suite is refused too, so the answer key cannot be "
+          "edited into one the solution passes",
+          said.get("kill") == "PermissionError", said.get("kill"))
+    check("and this is one denied path, not a blanket read-deny: the solution "
+          "can still read its own source",
+          said.get("own") == "READ", said.get("own"))
+
+    # The regression the linecache pin exists to prevent. Source lines in a
+    # traceback come from *reopening* the file the frame names, so a deny with no
+    # pin leaves `failed_assertion` empty and the repair round with nothing to
+    # quote -- the deny would have cost the run the one thing it needs most.
+    verdict, result = harness.verify_output(MEDIAN_WRONG, tests=SUITE)
+    check("a failing assertion still reports its source text",
+          result.failed_assertion == "assert median([1, 2, 3, 4]) == 2.5",
+          repr(result.failed_assertion))
+    check("and the line it is on", result.failed_assertion_line == 4,
+          result.failed_assertion_line)
+    check("so the repair round can still quote it",
+          "median([1, 2, 3, 4])" in harness.format_fixes(verdict, result),
+          harness.format_fixes(verdict, result)[:300])
+
+    verdict, result = harness.verify_output(MEDIAN, tests=SUITE)
+    check("a correct solution is still APPROVED",
+          verdict == harness.VERDICT_APPROVED, verdict)
+    check("the suite is still the entry point",
+          result.entry == harness.TEST_NAME, result.entry)
+
+    verdict, result = harness.verify_output(
+        "```python\nopen('out.txt', 'w').write('hi')\nprint('wrote')\n```")
+    check("with no suite the solution is still the entry point",
+          result.entry == harness.SCRIPT_NAME, result.entry)
+    check("and it can still write in its own directory",
+          "wrote" in result.stdout, repr(result.stdout))
+
+    import tempfile
+    tmp = tempfile.gettempdir()
+    before = set(name for name in os.listdir(tmp) if name.startswith("harness-"))
+    harness.run_python_sandboxed(harness.extract_code_block(MEDIAN)[0],
+                                 tests=SUITE)
+    after = set(name for name in os.listdir(tmp) if name.startswith("harness-"))
+    check("the second directory is still cleaned up, because the rmtree moved "
+          "up to the root that holds both",
+          not (after - before), sorted(after - before))
+
+
 # ------------------------------------------------- resource ceilings & jail
 
 def test_runaway_output_is_killed():
@@ -2099,6 +2206,7 @@ def main():
         test_the_prologue_survives_a_docstring_the_scan_cannot_parse,
         test_a_byte_order_mark_is_prelude_and_not_a_statement,
         test_executor_cannot_supply_its_own_tests,
+        test_the_suite_is_not_readable_by_the_solution,
         test_runaway_output_is_killed, test_filesystem_jail,
         test_destructive_calls_cannot_be_spelled_around_the_guard,
         test_guarded_calls_still_work_inside_the_workdir,

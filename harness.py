@@ -493,7 +493,12 @@ _MAX_WRITE_BYTES = int(sys.argv[3])
 _MAX_MEMORY_BYTES = int(sys.argv[4])
 _ENTRY_KIND = sys.argv[5]
 _PHASE_PATH = sys.argv[6]
-_WORKDIR = os.path.dirname(os.path.abspath(_TARGET))
+# Derived from the phase marker, NOT from the entry script. When a suite is
+# supplied the entry point is the suite, and it deliberately lives outside the
+# working directory so the solution cannot read the answers it is graded on. The
+# phase marker is written by the parent into the workdir itself, so argv[6] is
+# the one argument that always names it.
+_WORKDIR = os.path.dirname(os.path.abspath(_PHASE_PATH))
 # Resolved separately: on macOS the temp dir is reached through a symlink, so
 # realpath() of a path inside it does not start with _WORKDIR. Both spellings
 # count as inside. _WORKDIR itself is left alone because sys.path and the
@@ -644,6 +649,78 @@ def _fs_allowed(path):
     return False
 
 
+# argv[1] is the suite itself when a suite was supplied, and the suite is the
+# answer key: it is the thing APPROVED is measured against. It is written outside
+# _WORKDIR, so no relative name and no listing of cwd reaches it -- but `..`
+# still does, and reads are otherwise deliberately unrestricted. Hence a deny on
+# this one path. See `_arm_suite_lock` for why it is armed late rather than
+# installed late, and for what it does not close.
+_SUITE = os.path.abspath(_TARGET) if _ENTRY_KIND == 'tests' else ""
+_SUITE_REAL = os.path.realpath(_SUITE) if _SUITE else ""
+_SUITE_LOCKED = [False]
+_SUITE_MSG = ("reading the acceptance suite is disabled by the execution "
+              "harness: it is the answer key this solution is graded against")
+
+
+def _suite_deny(path):
+    try:
+        shown = os.fsdecode(path)
+    except Exception:
+        shown = repr(path)
+    return PermissionError("%s: %s" % (_SUITE_MSG, shown))
+
+
+def _is_suite(path):
+    if not _SUITE_LOCKED[0] or isinstance(path, int):
+        return False
+    try:
+        joined = os.path.join(_WORKDIR, os.fsdecode(path))
+    except Exception:
+        return False
+    for spelling in (os.path.abspath, os.path.realpath):
+        try:
+            if spelling(joined) in (_SUITE, _SUITE_REAL):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _arm_suite_lock():
+    """Start refusing reads of the suite -- from `import solution` onwards only.
+
+    Installed early and armed late, because the process that must be stopped
+    from reading the suite is the same process that has to read it to run it:
+    runpy opens argv[1] at startup. That is also why this cannot be pushed down
+    to the OS jail, where it would survive ctypes -- a seatbelt profile applies
+    to the whole process and cannot distinguish the two readers. The arming point
+    is the first `import solution`: after the suite has been loaded, before any
+    candidate code runs.
+
+    Pins the suite's source in linecache first, with mtime None so `checkcache`
+    leaves the entry alone. Without that the deny would silently empty
+    `failed_assertion`: source lines in a traceback come from linecache
+    *reopening* the file, and the parent extracts the failing assertion's text
+    from that stderr.
+
+    What it does not close, deliberately: `__main__.__file__` and `sys.argv[0]`
+    still name the suite, `tokenize.open` holds a reference to the real `open`
+    bound before this module ran, and a caller's own code object is readable
+    through `sys._getframe`. This is accident containment, in the same sense as
+    `_block_filesystem` -- it removes the read a solution stumbles into, not the
+    read a solution is written to perform.
+    """
+    try:
+        import linecache
+        lines = linecache.getlines(_TARGET)
+        if lines:
+            for key in set((_TARGET, _SUITE)):
+                linecache.cache[key] = (0, None, lines, key)
+    except Exception:
+        pass
+    _SUITE_LOCKED[0] = True
+
+
 def _block_filesystem():
     """Refuse writes that resolve outside the throwaway working directory.
 
@@ -657,13 +734,16 @@ def _block_filesystem():
     "contains untrusted code".
 
     Reads are deliberately left alone: importing the standard library is a read,
-    tracebacks read source files, and tests legitimately read fixtures.
+    tracebacks read source files, and tests legitimately read fixtures. The one
+    exception is the acceptance suite -- see `_arm_suite_lock`.
     """
     import builtins
     import io
 
     def _guard_open(real):
         def _open(file, mode="r", *args, **kwargs):
+            if _is_suite(file):
+                raise _suite_deny(file)
             try:
                 writing = any(char in mode for char in "wxa+")
             except TypeError:
@@ -676,6 +756,18 @@ def _block_filesystem():
     builtins.open = _guard_open(builtins.open)
     io.open = _guard_open(io.open)
 
+    # runpy reads the entry point through this, not through io.open, so it is a
+    # read of the suite that the suite deny has to cover -- and the only reason
+    # arming late works at all is that runpy's own read happens before arming.
+    _open_code = getattr(io, "open_code", None)
+    if _open_code is not None:
+        def _guarded_open_code(path, *args, **kwargs):
+            if _is_suite(path):
+                raise _suite_deny(path)
+            return _open_code(path, *args, **kwargs)
+
+        io.open_code = _guarded_open_code
+
     _write_flags = 0
     for flag in ("O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC"):
         _write_flags |= getattr(os, flag, 0)
@@ -685,6 +777,8 @@ def _block_filesystem():
         if kwargs.get("dir_fd") is not None:
             raise _fs_deny_fd("dir_fd")
         path = args[0] if args else kwargs.get("path")
+        if _is_suite(path):
+            raise _suite_deny(path)
         flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
         try:
             writing = bool(flags & _write_flags)
@@ -886,6 +980,9 @@ def _watch_solution_import():
     def _watched(name, globals=None, locals=None, fromlist=(), level=0):
         if name == 'solution' and _PHASE[0] != 'import-solution':
             _phase('import-solution')
+            # Before _real_import, so the solution's own module body is already
+            # covered: it runs during the import, not after it.
+            _arm_suite_lock()
             try:
                 return _real_import(name, globals, locals, fromlist, level)
             finally:
@@ -1367,8 +1464,9 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
     """Run ``source`` in an isolated subprocess and capture what it did.
 
     ``source`` is always written as ``solution.py``. When ``tests`` is given it
-    is written as ``test_solution.py`` alongside it and becomes the entry
-    point, with ``solution`` importable. With no tests the behaviour is
+    is written as ``test_solution.py`` in a sibling directory -- readable by the
+    child but outside the directory it can name, write or list -- and becomes the
+    entry point, with ``solution`` importable. With no tests the behaviour is
     unchanged from Phase 1: ``solution.py`` itself is the entry point.
     """
     result = ExecResult(language="python", source=source, tests=tests or "")
@@ -1382,8 +1480,16 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         result.reason = "no Python interpreter available to the harness"
         return result
 
-    workdir = tempfile.mkdtemp(prefix="harness-")
+    # Two directories under one root, and the split is the whole point. The
+    # suite used to be written next to solution.py, which meant a candidate
+    # could `open(TEST_NAME)` -- or list cwd and find it -- and read the answers
+    # it was about to be graded against. It now lives outside the only directory
+    # the child can name relatively, write to, or see by listing. One root keeps
+    # cleanup a single rmtree.
+    root = tempfile.mkdtemp(prefix="harness-")
+    workdir = os.path.join(root, "work")
     try:
+        os.mkdir(workdir)
         script_path = os.path.join(workdir, SCRIPT_NAME)
         with open(script_path, "w", encoding="utf-8") as handle:
             # The prologue goes into the model's text, never over it, and after
@@ -1403,7 +1509,16 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
 
         test_path = None
         if tests:
-            test_path = os.path.join(workdir, TEST_NAME)
+            # A sibling of the workdir, not a member of it. The child can still
+            # read it -- runpy has to, to run it -- and cannot write it at either
+            # layer: `_block_filesystem` refuses writes outside the workdir and
+            # the seatbelt profile is `deny file-write*` with an allow-subpath
+            # for the workdir alone. The reads a solution could make on top of
+            # runpy's are refused separately, from `import solution` onwards;
+            # see `_arm_suite_lock` in the runner.
+            suitedir = os.path.join(root, "suite")
+            os.mkdir(suitedir)
+            test_path = os.path.join(suitedir, TEST_NAME)
             with open(test_path, "w", encoding="utf-8") as handle:
                 # Deliberately no prologue: the artifact lives in the solution
                 # module, the baked suites carry no annotations, and editing
@@ -1521,7 +1636,8 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         _classify(result)
         return result
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        # The root, so the sibling suite directory goes with it.
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _kill_tree(proc):

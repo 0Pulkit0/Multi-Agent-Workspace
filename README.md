@@ -75,8 +75,9 @@ about a zero exit code catches that. So the Planner writes an acceptance suite
 up front and the harness grades against it.
 
 - The Executor's program is written to `solution.py`.
-- The suite is written to `test_solution.py` in the same directory and becomes
-  the entry point; `solution.py` is importable from it.
+- The suite is written to `test_solution.py` in a sibling directory and becomes
+  the entry point; `solution.py` is importable from it, and the suite is not
+  readable by it — see [Reading the answer key](#reading-the-answer-key).
 - `APPROVED` requires: the suite ran, exit code 0, and the suite was audited as
   non-vacuous. All three.
 
@@ -272,6 +273,32 @@ This is accident containment against hallucinated destructive operations —
 `shutil.rmtree("/")`, writing to a home-directory dotfile — **not a security
 boundary**. Adversarial code can bypass it via `ctypes`, `importlib`, or a raw
 syscall. `RLIMIT_FSIZE` caps how much a permitted write can produce.
+
+### Reading the answer key
+
+The suite is what `APPROVED` is measured against, so a solution that can read it
+can pass without solving anything. It used to be written next to `solution.py`,
+where `open("test_solution.py")` reached it. Two changes:
+
+- The suite is written to a **sibling** directory of the working directory. No
+  relative name reaches it, and it does not appear in a listing of the directory
+  the solution runs in. It is write-denied at both layers, in-process and (on
+  macOS) by the seatbelt profile, which allows writes under the working directory
+  only.
+- Reads of that one path are refused from `import solution` onwards, through
+  `builtins.open`, `io.open`, `io.open_code`, `os.open` and therefore `pathlib`.
+  The deny is *armed* late rather than installed late, because the process that
+  must not read the suite is the same one that has to read it to run it: `runpy`
+  opens it at startup. That is also why this cannot be pushed down to the OS
+  jail, which sees one process and cannot tell the two readers apart.
+
+Same honest limit as the write guard, and one specific consequence: the suite's
+absolute path is still visible in `sys.argv[0]` and `__main__.__file__`,
+`tokenize.open` holds a reference to the real `open` bound before the guard was
+installed, and a caller's own code object is readable through `sys._getframe`.
+This removes the read a solution stumbles into, not the read a solution is
+written to perform. Exploitation was measured before the change at k = 0 in
+n = 30 trials.
 
 ### Timeouts say where
 
