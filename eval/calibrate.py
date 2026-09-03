@@ -323,6 +323,27 @@ def one_draw(task, plan, keys, instrument, draw):
     record["seconds"] = round(time.time() - started, 2)
     record["calls"] = instrument.calls
     record["calls_by_provider"] = dict(instrument.calls_by_provider)
+    # What the `seconds` above was actually spent on. Written because its absence
+    # cost a diagnosis: all 170 draws from the 2026-09-02 sweep carry `seconds`
+    # and `calls` and nothing else, so `config-parsing-01__d3` -- 8467.2s at
+    # `calls: 2` -- cannot be told apart by any field on disk from one request
+    # that stayed open for hours, and `RateGovernor.note_429` honouring an
+    # uncapped multi-hour `Retry-After` between two fast ones. The remedies differ
+    # (a request deadline versus a cap on the governor), so the run has to record
+    # which it was rather than leave it to be argued about afterwards.
+    #
+    # `seconds` minus `seconds_sleeping` and `seconds_http` is time in this
+    # process: grading, disk, parsing.
+    record["seconds_sleeping"] = round(instrument.slept, 2)
+    record["failed_calls"] = instrument.failed_calls
+    record["rate_limit_retries"] = instrument.retries
+    # HTTP, as distinct from calls: what reached the wire, and the single longest
+    # request. Zero on a stubbed draw. `http_attempts > calls` means something was
+    # retried inside a call; `seconds_http_max` near `seconds` means one request
+    # held the draw open, and `seconds_sleeping` near `seconds` means a wait did.
+    record["http_attempts"] = instrument.http_attempts
+    record["seconds_http"] = round(instrument.seconds_http, 2)
+    record["seconds_http_max"] = round(instrument.seconds_http_max, 2)
     return record
 
 
@@ -969,6 +990,14 @@ def build_manifest(args, tasks, lock, verdict, per_task, projection, spent,
                    "governor_max_429_retries": run_eval.MAX_429_RETRIES,
                    "governor_fallback_backoff": list(run_eval.FALLBACK_BACKOFF),
                    "rate_limits": governor.rate_limits,
+                   # Separate from `rate_limits` because that list is printed as
+                   # "429 <provider> Retry-After=..." and a 503 in it would be
+                   # announced as a rate limit. Same shape, different question.
+                   "governor_max_5xx_retries": run_eval.MAX_5XX_RETRIES,
+                   "governor_fallback_5xx_backoff": list(
+                       run_eval.FALLBACK_5XX_BACKOFF),
+                   "server_errors": governor.server_errors,
+                   "http_accounting": run_eval.HTTP_ACCOUNTING,
                    "agents_core_pacer": agents_core.PACER.snapshot(),
                    "agents_core_retry": agents_core.retry_snapshot()},
         "seconds": round(seconds, 1),

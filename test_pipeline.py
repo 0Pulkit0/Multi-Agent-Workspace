@@ -2529,6 +2529,14 @@ class _FakeInstrument(object):
         # stand-in usable from only half the call sites.
         self.calls_by_provider = {}
         self.slept = 0.0
+        # Likewise: `one_draw` reads all three onto the draw record, and a stub
+        # never reaches the wire so all three are the honest zero here. Kept in
+        # step with the real `reset` deliberately -- the last time this stand-in
+        # lagged behind, three checks failed with an AttributeError, which is the
+        # design working.
+        self.http_attempts = 0
+        self.seconds_http = 0.0
+        self.seconds_http_max = 0.0
 
 
 def _run_one_against(raiser, arm="a", attempts=2):
@@ -3885,7 +3893,21 @@ _ADDED_RECORD_KEYS = (
     # the record growing a sampling parameter is a declared event and not a
     # diff nobody reads.
     "call_log[].finish_reason", "candidates[].finish_reason", "finish_reason",
-    "models[].reasoning_format", "plan_call_log[].finish_reason")
+    "models[].reasoning_format", "plan_call_log[].finish_reason",
+    # Sprint 21, item B: HTTP, as distinct from calls. `calls` counts what the
+    # wrapper tried; these count what reached the wire and what it cost.
+    #
+    # Declared as three fields on the arm record and not on the call log, because
+    # a call-log entry is one provider attempt and the retries being counted here
+    # happen *inside* one of those. Putting them there would attribute a call's
+    # whole HTTP history to its first attempt.
+    #
+    # The reason they exist: every draw the 2026-09-02 sweep wrote carries
+    # `seconds` and `calls` and nothing about what the seconds were spent on, so a
+    # cell of 8467.2s at `calls: 2` cannot be told apart by any field on disk from
+    # one request held open for hours, or a wait honoured between two fast ones.
+    # `seconds_http_max` is the field that separates them.
+    "http_attempts", "seconds_http", "seconds_http_max")
 
 def _shape_into(value, path, out):
     """Leaf paths of a JSON value to the set of types seen at each."""
@@ -3929,7 +3951,7 @@ class _Named(object):
 
 
 def test_every_event_kind_round_trips_through_the_writer():
-    """All seven kinds, written and parsed back as one JSON object per line."""
+    """All eight kinds, written and parsed back as one JSON object per line."""
     out = tempfile.mkdtemp(prefix="events-kinds-")
     try:
         path = agents_core.event_log_path(os.path.join(out, "run-kinds.json"))
@@ -3949,7 +3971,15 @@ def test_every_event_kind_round_trips_through_the_writer():
             agents_core.EVENT_INFRA_LOSS: {"infra_status": 429,
                                            "infra_attempts": 4,
                                            "infra_providers": ["groq"]},
-            agents_core.EVENT_RESUME_SKIP: {"result": "aggregation-01__r0.json"}}
+            agents_core.EVENT_RESUME_SKIP: {"result": "aggregation-01__r0.json"},
+            agents_core.EVENT_HTTP_ATTEMPT: {"provider": "groq",
+                                             "role": "executor", "attempt": 2,
+                                             "seconds": 1.25, "ok": False,
+                                             "status": 503,
+                                             "exc_class": "APIStatusError",
+                                             "retrying": True,
+                                             "accounting":
+                                             "per_http_attempt/1"}}
         # Keyed off the vocabulary itself: a kind added to `EVENT_KINDS` without
         # a payload here fails this check rather than going unexercised.
         check("every kind in the closed vocabulary is exercised",
@@ -5995,6 +6025,20 @@ _DRAW_KEYS_BEFORE_THE_MODEL_PAIR = (
     "measurement_mode", "outcome", "passed", "provider_last", "raw_len",
     "seconds", "seed", "spec_sha256", "stub", "task_id", "tier", "variant")
 
+# The six sprint 21 added, named as their own group rather than folded into the
+# list above, so the store reads as three dated layers and a reader can tell which
+# one a file predates. Verified against the store on 2026-09-03: of 170 draw files,
+# 100 carry 26 keys and 70 carry 28, differing by exactly the model pair.
+#
+# They exist because their absence cost a diagnosis. Every one of those 170 files
+# records `seconds` and `calls` and nothing about what the seconds were spent on,
+# so `config-parsing-01__d3` -- 8467.2s at `calls: 2` -- cannot be told apart by
+# any field on disk from one request held open for hours, or a wait honoured
+# between two fast ones. The remedies differ, so the run has to say which it was.
+_DRAW_KEYS_HTTP_ACCOUNTING = (
+    "failed_calls", "http_attempts", "rate_limit_retries", "seconds_http",
+    "seconds_http_max", "seconds_sleeping")
+
 
 def test_a_draw_file_records_which_model_answered_it():
     """The halt covers a live sweep. This covers what the sweep leaves behind.
@@ -6145,12 +6189,26 @@ def test_a_draw_file_records_which_model_answered_it():
            (unobserved.get("model_requested"),
             unobserved.get("model_returned"))])
 
-    check("the store's shape moved 26 keys to 28 and by exactly these two, "
-          "checked against the key list the 100 existing draw files carry",
+    check("the store's shape moved 26 keys to 34 in two dated steps and by "
+          "exactly these eight, checked against the key list the 100 oldest "
+          "draw files carry",
           sorted(graded) == sorted(_DRAW_KEYS_BEFORE_THE_MODEL_PAIR
-                                   + ("model_requested", "model_returned"))
-          and len(graded) == 28,
+                                   + ("model_requested", "model_returned")
+                                   + _DRAW_KEYS_HTTP_ACCOUNTING)
+          and len(graded) == 34,
           sorted(set(graded) ^ set(_DRAW_KEYS_BEFORE_THE_MODEL_PAIR)))
+    check("and a graded draw actually decomposes its own wall clock, which is "
+          "the whole point of the six: sleeping, wire time and the longest "
+          "single request are all present and all numbers",
+          all(isinstance(graded[name], (int, float))
+              for name in _DRAW_KEYS_HTTP_ACCOUNTING),
+          [(name, graded.get(name)) for name in _DRAW_KEYS_HTTP_ACCOUNTING])
+    check("a stubbed draw claims no HTTP at all, so it cannot be read as a "
+          "cheap live one",
+          (graded["http_attempts"], graded["seconds_http"],
+           graded["seconds_http_max"]) == (0, 0.0, 0.0),
+          (graded["http_attempts"], graded["seconds_http"],
+           graded["seconds_http_max"]))
 
     # Normalisation is for the comparison, not for the record. Writing the
     # normalised form would spend the pair's whole value: what makes a file
@@ -8556,6 +8614,385 @@ def test_the_write_guard_proves_its_own_interception():
         shutil.rmtree(fake, ignore_errors=True)
 
 
+# --------------------------------------------------------------------- sprint 21
+#
+# The wrapper retries a 5xx as well as a 429, and every HTTP attempt is counted
+# where it happens. Both are changes to what a run *costs* and to what its numbers
+# mean, so both are pinned here rather than left to the next live sweep to reveal.
+
+
+def _sequenced_provider(*statuses):
+    """A stand-in for the real provider call: fails with each status, then answers.
+
+    Raises `ProviderError` with `status` populated, which is what
+    `call_model_detailed` does at the point the SDK error is still typed. The
+    statuses are given in the order they are to be raised.
+    """
+    state = {"n": 0}
+
+    def real(provider, api_key, system, user, role=None):
+        index = state["n"]
+        state["n"] += 1
+        if index < len(statuses):
+            raise agents_core.ProviderError(
+                "%s failed: boom %s" % (provider, statuses[index]),
+                status=statuses[index], exc_class="APIStatusError")
+        return "answered after %d failure(s)" % len(statuses)
+    return real
+
+
+def _wired_instrument(run_eval, real):
+    """An `Instrument` whose wire is `real`, paced fast enough not to matter.
+
+    `_real` is assigned rather than entering the context manager: `__enter__`
+    captures `agents_core.call_model` and rebinds it globally, and a check does
+    not need the global rebinding to exercise `_call`.
+    """
+    governor = run_eval.RateGovernor(rates={"groq": 100000.0})
+    instrument = run_eval.Instrument(governor)
+    instrument._real = real
+    return governor, instrument
+
+
+def _no_real_waiting(run_eval, thunk):
+    """Run `thunk` with `time.sleep` stubbed out, restored on the way back.
+
+    The waits under test are the *numbers the governor returns*, which are
+    asserted directly. Actually taking them would add 5s to an offline suite to
+    prove nothing extra.
+
+    `run_eval.time` is the `time` module itself, so this is process-wide while it
+    is in force. Nothing else sleeps inside these checks, and the `finally` puts
+    the real one back before anything that might.
+    """
+    original = run_eval.time.sleep
+    run_eval.time.sleep = lambda seconds: None
+    try:
+        return thunk()
+    finally:
+        run_eval.time.sleep = original
+
+
+def _raised(thunk, kind):
+    """True if `thunk` raised `kind`. Deliberately not `_raises`.
+
+    `_raises` returns a *string* -- the message on a ValueError and
+    `"wrong type: ..."` on anything else -- so both are truthy and using it as a
+    boolean would score the wrong exception as a pass. These checks care which
+    exception came out.
+    """
+    try:
+        thunk()
+    except kind:
+        return True
+    return False
+
+
+def test_a_5xx_is_retried_on_its_own_budget_and_a_4xx_is_not():
+    """The hole this closes cost two tasks on 2026-09-02.
+
+    The wrapper was 429-only, so a 503 ended a draw. The inner layer used to cover
+    5xx and was pinned to a single attempt for the eval, which removed that
+    coverage without anything saying so.
+
+    Three things are pinned. A 5xx is retried and the answer is graded rather than
+    lost. The budget is finite, so a provider that is simply down surfaces instead
+    of being retried into the day's quota. And the two budgets are counted
+    separately: a 503 must not spend a quarter of the rate-limit budget and strand
+    the run on the 429 storm that needed it.
+    """
+    run_eval = _import_run_eval()
+
+    governor, instrument = _wired_instrument(
+        run_eval, _sequenced_provider(503, 502))
+    text = _no_real_waiting(
+        run_eval,
+        lambda: instrument._call("groq", "k", "sys", "usr", role="executor"))
+    check("two 5xx then an answer returns the answer, where the wrapper used to "
+          "let the first 5xx end the draw",
+          text == "answered after 2 failure(s)", text)
+    check("the 5xx events are recorded, and not in `rate_limits`, which is "
+          "printed as \"429 <provider> Retry-After=...\" in both manifests",
+          len(governor.server_errors) == 2 and governor.rate_limits == [],
+          (governor.server_errors, governor.rate_limits))
+    check("each 5xx is recorded with the status the provider actually sent",
+          [e["status"] for e in governor.server_errors] == [503, 502],
+          governor.server_errors)
+    check("the waits are the registered fallback in order, and no header is "
+          "honoured on a 5xx",
+          [e["waited"] for e in governor.server_errors]
+          == list(run_eval.FALLBACK_5XX_BACKOFF)
+          and all(e["source"] == "backoff" for e in governor.server_errors),
+          governor.server_errors)
+
+    governor, instrument = _wired_instrument(
+        run_eval, _sequenced_provider(500, 500, 500, 500))
+    raised = _no_real_waiting(run_eval, lambda: _raised(
+        lambda: instrument._call("groq", "k", "sys", "usr", role="executor"),
+        agents_core.ProviderError))
+    check("a provider that is down surfaces once the budget is spent, rather "
+          "than being retried into the day's quota",
+          raised and instrument.retries == run_eval.MAX_5XX_RETRIES
+          and instrument.calls == 1 + run_eval.MAX_5XX_RETRIES,
+          (raised, instrument.retries, instrument.calls))
+
+    governor, instrument = _wired_instrument(
+        run_eval, _sequenced_provider(503, 429, 429, 429, 429))
+    text = _no_real_waiting(
+        run_eval,
+        lambda: instrument._call("groq", "k", "sys", "usr", role="executor"))
+    check("a 5xx does not spend the 429 budget: one 503 and then the full four "
+          "rate limits still reaches the answer",
+          text == "answered after 5 failure(s)"
+          and len(governor.rate_limits) == run_eval.MAX_429_RETRIES
+          and len(governor.server_errors) == 1,
+          (text, len(governor.rate_limits), len(governor.server_errors)))
+    check("and the 429 attempt ordinals are its own, unshifted by the 5xx that "
+          "preceded them -- they index `FALLBACK_BACKOFF`",
+          [e["attempt"] for e in governor.rate_limits] == [1, 2, 3, 4],
+          governor.rate_limits)
+
+    governor, instrument = _wired_instrument(
+        run_eval, _sequenced_provider(400, 400))
+    raised = _raised(
+        lambda: instrument._call("groq", "k", "sys", "usr", role="executor"),
+        agents_core.ProviderError)
+    check("a 400 is still not retried, so a dead slug does not burn the budget",
+          raised and instrument.calls == 1 and instrument.retries == 0,
+          (raised, instrument.calls, instrument.retries))
+
+
+def test_a_5xx_is_classified_off_the_status_and_never_off_the_message():
+    """`_server_error_info` is deliberately narrower than `_rate_limit_info`.
+
+    That one falls back to `"429" in str(exc)`, because a rate limit is worth
+    catching even when the SDK's typing is lost. The same fallback on 5xx would
+    match any error whose body happened to contain "500" -- and a retry budget
+    spent on a misclassified 400 is spent against a per-day quota.
+
+    Also pinned: the `__context__` walk both functions now share still works. It
+    is a *split* out of `_rate_limit_info`, not new behaviour, and the check that
+    it did not change `_rate_limit_info` is here rather than assumed.
+    """
+    run_eval = _import_run_eval()
+
+    def perr(status):
+        return agents_core.ProviderError("groq failed: boom %s" % status,
+                                         status=status)
+
+    check("a typed 5xx is read off `ProviderError.status`, which "
+          "`call_model_detailed` sets while the SDK error is still typed",
+          run_eval._server_error_info(perr(503)) == (True, 503)
+          and run_eval._server_error_info(perr(500)) == (True, 500)
+          and run_eval._server_error_info(perr(599)) == (True, 599),
+          [run_eval._server_error_info(perr(s)) for s in (503, 500, 599)])
+    check("a 429 is not a server error, so it takes the rate-limit branch and "
+          "its own budget",
+          run_eval._server_error_info(perr(429)) == (False, 429))
+    check("an error carrying no status at all is neither, and is raised",
+          run_eval._server_error_info(
+              agents_core.ProviderError("no status anywhere")) == (False, None))
+    check("a message that merely contains a 5xx-shaped number is not retried",
+          run_eval._server_error_info(agents_core.ProviderError(
+              "failed after 500 characters")) == (False, None)
+          and run_eval._server_error_info(agents_core.ProviderError(
+              "connection reset (503 bytes read)")) == (False, None))
+
+    class _Typed(Exception):
+        def __init__(self, status):
+            Exception.__init__(self, "typed %s" % status)
+            self.status_code = status
+
+    try:
+        raise _Typed(502)
+    except _Typed:
+        try:
+            raise agents_core.ProviderError("status lost in the wrapping")
+        except agents_core.ProviderError as exc:
+            check("the shared `__context__` walk finds a status the wrapper lost, "
+                  "which is the case the split exists to serve twice",
+                  run_eval._server_error_info(exc) == (True, 502),
+                  run_eval._server_error_info(exc))
+
+    check("the split left `_rate_limit_info` classifying a typed 429 as it did",
+          run_eval._rate_limit_info(perr(429))[0] is True)
+    check("and left its message fallback intact, which is the asymmetry with "
+          "`_server_error_info` and not an oversight in it",
+          run_eval._rate_limit_info(
+              agents_core.ProviderError("429 rate limit reached"))[0] is True
+          and run_eval._rate_limit_info(
+              agents_core.ProviderError("Rate Limit"))[0] is True)
+
+
+def test_every_http_attempt_is_counted_where_it_happens():
+    """152 call events from the 2026-09-02 sweep each claimed zero waiting.
+
+    None of them was wrong. `Instrument` rebinds `call_model`, so every retry and
+    every second slept happens *inside* one `_attempt_provider` invocation, and the
+    layer that owns the call record cannot see any of it. The question was put to
+    the wrong layer. Draws in that sweep ran to 8467.2s at `calls: 2` and nothing
+    on disk can say whether one request was held open or a wait was honoured.
+
+    So: one event per HTTP attempt with its own latency, a marker distinguishing
+    the two regimes in one file, and the totals reported up through
+    `agents_core.note_waits` onto the record that used to read zero.
+    """
+    run_eval = _import_run_eval()
+    directory = tempfile.mkdtemp(prefix="http-attempts-")
+    log = agents_core.EventLog(os.path.join(directory, "events.jsonl"), keys={})
+    previous = agents_core.set_event_log(log)
+    try:
+        governor, instrument = _wired_instrument(
+            run_eval, _sequenced_provider(503, 429))
+        agents_core.note_waits(None)
+        _no_real_waiting(
+            run_eval,
+            lambda: instrument._call("groq", "k", "sys", "usr", role="executor"))
+        rows = [e for e in _read_events(log.path)
+                if e["kind"] == agents_core.EVENT_HTTP_ATTEMPT]
+        check("one event per HTTP attempt, where the old file carried one per "
+              "provider attempt and collapsed up to fifteen requests into it",
+              len(rows) == 3 and instrument.http_attempts == 3
+              and instrument.calls == 3,
+              (len(rows), instrument.http_attempts, instrument.calls))
+        check("the kind is in the closed vocabulary, so it is not a typo that "
+              "would leave a hole in every count made from this file",
+              agents_core.EVENT_HTTP_ATTEMPT in agents_core.EVENT_KINDS)
+        check("each row is stamped with the accounting regime, so the rows "
+              "written before this existed cannot be read as complete",
+              all(e["accounting"] == run_eval.HTTP_ACCOUNTING for e in rows),
+              [e.get("accounting") for e in rows])
+        check("`attempt` is the ordinal within the call, so a row says whether "
+              "it was a retry rather than only where it sits in the file",
+              [e["attempt"] for e in rows] == [1, 2, 3],
+              [e["attempt"] for e in rows])
+        check("each row carries its own latency, which is the field that "
+              "separates one long request from a long wait",
+              all(isinstance(e["seconds"], float) and e["seconds"] >= 0.0
+                  for e in rows), [e["seconds"] for e in rows])
+        check("the outcome recorded is the attempt's and not the call's, and the "
+              "retried ones say they were retried",
+              [e["ok"] for e in rows] == [False, False, True]
+              and [e["retrying"] for e in rows] == [True, True, False],
+              [(e["ok"], e["retrying"]) for e in rows])
+        check("the failing attempts name their status, so a 5xx and a 429 in one "
+              "call are distinguishable after the fact",
+              [e["status"] for e in rows] == [503, 429, None],
+              [e["status"] for e in rows])
+        check("no prompt, no reply and no key reaches an http_attempt row",
+              not [name for e in rows for name in e
+                   if name in ("system", "user", "prompt", "code", "text")]
+              and "k" not in [e.get("api_key") for e in rows],
+              [sorted(e) for e in rows[:1]])
+
+        waits = agents_core.last_waits()
+        check("the wrapper reports its waiting upward, in the layer-below terms "
+              "`_fold_waits` folds onto the call record",
+              waits.get("http_attempts") == 3
+              and waits.get("backoff") == run_eval.FALLBACK_5XX_BACKOFF[0]
+              + run_eval.FALLBACK_BACKOFF[0],
+              waits)
+        check("and reports the wire time it measured, summed and at its maximum",
+              waits["seconds_http"] >= waits["seconds_http_max"] >= 0.0, waits)
+
+        governor, instrument = _wired_instrument(
+            run_eval, _sequenced_provider(500, 500, 500))
+        agents_core.note_waits(None)
+        _no_real_waiting(run_eval, lambda: _raised(
+            lambda: instrument._call("groq", "k", "s", "u", role="executor"),
+            agents_core.ProviderError))
+        check("a call that dies reports its waiting too, because a draw lost to "
+              "a provider is exactly when the accounting is wanted",
+              agents_core.last_waits().get("http_attempts")
+              == 1 + run_eval.MAX_5XX_RETRIES, agents_core.last_waits())
+
+        before = len(_read_events(log.path))
+        stubbed = run_eval.Instrument(
+            run_eval.RateGovernor(), stub=lambda p, s, u, role=None: "stubbed")
+        agents_core.note_waits(None)
+        answer = stubbed._call("groq", "k", "s", "u")
+        check("a stubbed call still counts as a call but makes no HTTP claim: an "
+              "`http_attempt` row has to mean a request left the machine",
+              answer == "stubbed" and stubbed.calls == 1
+              and stubbed.http_attempts == 0
+              and len(_read_events(log.path)) == before,
+              (answer, stubbed.calls, stubbed.http_attempts))
+        check("and a stub reports no wire time either, so a stub sweep cannot be "
+              "read as a cheap live one",
+              (stubbed.seconds_http, stubbed.seconds_http_max) == (0.0, 0.0),
+              (stubbed.seconds_http, stubbed.seconds_http_max))
+    finally:
+        agents_core.set_event_log(previous)
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_the_wrapper_reports_its_waiting_onto_the_call_record():
+    """`agents_core`'s side of the same change: the fold, and its closed vocabulary.
+
+    The precedent is `_LAST_COMPLETION`, which the layer below already uses to
+    report a `finish_reason` upward without changing `call_model`'s return type.
+    This is the second such channel and it follows the same rule: cleared before
+    the call, so an empty channel means "nothing was observed" and never a stale
+    value from the last one.
+
+    The two seconds fields are *added* to what the record already holds and the
+    three counts are *assigned*, because the record's own `seconds_paced` is a
+    different sleep from the wrapper's and a max is not a sum.
+    """
+    record = {"seconds_paced": 1.0, "seconds_backoff": 0.5}
+    agents_core.note_waits({"paced": 2.0, "backoff": 5.0, "http_attempts": 3,
+                            "seconds_http": 9.5, "seconds_http_max": 8.0})
+    agents_core._fold_waits(record)
+    check("the seconds are added to the record's own and the counts assigned",
+          record == {"seconds_paced": 3.0, "seconds_backoff": 5.5,
+                     "http_attempts": 3, "seconds_http": 9.5,
+                     "seconds_http_max": 8.0}, record)
+
+    untouched = {"seconds_paced": 1.0, "seconds_backoff": 0.5}
+    agents_core.note_waits(None)
+    agents_core._fold_waits(untouched)
+    check("a cleared channel leaves the record exactly as it was, so a call "
+          "through a path that does not report cannot inherit the last one's "
+          "numbers",
+          untouched == {"seconds_paced": 1.0, "seconds_backoff": 0.5}
+          and agents_core.last_waits() == {}, untouched)
+
+    check("an unknown wait key raises rather than being dropped, for the same "
+          "reason the event vocabulary is closed",
+          _raised(lambda: agents_core.note_waits({"secondss_http": 1.0}),
+                  ValueError))
+    check("a partial report folds what it has and leaves the rest alone",
+          agents_core.note_waits({"backoff": 2.0}) is None
+          and agents_core._fold_waits(
+              {"seconds_paced": 0.0, "seconds_backoff": 0.0})
+          == {"seconds_paced": 0.0, "seconds_backoff": 2.0})
+    agents_core.note_waits(None)
+
+    check("`last_waits` hands back a copy, so a caller cannot edit the channel "
+          "by holding what it read",
+          agents_core.last_waits() is not agents_core._LAST_WAITS)
+
+    snapshot = agents_core.retry_snapshot()
+    check("the manifest's retry block now names the SDK layer beneath this "
+          "module's own, which was invisible to `calls` until it was pinned",
+          "sdk_retry_kwargs" in snapshot
+          and "sdk_default_max_retries" in snapshot, sorted(snapshot))
+    was = agents_core.MEASUREMENT_MODE
+    try:
+        agents_core.set_measurement_mode(True)
+        check("on the measured path the SDK is pinned to one attempt, so one "
+              "attempt in this project's count is one HTTP request",
+              agents_core._sdk_retry_kwargs() == {"max_retries": 0}
+              and agents_core.retry_snapshot()["sdk_retry_kwargs"]
+              == {"max_retries": 0})
+        agents_core.set_measurement_mode(False)
+        check("off it nothing is passed, because the interactive app keeps the "
+              "retry coverage the eval gives up",
+              agents_core._sdk_retry_kwargs() == {})
+    finally:
+        agents_core.set_measurement_mode(was)
+
+
 def main():
     for fn in (
         test_pipeline_is_explicit, test_mode_2_skips_execution,
@@ -8701,6 +9138,12 @@ def main():
         # sprint 18: the write guard is an external wrapper, so what is pinned is
         # that its self-test can fail, and that it does not over-deny
         test_the_write_guard_proves_its_own_interception,
+        # sprint 21, item B: the wrapper covers 5xx as well as 429, and every HTTP
+        # attempt is counted at the layer that makes it
+        test_a_5xx_is_retried_on_its_own_budget_and_a_4xx_is_not,
+        test_a_5xx_is_classified_off_the_status_and_never_off_the_message,
+        test_every_http_attempt_is_counted_where_it_happens,
+        test_the_wrapper_reports_its_waiting_onto_the_call_record,
     ):
         print("\n-- %s" % fn.__name__)
         try:

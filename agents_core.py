@@ -823,6 +823,119 @@ def note_completion(detail):
         _LAST_COMPLETION.update(detail)
 
 
+# The second side channel, and it exists for the same reason as the first: the
+# thing that knows the answer sits *below* the thing that writes the record.
+#
+# `eval/run_eval.Instrument` replaces `call_model` -- the symbol `_attempt_provider`
+# calls -- so every wrapper-level retry, and every second it sleeps between them,
+# happens inside one `_attempt_provider` invocation. `_attempt_provider` then emits
+# a record whose `seconds_backoff` is 0.0 and whose `attempts` is 1, because from
+# where it stands that is true. On the 2026-09-02 tier-3 sweep that produced 152
+# call events every one of which claimed zero waiting, across draws that took up
+# to 8467.2s. The number was not wrong, it was answered by the wrong layer.
+#
+# Same staleness rule as `_LAST_COMPLETION`, for the same reason: cleared before
+# the call and read after, so `{}` means "the layer below reported nothing" -- a
+# stand-in, or an uninstrumented path -- and never a previous attempt's total.
+_LAST_WAITS = {}
+
+_WAIT_KEYS = ("paced", "backoff", "http_attempts", "seconds_http",
+              "seconds_http_max")
+
+
+def last_waits():
+    """What the layer below waited and how often it went to the wire, or ``{}``."""
+    return dict(_LAST_WAITS)
+
+
+def note_waits(waits):
+    """Record (or, with a falsy ``waits``, forget) the layer below's waiting.
+
+    Keys are `_WAIT_KEYS`. Unknown keys raise rather than being dropped: this is
+    a channel between two files, and a typo here would read downstream as "that
+    layer waited zero", which is the exact failure it was added to fix.
+    """
+    _LAST_WAITS.clear()
+    if not waits:
+        return
+    unknown = [name for name in waits if name not in _WAIT_KEYS]
+    if unknown:
+        raise ValueError("unknown wait key(s) %s; the vocabulary is %s"
+                         % (", ".join(sorted(unknown)), ", ".join(_WAIT_KEYS)))
+    _LAST_WAITS.update(waits)
+
+
+def _fold_waits(record):
+    """Move the layer below's waiting onto ``record``, in that layer's own terms.
+
+    Additive on the two seconds fields, because `_attempt_provider` has its own
+    pacing and its own backoff and both are real; this adds a second contributor
+    rather than overwriting a first. `http_attempts` is assigned, not added: it
+    is the count for this provider attempt, and the loop calls this once per
+    attempt.
+
+    Absent keys leave the record alone. An uninstrumented path -- the interactive
+    app, or any of the two dozen `call_model` stand-ins -- then leaves
+    `http_attempts` at 0, which reads as "nothing below reported" and is honest;
+    a 1 written here would be this function inventing a measurement.
+    """
+    waits = _LAST_WAITS
+    if not waits:
+        return record
+    if "paced" in waits:
+        record["seconds_paced"] = round(
+            record["seconds_paced"] + waits["paced"], 3)
+    if "backoff" in waits:
+        record["seconds_backoff"] = round(
+            record["seconds_backoff"] + waits["backoff"], 3)
+    for name in ("http_attempts", "seconds_http", "seconds_http_max"):
+        if name in waits:
+            record[name] = waits[name]
+    return record
+
+
+def _sdk_retry_kwargs():
+    """``max_retries`` for a client on the measured path, or nothing at all.
+
+    openai 2.48.0 defaults to ``DEFAULT_MAX_RETRIES = 2``, so three HTTP tries
+    per request, and it retries on 408, 409, 429 and every status >= 500
+    (`_base_client._should_retry`). None of those tries is visible to
+    `Instrument.calls`, to the event log, or to the manifest's `spent`: the SDK
+    makes them beneath the lowest layer this project instruments. On 2026-09-02
+    the provider's own counter caught them -- Google recorded 20 requests against
+    13 planner events, and two 503s alone account for up to six of the 20 against
+    a 20-per-day quota.
+
+    So under measurement mode the SDK's retry layer is turned off and the
+    project's own layers do the retrying, where a request is counted before it is
+    made. Outside measurement mode nothing is passed and the installed SDK's
+    default stands: `agents_core.py:1198-1204` registers that the interactive app
+    deliberately keeps retry coverage this eval gives up, and pinning a number
+    here would freeze the app's robustness to whatever 2.48.0 happens to default
+    to.
+    """
+    return {"max_retries": 0} if MEASUREMENT_MODE else {}
+
+
+def _sdk_default_max_retries():
+    """The installed SDK's own retry default, or None if openai is not importable.
+
+    Read from the library rather than written down, because the whole point of the
+    number on the manifest is to say what `{}` from `_sdk_retry_kwargs` meant on
+    the day of the run. A literal 2 here would keep reading 2 after an upgrade
+    changed it, which is the failure mode this field exists to close.
+
+    `openai` is imported inside the function for the same reason every other
+    import of it in this module is: the module has to import with the dependency
+    absent, which is how both offline suites run.
+    """
+    try:
+        import openai
+    except Exception:
+        return None
+    return getattr(openai, "DEFAULT_MAX_RETRIES", None)
+
+
 def call_model_detailed(provider, api_key, system, user, role=None):
     """One model call, with the accounting a bare string cannot carry.
 
@@ -860,7 +973,8 @@ def call_model_detailed(provider, api_key, system, user, role=None):
         # without the SDK installed.
         from openai import OpenAI
 
-        client = OpenAI(api_key=api_key, base_url=cfg["base_url"], timeout=60)
+        client = OpenAI(api_key=api_key, base_url=cfg["base_url"], timeout=60,
+                        **_sdk_retry_kwargs())
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -961,9 +1075,19 @@ def preflight_pair(provider, model, api_key, call=None, params=None):
         def call(provider_name, key, slug, system, user, sent_params):
             from openai import OpenAI
 
+            # `max_retries=0` unconditionally, not under measurement mode: a
+            # preflight runs *before* `set_measurement_mode(True)` -- see
+            # `eval/calibrate.py:1122` against `:1139` -- so a conditional here
+            # would never fire on the path that pays for it. Nothing is lost: no
+            # caller outside `eval/` reaches this, the interactive app never runs
+            # a preflight, and this function's whole documented posture is that
+            # "any exception is a failure ... the useful bias is to refuse".
+            # Three silent tries is the opposite of that bias, and the timed-out
+            # preflight that refused run 1 on 2026-09-02 cost up to 3 of the day's
+            # 20 Gemini requests to say so once.
             client = OpenAI(api_key=key,
                             base_url=PROVIDERS[provider_name]["base_url"],
-                            timeout=30)
+                            timeout=30, max_retries=0)
             keywords, extra = split_params(sent_params)
             if extra:
                 keywords["extra_body"] = extra
@@ -1041,11 +1165,16 @@ def list_models(provider, api_key):
     "What can this key actually reach" should be a command, not a script written
     into /tmp when a slug retires. `eval/models.py --list <provider>` is that
     command; this is what it calls.
+
+    ``max_retries=0`` for the same reason as `preflight_pair`'s client: this is a
+    diagnostic, it is reached only from `eval/models.py`, and a diagnostic that
+    silently makes three requests to answer "can this key reach anything" is
+    spending a quota to hide the answer.
     """
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url=PROVIDERS[provider]["base_url"],
-                    timeout=30)
+                    timeout=30, max_retries=0)
     return sorted(getattr(item, "id", str(item))
                   for item in client.models.list())
 
@@ -1257,7 +1386,18 @@ def retry_snapshot():
             "backoff_run_id": _BACKOFF_RUN_ID,
             "real_sleep": _RETRY_SLEEP is time.sleep,
             "schedule_seconds": backoff_schedule(_BACKOFF_RUN_ID,
-                                                 _RETRY_ATTEMPTS)}
+                                                 _RETRY_ATTEMPTS),
+            # The layer below this one. Every constant above describes retries
+            # *this module* performs; the openai SDK performs its own beneath them,
+            # and until it was pinned it was invisible to `calls`, to the event log
+            # and to the manifest's `spent` alike -- so a run could make three
+            # times the HTTP requests it reported and no field would show it.
+            # `{"max_retries": 0}` is the measured configuration, one attempt per
+            # request. `{}` means nothing is passed and openai 2.48.0's own default
+            # of 2 retries applies, which is deliberate off the measured path: the
+            # interactive app keeps its retry coverage.
+            "sdk_retry_kwargs": _sdk_retry_kwargs(),
+            "sdk_default_max_retries": _sdk_default_max_retries()}
 
 
 # Minimum seconds between two calls to the same provider, enforced client-side
@@ -1452,9 +1592,23 @@ EVENT_GATE = "gate"
 EVENT_VERDICT = "verdict"
 EVENT_INFRA_LOSS = "infra_loss"
 EVENT_RESUME_SKIP = "resume_skip"
+# One per HTTP request, where `call` is one per *provider attempt*. The two are
+# not the same number and were being read as if they were: the 2026-09-02 store
+# holds 227 wrapper attempts against 152 `call` events, because every retry
+# `eval/run_eval.Instrument` makes happens inside one `_attempt_provider` call and
+# therefore inside one `call` event.
+#
+# A separate kind rather than a field on `call`, so that no count computed from
+# this vocabulary changes meaning: `kind == "call"` still means what it meant in
+# every existing reader and in every file already on disk. It is also the marker
+# that tells the two regimes apart in a file that spans the change -- a task whose
+# events include `http_attempt` rows has complete HTTP accounting, and a task
+# whose events do not is from before this existed and undercounts.
+EVENT_HTTP_ATTEMPT = "http_attempt"
 
 EVENT_KINDS = (EVENT_CALL, EVENT_STEP, EVENT_CANDIDATE, EVENT_GATE,
-               EVENT_VERDICT, EVENT_INFRA_LOSS, EVENT_RESUME_SKIP)
+               EVENT_VERDICT, EVENT_INFRA_LOSS, EVENT_RESUME_SKIP,
+               EVENT_HTTP_ATTEMPT)
 
 EVENT_LOG_SUFFIX = ".events.jsonl"
 
@@ -1732,6 +1886,22 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         "retried": 0,
         "seconds_paced": 0.0,
         "seconds_backoff": 0.0,
+        # HTTP requests actually made for this provider attempt, and where their
+        # seconds went. `attempts` above counts *this* loop, which under
+        # `set_retry_attempts(1)` is always 1 while the layer below may have gone
+        # to the wire five times; these three are that layer's own count, arriving
+        # through `note_waits`. 0 means nothing below reported -- a stand-in, or
+        # the interactive app, which does its own retrying in this loop -- and
+        # never "one request was made".
+        #
+        # `seconds_http_max` is the field the 2026-09-02 sweep did not have and
+        # needed: a draw that took 8467.2s at `calls: 2` is either one request
+        # that stayed open for hours or two fast requests either side of a
+        # `Retry-After` this project honoured without a cap, the remedies are
+        # different, and nothing in the store distinguishes them.
+        "http_attempts": 0,
+        "seconds_http": 0.0,
+        "seconds_http_max": 0.0,
     }
     # Every sampling parameter actually sent, by its own name, so `temperature`
     # and `top_p` keep the keys every existing reader uses and a provider-specific
@@ -1767,8 +1937,13 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
             # is then this attempt's completion or nothing at all, and a stub that
             # sets nothing cannot inherit the previous attempt's `finish_reason`.
             note_completion(None)
+            # Same rule, same reason, for the waiting the layer below did. Cleared
+            # here and folded in on both exits, so an attempt that reports nothing
+            # cannot inherit the previous attempt's seconds.
+            note_waits(None)
             text = call_model(provider, key, system, user, role=role)
         except ProviderError as exc:
+            _fold_waits(record)
             error = exc
             record["error"] = _redact(exc, keys)
             record["status"] = exc.status
@@ -1815,6 +1990,7 @@ def _attempt_provider(role, requested, provider, key, system, user, keys):
         record["error"] = None
         record["status"] = None
         record["exc_class"] = ""
+        _fold_waits(record)
         # One read of the side channel, not two: `finish_reason` and the returned
         # slug are facts about the same completion, and two `last_completion()`
         # calls could in principle straddle a `note_completion` from elsewhere.

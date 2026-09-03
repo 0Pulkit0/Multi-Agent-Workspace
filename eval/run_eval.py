@@ -75,6 +75,45 @@ BURST = 2.0
 MAX_429_RETRIES = 4
 FALLBACK_BACKOFF = (2.0, 5.0, 12.0, 30.0)
 
+# 5xx, separately budgeted from 429, because they are not the same failure.
+#
+# This layer was 429-only, and that was a hole rather than a policy. Two retry
+# layers exist and only one may be active at a time (`agents_core.py:1198-1204`);
+# the eval pins the inner one to 1 attempt and keeps this one, and the inner one
+# is where `RETRY_STATUS_FLOOR = 500` lived. So on both the calibration and grid
+# paths a 429 got four retries with `Retry-After` honoured and a 503 got none,
+# which is strictly less coverage than the interactive app has on the one path
+# where a lost call costs a measurement. It cost two tasks on 2026-09-02:
+# `expression-eval-02` and `expression-eval-01`, the latter unplanned from
+# 17:39:19Z until 22:14:40Z.
+#
+# Two retries and not four: a 429 is the provider asking for time and its own
+# header says how much, while a 5xx is the provider being unwell with no such
+# number, and under a 20-request-per-day quota an optimistic retry budget spends
+# the day rather than saving it. Short waits for the same reason -- if two tries
+# 1s and 4s apart both fail, the provider is not having a blip.
+MAX_5XX_RETRIES = 2
+FALLBACK_5XX_BACKOFF = (1.0, 4.0)
+
+# Stamped on every `http_attempt` event, and the reason the new kind is safe to
+# add to a file that already holds 197 events written under the old regime.
+#
+# Those 197 are one event per *provider* attempt: `_emit_call_event` fires from
+# `agents_core._attempt_provider`, which is one level above `call_model`, so all
+# five of this wrapper's retries and all three of the SDK's collapse into a single
+# `call` row. Counting HTTP requests from that file gives 197 and the truth is
+# somewhere up to 15x that. Both regimes now coexist in `events.jsonl`, and
+# telling them apart cannot be left to inference from the count:
+#
+#   - a task whose events include `http_attempt` rows has per-request accounting;
+#   - a task whose events do not is from before this existed, and its `call`
+#     rows are a lower bound on HTTP requests rather than a count of them.
+#
+# The value is versioned rather than boolean so that a later change to what one
+# row means -- SDK-internal retries becoming visible, say -- is a new value here
+# instead of a silent redefinition of a field that already reads True.
+HTTP_ACCOUNTING = "per_http_attempt/1"
+
 # ------------------------------------------------------------------ outcomes
 
 # What happened to a cell, as three mutually exclusive values.
@@ -117,6 +156,12 @@ class RateGovernor(object):
         self.checked = dict((name, time.time()) for name in self.rates)
         self.slept = dict((name, 0.0) for name in self.rates)
         self.rate_limits = []
+        # 5xx kept out of `rate_limits` deliberately. That list is printed as
+        # "429 %s Retry-After=..." at the end of a grid run and is copied into
+        # both manifests under the key `rate_limits`; putting a 503 in it would
+        # make every historical count of "rate-limit event(s)" mean something
+        # different depending on when the file was written.
+        self.server_errors = []
 
     def acquire(self, provider):
         per_second = self.rates.get(provider, 0.0) / 60.0
@@ -150,22 +195,77 @@ class RateGovernor(object):
             "source": "header" if retry_after is not None else "backoff"})
         return wait
 
+    def note_server_error(self, provider, status, attempt):
+        """Record the 5xx and return how long to wait before retrying.
+
+        No header is consulted. A 429 carries the provider's own number and it
+        wins over ours because it knows; a 5xx carries nothing comparable, and
+        `Retry-After` on one is a hint about a load balancer rather than about a
+        quota. Uncapped honouring of a header is also the shape of the one thing
+        this project cannot presently rule out about its own 8467.2s draw, so the
+        new path does not add a second place it could happen.
+        """
+        wait = FALLBACK_5XX_BACKOFF[min(attempt, len(FALLBACK_5XX_BACKOFF) - 1)]
+        self.server_errors.append({
+            "provider": provider, "status": status,
+            "waited": round(wait, 2), "attempt": attempt + 1,
+            "at": round(time.time(), 3), "source": "backoff"})
+        return wait
+
 # ---------------------------------------------------------------- instrumenting
 
-def _rate_limit_info(exc):
-    """`(is_429, retry_after_seconds)` for a ProviderError, from the SDK error.
+def _sdk_status(exc):
+    """`(status, response)` off the SDK exception a ProviderError wrapped.
+
+    A **split** out of `_rate_limit_info`, not a new capability: these four lines
+    were its first four and are now shared with `_server_error_info`, so the two
+    read the status the same way instead of two walks that can drift. Nothing
+    about what `_rate_limit_info` returns has changed.
 
     `agents_core.call_model` re-raises as ProviderError, which loses the typed
-    exception -- but not the object: Python keeps the original on
-    `__context__`, so the status code and the `Retry-After` header are still
-    reachable without reimplementing the provider call here and letting the
-    model IDs drift apart.
+    exception -- but not the object: Python keeps the original on `__context__`,
+    so the status code and the response headers are still reachable without
+    reimplementing the provider call here.
     """
     original = getattr(exc, "__context__", None)
     status = getattr(original, "status_code", None)
     response = getattr(original, "response", None)
     if status is None:
         status = getattr(response, "status_code", None)
+    return status, response
+
+
+def _server_error_info(exc):
+    """`(is_5xx, status)` for a ProviderError.
+
+    Deliberately narrower than `_rate_limit_info`'s string sniffing. That one
+    falls back to `"429" in str(exc)` because a rate limit is worth catching even
+    when the SDK's typing is lost; here a substring test would match any error
+    whose body happened to contain "500", and a retry budget spent on a
+    misclassified 400 is spent against a per-day quota. A 5xx is retried only
+    when the status was actually read.
+
+    `agents_core.ProviderError.status` is preferred over the walk, because
+    `call_model_detailed` sets it from `_status_of(exc)` at the point the SDK
+    error is still typed.
+    """
+    status = getattr(exc, "status", None)
+    if status is None:
+        status, _ = _sdk_status(exc)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return False, None
+    return 500 <= status < 600, status
+
+
+def _rate_limit_info(exc):
+    """`(is_429, retry_after_seconds)` for a ProviderError, from the SDK error.
+
+    The status and the `Retry-After` header come off `__context__` via
+    `_sdk_status`; see that function for why they are still reachable.
+    """
+    status, response = _sdk_status(exc)
     is_429 = status == 429 or "429" in str(exc) or "rate limit" in str(exc).lower()
     retry_after = None
     headers = getattr(response, "headers", None)
@@ -189,8 +289,13 @@ class Instrument(object):
     """Wraps `agents_core.call_model` -- the one place that touches a provider.
 
     Counts calls, names the providers actually used, applies the governor
-    before each call and retries a 429 rather than letting it surface as a
-    provider failure and silently become a different result.
+    before each call and retries a 429 or a 5xx rather than letting either
+    surface as a provider failure and silently become a different result.
+
+    Also the only layer that can say how long a request took and how many were
+    made, because it is the only one on both sides of the wire: it emits one
+    `http_attempt` event per attempt and reports the totals up to
+    `_attempt_provider` through `agents_core.note_waits`.
     """
 
     def __init__(self, governor, stub=None, verbose=False):
@@ -210,6 +315,15 @@ class Instrument(object):
         # anyone needs; the calibration sweep's projection is built off this.
         self.calls_by_provider = {}
         self.slept = 0.0
+        # HTTP, as distinct from calls. `calls` counts what this wrapper tried;
+        # these count what reached the wire and what it cost, summed across every
+        # attempt of every call in the draw. `seconds_http_max` is the single
+        # longest request, and it is the field the 2026-09-02 sweep needed and did
+        # not have: against a draw of 8467.2s it separates one request held open
+        # from a long wait between two fast ones. Zero on a stubbed run, always.
+        self.http_attempts = 0
+        self.seconds_http = 0.0
+        self.seconds_http_max = 0.0
 
     def __enter__(self):
         self._real = agents_core.call_model
@@ -221,7 +335,32 @@ class Instrument(object):
         return False
 
     def _call(self, provider, api_key, system, user, role=None):
-        for attempt in range(MAX_429_RETRIES + 1):
+        # Two retry budgets, counted separately, because they are answers to
+        # different failures. A 429 says "you asked too often" and the fix is to
+        # wait; a 5xx says "we broke" and the fix is to try again shortly. Sharing
+        # one counter would let a single 503 eat a quarter of the rate-limit budget
+        # and then strand the run on the 429 storm that actually needed it.
+        #
+        # The loop terminates without a separate cap: every path that continues it
+        # increments one of the two counters, and both are bounded, so the worst
+        # case is 1 + MAX_429_RETRIES + MAX_5XX_RETRIES attempts.
+        retries_429 = 0
+        retries_5xx = 0
+        # Reported upward through `agents_core.note_waits` on the way out. The
+        # layer above this one owns the call record and cannot see any of it:
+        # `Instrument.__enter__` rebinds `call_model`, so every retry here happens
+        # *inside* one `_attempt_provider` invocation. That is why 152 call events
+        # from the 2026-09-02 sweep each claimed zero waiting across draws taking
+        # up to 8467.2s -- the question was put to the wrong layer.
+        paced = 0.0
+        backoff = 0.0
+        # Per-call HTTP totals are read back off the instrument as a delta rather
+        # than counted a second time here, so the event rows, the draw record and
+        # what this reports upward cannot disagree about the same requests.
+        base_attempts = self.http_attempts
+        base_seconds = self.seconds_http
+        seconds_http_max = 0.0
+        while True:
             # The governor exists to arrive under a provider's rate limit. A stub
             # never reaches a provider, so pacing it prevents nothing and costs
             # the full interval per call in real time -- measured at 89% of an
@@ -229,29 +368,124 @@ class Instrument(object):
             # task took 13.8s. Skip it when stubbed, and record that in the
             # manifest so a stub summary cannot be read as a real sweep's cost.
             if self.stub is None:
-                self.slept += self.governor.acquire(provider)
+                waited = self.governor.acquire(provider)
+                self.slept += waited
+                paced += waited
             self.calls += 1
             self.calls_by_provider[provider] = (
                 self.calls_by_provider.get(provider, 0) + 1)
             if provider not in self.providers:
                 self.providers.append(provider)
+            started = time.time()
             try:
                 if self.stub is not None:
-                    return self.stub(provider, system, user, role=role)
-                return self._real(provider, api_key, system, user, role=role)
+                    text = self.stub(provider, system, user, role=role)
+                else:
+                    text = self._real(provider, api_key, system, user, role=role)
             except agents_core.ProviderError as exc:
+                elapsed = time.time() - started
                 self.failed_calls += 1
                 is_429, retry_after = _rate_limit_info(exc)
-                if not is_429 or attempt == MAX_429_RETRIES:
+                # 429 first, and only then 5xx, so the existing classification is
+                # untouched: `_rate_limit_info` also matches on the message text,
+                # and an error that reads as a rate limit stays one.
+                if is_429:
+                    is_5xx, status = False, None
+                else:
+                    is_5xx, status = _server_error_info(exc)
+                exhausted = (retries_429 >= MAX_429_RETRIES if is_429
+                             else retries_5xx >= MAX_5XX_RETRIES)
+                retrying = (is_429 or is_5xx) and not exhausted
+                self._note_http_attempt(
+                    provider, role, self.http_attempts - base_attempts + 1,
+                    elapsed, False,
+                    status=getattr(exc, "status", None) or status,
+                    exc_class=getattr(exc, "exc_class", "")
+                    or type(exc).__name__,
+                    retrying=retrying)
+                if self.stub is None:
+                    seconds_http_max = max(seconds_http_max, elapsed)
+                if not retrying:
+                    agents_core.note_waits(self._waits(
+                        paced, backoff, base_attempts, base_seconds,
+                        seconds_http_max))
                     raise
-                wait = self.governor.note_429(provider, retry_after, attempt)
+                if is_429:
+                    wait = self.governor.note_429(
+                        provider, retry_after, retries_429)
+                    retries_429 += 1
+                    if self.verbose:
+                        print("    429 from %s; Retry-After=%s; waiting %.1fs"
+                              % (provider, retry_after, wait))
+                else:
+                    wait = self.governor.note_server_error(
+                        provider, status, retries_5xx)
+                    retries_5xx += 1
+                    if self.verbose:
+                        print("    %s from %s; waiting %.1fs"
+                              % (status, provider, wait))
                 self.retries += 1
-                if self.verbose:
-                    print("    429 from %s; Retry-After=%s; waiting %.1fs"
-                          % (provider, retry_after, wait))
                 time.sleep(wait)
                 self.slept += wait
-        raise AssertionError("unreachable")
+                backoff += wait
+            else:
+                elapsed = time.time() - started
+                self._note_http_attempt(
+                    provider, role, self.http_attempts - base_attempts + 1,
+                    elapsed, True)
+                if self.stub is None:
+                    seconds_http_max = max(seconds_http_max, elapsed)
+                agents_core.note_waits(self._waits(
+                    paced, backoff, base_attempts, base_seconds,
+                    seconds_http_max))
+                return text
+
+    def _waits(self, paced, backoff, base_attempts, base_seconds,
+               seconds_http_max):
+        """What this call waited and how often it went to the wire, for the layer above.
+
+        Consumed by `agents_core._fold_waits`, which *adds* the two seconds fields
+        to the record's own and *assigns* the three counts. The keys are checked
+        against a closed vocabulary there, so a typo raises here rather than
+        quietly reporting nothing.
+        """
+        return {"paced": round(paced, 3),
+                "backoff": round(backoff, 3),
+                "http_attempts": self.http_attempts - base_attempts,
+                "seconds_http": round(self.seconds_http - base_seconds, 3),
+                "seconds_http_max": round(seconds_http_max, 3)}
+
+    def _note_http_attempt(self, provider, role, attempt, seconds, ok,
+                           status=None, exc_class="", retrying=False):
+        """Count one HTTP attempt and emit its event. A no-op when stubbed.
+
+        ``attempt`` is the ordinal *within this call* -- attempt 3 means two
+        earlier requests for the same prompt were retried -- and not a position in
+        the file, which the row order already gives.
+
+        Stubbed runs neither count nor emit, on purpose: an `http_attempt` row and
+        a non-zero `http_attempts` both have to mean a request left the machine, or
+        they are worthless for the thing they were added for. A stub sweep
+        therefore shows `calls` with `http_attempts: 0`, which reads correctly as
+        "no HTTP to account for" rather than as the old regime.
+
+        One row per attempt is exact only while the SDK is pinned to zero retries
+        -- `agents_core._sdk_retry_kwargs`, in measurement mode. Outside it,
+        openai 2.48.0 retries 408/409/429 and every 5xx twice on its own inside a
+        single attempt here, and this count is a lower bound again. Measurement
+        mode is the case that has to be exact.
+        """
+        if self.stub is not None:
+            return None
+        self.http_attempts += 1
+        self.seconds_http = round(self.seconds_http + seconds, 3)
+        self.seconds_http_max = max(self.seconds_http_max, round(seconds, 3))
+        return agents_core.emit_event(
+            agents_core.EVENT_HTTP_ATTEMPT,
+            provider=provider, role=role or "", attempt=attempt,
+            seconds=round(seconds, 3), ok=bool(ok),
+            status=status, exc_class=exc_class, retrying=bool(retrying),
+            accounting=HTTP_ACCOUNTING)
 
 
 class _InstalledEventLog(object):
@@ -978,6 +1212,14 @@ def run_one(task, arm, keys, instrument, repeat, stub=None, plan=None):
     record["calls"] = instrument.calls
     record["failed_calls"] = instrument.failed_calls
     record["rate_limit_retries"] = instrument.retries
+    # HTTP, as distinct from calls: what reached the wire, and the single longest
+    # request. Written here as well as on the calibration draw because it is the
+    # same instrument and the same question -- `http_attempts > calls` means
+    # something was retried inside a call, and `seconds_http_max` close to
+    # `seconds` means one request held the cell open rather than a wait did.
+    record["http_attempts"] = instrument.http_attempts
+    record["seconds_http"] = round(instrument.seconds_http, 2)
+    record["seconds_http_max"] = round(instrument.seconds_http_max, 2)
     record["providers"] = list(instrument.providers)
     record["call_log"] = _call_log_slice(log_start)
     record["provider_substituted"] = any(
@@ -1911,12 +2153,17 @@ def main(argv=None):
                         print("     BUG: a provider was substituted in "
                               "measurement mode; see call_log")
 
-    print("\n%d run(s) in %.1fs; %d rate-limit event(s)"
-          % (done, time.time() - started, len(governor.rate_limits)))
+    print("\n%d run(s) in %.1fs; %d rate-limit event(s), %d server error(s)"
+          % (done, time.time() - started, len(governor.rate_limits),
+             len(governor.server_errors)))
     for event in governor.rate_limits:
         print("  429 %s Retry-After=%s waited %.1fs (%s)"
               % (event["provider"], event["retry_after"], event["waited"],
                  event["source"]))
+    for event in governor.server_errors:
+        print("  %s %s waited %.1fs (attempt %d)"
+              % (event["status"], event["provider"], event["waited"],
+                 event["attempt"]))
     print("%d event(s) written to %s%s"
           % (events.count, events.path,
              " (%d write(s) failed)" % events.failed if events.failed else ""))
@@ -1924,6 +2171,9 @@ def main(argv=None):
     records = load_records(root, args.seed, arms)
     summary = summarise(records)
     summary["rate_limits"] = governor.rate_limits
+    # Beside `rate_limits`, not inside it: this list is what the widened governor
+    # retried, and a 503 announced as a 429 would be worse than not announcing it.
+    summary["server_errors"] = governor.server_errors
     summary["seed"] = args.seed
     summary["stub"] = args.stub
     summary["repeats"] = args.repeats
@@ -1942,6 +2192,14 @@ def main(argv=None):
                          "governor_applied": stub is None,
                          "governor_max_429_retries": MAX_429_RETRIES,
                          "governor_fallback_backoff": list(FALLBACK_BACKOFF),
+                         # A separate budget from the 429 one, counted separately
+                         # per call: a single 503 must not eat a quarter of the
+                         # rate-limit budget and strand the run on the storm that
+                         # needed it.
+                         "governor_max_5xx_retries": MAX_5XX_RETRIES,
+                         "governor_fallback_5xx_backoff": list(
+                             FALLBACK_5XX_BACKOFF),
+                         "http_accounting": HTTP_ACCOUNTING,
                          "agents_core_pacer": agents_core.PACER.snapshot(),
                          "agents_core_retry": agents_core.retry_snapshot()}
     summary["events"] = {"path": os.path.basename(events.path),
