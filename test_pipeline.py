@@ -515,6 +515,85 @@ def test_a_coverage_gap_costs_one_regeneration_and_then_yields():
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_assumptions_are_named_and_shown_above_the_spec():
+    """The decisions the prompt did not make, surfaced instead of buried."""
+    prompt = agents_core.PROMPTS["planner"]
+    check("the Planner is asked for its assumptions",
+          "ASSUMPTIONS:" in prompt and "all four headers" in prompt)
+    check("and is given a way to say there were none",
+          "`ASSUMPTIONS: none`" in prompt)
+    check("nothing downstream demands a machine-readable format",
+          "no particular format" in prompt)
+
+    check("prose assumptions come through",
+          agents_core.extract_assumptions(
+              "ASSUMPTIONS: metres, not feet.\nSPEC: x\n") == "metres, not feet.")
+    for spelling in ("none", "None.", "n/a", "NOTHING"):
+        check("`%s` reads back as no assumptions" % spelling,
+              agents_core.extract_assumptions(
+                  "ASSUMPTIONS: %s\nSPEC: x\n" % spelling) == "", spelling)
+    check("an absent section is not an error",
+          agents_core.extract_assumptions("SPEC: x\n") == "")
+
+    # The load-bearing one: an unlisted header would be swallowed by the SPEC
+    # above it and handed to the Executor as a requirement.
+    after = "SPEC: Exposes f().\nASSUMPTIONS: units are metres\nSTEPS:\n1. go\n"
+    check("assumptions after the spec do not leak into it",
+          agents_core.extract_spec(after) == "Exposes f().",
+          agents_core.extract_spec(after))
+    check("and are still found there",
+          agents_core.extract_assumptions(after) == "units are metres")
+
+    stated = ("ASSUMPTIONS: Ties break low. Empty input is an error.\n"
+              + PLAN)
+    stub = Stub({"planner": stated, "executor": GOOD_CODE})
+    workdir = tempfile.mkdtemp(prefix="runs-")
+    try:
+        run, events = run_with(stub, mode=3, runs_dir=workdir)
+        roles = [role for role, _ in events]
+        check("the assumptions get their own feed entry",
+              "assumptions" in roles, roles)
+        check("and it lands before the acceptance suite",
+              roles.index("assumptions") < roles.index("tests"), roles)
+        check("the run record carries them",
+              run.assumptions.startswith("Ties break low"), run.assumptions)
+        check("the deliverable shows them above everything about the code",
+              (run.deliverable.index("Assumptions the plan made")
+               < run.deliverable.index("Acceptance suite")), run.deliverable[:400])
+        with open(os.path.join(workdir, "%s.json" % run.run_id)) as handle:
+            logged = json.load(handle)["log"]
+        check("and the run JSON records the entry",
+              any(entry["role"] == "assumptions" for entry in logged),
+              [entry["role"] for entry in logged])
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    stub = Stub({"planner": "ASSUMPTIONS: none\n" + PLAN, "executor": GOOD_CODE})
+    workdir = tempfile.mkdtemp(prefix="runs-")
+    try:
+        run, events = run_with(stub, mode=3, runs_dir=workdir)
+        check("`none` produces no entry rather than an empty one",
+              "assumptions" not in [role for role, _ in events])
+        check("and no empty section in the deliverable",
+              "Assumptions the plan made" not in run.deliverable)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    # app.py is untested by construction -- importing it runs Streamlit -- so the
+    # one thing checked here is read statically: every role the pipeline emits
+    # has a label, or it renders as a bare white circle with no explanation.
+    with open("app.py") as handle:
+        tree = ast.parse(handle.read())
+    styles = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", "") == "ROLE_STYLE"):
+            styles = ast.literal_eval(node.value)
+    check("app.py still declares role styles", bool(styles), sorted(styles))
+    missing = sorted(set(roles) - set(styles))
+    check("every role the feed emits has one", not missing, missing)
+
+
 def test_missing_tests_cap_the_verdict():
     stub = Stub({"planner": PLAN_NO_TESTS, "test_writer": "no code here",
                  "executor": GOOD_CODE})
@@ -9451,6 +9530,7 @@ def main():
         test_vacuous_tests_force_unverified,
         test_regeneration_can_rescue_a_vacuous_suite,
         test_a_coverage_gap_costs_one_regeneration_and_then_yields,
+        test_assumptions_are_named_and_shown_above_the_spec,
         test_missing_tests_cap_the_verdict, test_user_tests_win_over_generated,
         test_executor_cannot_weaken_the_tests,
         test_escalation_is_deterministic,

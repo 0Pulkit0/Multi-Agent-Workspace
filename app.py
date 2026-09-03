@@ -117,6 +117,7 @@ if "run_meta" not in st.session_state:
 
 ROLE_STYLE = {
     "planner": ("🟢", "planner"),
+    "assumptions": ("🧭", "assumptions · decisions the prompt did not make"),
     "tests": ("🧾", "acceptance suite · what APPROVED is measured against"),
     "executor": ("🔵", "executor"),
     "harness": ("🧪", "harness · executed"),

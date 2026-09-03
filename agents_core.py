@@ -2103,12 +2103,34 @@ _RUNTIME_RULE = (
     "- `list[int]`, `dict[str, int]` and `tuple[int, ...]` are fine (3.9, PEP 585).\n"
 )
 
+# Why the Planner is asked to name its assumptions: a vague prompt
+# underdetermines the spec, so every gap the Planner closes is a decision the
+# user never made -- units, tie-breaking, what counts as invalid input, whether
+# an empty collection is an error or an identity. Those decisions were previously
+# visible only as whatever the spec happened to say, which is the one place a
+# reader is least likely to notice them.
+#
+# Deliberately prose and deliberately not machine-readable. Nothing downstream
+# parses this section, nothing gates on it, and no assumption is checked against
+# the code. Asking for a format would buy a schema to violate and would suggest a
+# guarantee that does not exist; asking for sentences buys the one thing wanted,
+# which is that a wrong turn is legible before the code is read.
+_ASSUMPTIONS_RULE = (
+    "Before the spec, name the decisions the prompt left open and you had to "
+    "make anyway -- units, tie-breaking, empty or malformed input, output "
+    "shape, anything you invented. Prose, one per line or one paragraph; no "
+    "particular format. If the prompt really settled everything, write the "
+    "literal line `ASSUMPTIONS: none` rather than inventing an assumption to "
+    "fill the section.\n"
+)
+
 PROMPTS = {
     "planner": (
         "You are the Planner for a pipeline that EXECUTES the code it writes "
         "and grades it against tests you write now.\n"
         "The user gives a vague prompt. Rewrite it into a clear spec, break it "
         "into numbered steps, then write the acceptance tests.\n\n"
+        + _ASSUMPTIONS_RULE + "\n"
         + _INTERFACE_RULE +
         "\nRequirements for the steps:\n"
         "- Each step must be deliverable as a single self-contained Python "
@@ -2121,7 +2143,9 @@ PROMPTS = {
         "SPEC, because the same acceptance suite is run against each step.\n\n"
         + _TEST_RULES +
         "\n" + _RUNTIME_RULE +
-        "\nOutput format, with all three headers present:\n"
+        "\nOutput format, with all four headers present:\n"
+        "ASSUMPTIONS: <the decisions you had to make that the prompt did not, "
+        "in prose -- or the literal line `ASSUMPTIONS: none`>\n"
         "SPEC: <one paragraph, naming the exact functions and signatures>\n"
         "STEPS:\n1. ...\n2. ...\n"
         "TESTS:\n```python\nfrom solution import ...\nassert ...\n```\n"
@@ -2338,7 +2362,10 @@ class Memory:
 
 
 _STEP_LINE = re.compile(r"^\s*(\d+)[.)]\s+(.*)")
-_HEADERS = ("SPEC", "STEPS", "TESTS")
+# ASSUMPTIONS is listed here as well as parsed, because `_section` cuts a body at
+# the next *known* header: an unlisted section placed after SPEC would be read as
+# part of the spec and fed to the Executor as requirements.
+_HEADERS = ("ASSUMPTIONS", "SPEC", "STEPS", "TESTS")
 
 
 def _section(text, name):
@@ -2378,6 +2405,24 @@ def extract_spec(planner_output):
     """Pull the SPEC paragraph out, falling back to the whole plan."""
     spec = _section(planner_output, "SPEC")
     return spec or (planner_output or "").strip()
+
+
+def extract_assumptions(planner_output):
+    """The Planner's stated assumptions, or "" when it stated none.
+
+    `ASSUMPTIONS: none` is the Planner saying the prompt settled everything, and
+    it reads back as "" -- the same as an absent section, because both mean there
+    is nothing for a reader to check. The distinction that matters is between "no
+    assumptions to show" and "here they are", not between two spellings of the
+    first. A section that is only punctuation ("none.", "None") collapses the
+    same way.
+    """
+    body = _section(planner_output, "ASSUMPTIONS")
+    if not body:
+        return ""
+    if body.strip().strip(".").strip().lower() in ("none", "n/a", "nothing"):
+        return ""
+    return body
 
 
 def extract_tests(planner_output):
@@ -2472,6 +2517,7 @@ class RunResult:
     pipeline: tuple = ()
     plan: str = ""
     spec: str = ""
+    assumptions: str = ""
     tests: str = ""
     tests_status: str = TESTS_MISSING
     tests_summary: str = ""
@@ -2579,6 +2625,12 @@ def _run_workspace(user_prompt, keys, mode, stages, memory, on_event,
     emit("planner", plan)
     run.plan = plan
     run.spec = extract_spec(plan)
+    run.assumptions = extract_assumptions(plan)
+    if run.assumptions:
+        # Above the spec, because it is the spec these decisions were folded
+        # into. A reader who disagrees with one of them has learned it before
+        # reading the paragraph that already assumes it.
+        emit("assumptions", run.assumptions)
     # Report-only. Recorded, said once in the transcript, and it changes nothing
     # about what runs next -- see `scan_runtime_syntax` for why rejecting was not
     # chosen.
@@ -3205,6 +3257,11 @@ def _assemble_deliverable(run):
               "Verified against the acceptance suite: %d/%d step(s)"
               % (run.verified_count, len(run.steps)),
               ""]
+    if run.assumptions:
+        # First, above every claim about the code. The deliverable is what gets
+        # read and kept, and a decision the prompt never made is the thing most
+        # worth disagreeing with before reading anything that assumes it.
+        blocks.append("## Assumptions the plan made\n\n%s\n" % run.assumptions)
     if run.tests:
         blocks.append("## Acceptance suite (`%s`)\n\n%s\n\n```python\n%s```\n"
                       % (run.tests_status, run.tests_summary, run.tests))
