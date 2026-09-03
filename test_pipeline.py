@@ -9117,6 +9117,11 @@ def _probe_loop_bounds(path):
     The bounds are read out of the loop's own literals rather than copied here. A
     builder that changes its target or its attempt cap must not be able to leave
     this check quietly testing the numbers it used to have.
+
+    `handled` reads `except E:` and `except (E, F):` by name. A handler spelled
+    any other way -- bare, an attribute, a subclass standing in for a parent --
+    reads as handling nothing, which fails the check that consumes it rather than
+    passing it silently.
     """
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
@@ -9150,9 +9155,13 @@ def _probe_loop_bounds(path):
                 continue
             handled = set()
             for child in ast.walk(statement):
-                if isinstance(child, ast.ExceptHandler) and isinstance(
-                        child.type, ast.Name):
+                if not isinstance(child, ast.ExceptHandler):
+                    continue
+                if isinstance(child.type, ast.Name):
                     handled.add(child.type.id)
+                elif isinstance(child.type, ast.Tuple):
+                    handled.update(part.id for part in child.type.elts
+                                   if isinstance(part, ast.Name))
             found[node.name] = (target, cap, handled)
     return found
 
@@ -9291,12 +9300,20 @@ def test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap():
     have: no error, no warning, a quietly smaller suite.
 
     Which is the hazard a difficulty dial creates rather than one it inherits.
-    Every knob these builders already carry -- `escape`, `stray`, `duplicate`,
-    `division` -- changes how often the reference raises, and a harder setting
-    raises more often, consumes more attempts and spends the headroom. Addendum L
-    section 6a constraint 3 registers that check count is not the difficulty dial;
-    an unchecked loop exit is precisely how a dial would move the check count
-    while believing it had moved difficulty.
+    `escape` is the worked example: `'raise'` on path-canonicalization-01 against
+    `'clamp'` on -02 selects raising directly, and it is the one knob in this lock
+    whose variation shows up in the loop below as a raise count. A harder setting
+    on an axis like that raises more often, consumes more attempts, and spends
+    the headroom. The other knobs these builders carry do not do that today,
+    which is what makes this a precondition rather than a live fault: `division`
+    selects `//` against `/` with the zero-divisor `raise` ahead of that branch,
+    so it changes no raise at all, and it is monomorphic at `'floor'` besides;
+    `duplicate` is monomorphic at `'last'`, its raising setting reachable in the
+    reference but in no task here; `stray` does vary, but the only input that
+    exercises its rule is appended to `calls` in the `'default'` branch alone.
+    Addendum L section 6a constraint 3 registers that check count is not the
+    difficulty dial; an unchecked loop exit is precisely how a dial would move
+    the check count while believing it had moved difficulty.
 
     So this pins the precondition instead of changing the loop. `eval/gen_tasks.py`
     is not edited, and if a future dial makes a cap bind, this fails rather than
@@ -9324,7 +9341,7 @@ def test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap():
             namespace[key] = _counting_reference(namespace[key], tally, depth)
         return namespace
 
-    measured, raised_kinds = [], set()
+    measured = []
     gen_tasks._probe = counting_probe
     try:
         for fam in gen_tasks.FAMILIES:
@@ -9342,11 +9359,11 @@ def test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap():
                     escaped = "%s: %s" % (type(exc).__name__, exc)
                 attempts = tally["attempts"]
                 raised = sum(tally["raised"].values())
-                raised_kinds |= set(tally["raised"])
                 measured.append({
                     "task": task_id, "params": params, "escaped": escaped,
                     "target": target, "cap": cap, "handled": sorted(handled),
                     "attempts": attempts, "raised": raised,
+                    "kinds": sorted(tally["raised"]),
                     "kept": attempts - raised})
     finally:
         gen_tasks._probe = real_probe
@@ -9361,13 +9378,16 @@ def test_the_probe_loops_exit_on_their_target_and_not_on_their_attempt_cap():
                  row["cap"]),
               row["escaped"] is None and row["kept"] >= row["target"]
               and row["attempts"] < row["cap"], row)
-    check("and no probed reference raised a type its loop does not handle: an "
-          "unhandled one leaves the builder and takes `generate` with it, which "
-          "is the other half of the same fall-through",
-          all(row["escaped"] is None for row in measured)
-          and all(raised_kinds <= set(bounds[name][2]) for name in bounds),
+    unhandled = [(row["task"], sorted(set(row["kinds"]) - set(row["handled"])))
+                 for row in measured
+                 if not set(row["kinds"]) <= set(row["handled"])]
+    check("and no probed reference raised a type its own loop does not handle: "
+          "an unhandled one leaves the builder and takes `generate` with it, "
+          "which is the other half of the same fall-through",
+          all(row["escaped"] is None for row in measured) and not unhandled,
           [(row["task"], row["escaped"]) for row in measured if row["escaped"]]
-          or sorted(raised_kinds))
+          or unhandled
+          or [(row["task"], row["kinds"], row["handled"]) for row in measured])
 
 
 def main():
