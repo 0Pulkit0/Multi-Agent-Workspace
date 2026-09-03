@@ -1491,6 +1491,210 @@ def test_the_suite_is_not_readable_by_the_solution():
           not (after - before), sorted(after - before))
 
 
+def test_the_two_sides_of_a_failing_assertion_are_reported():
+    """`assert a == b` raises an AssertionError carrying nothing.
+
+    The message already quoted the assertion's source text and line; what it
+    could not say is what the left side actually was. This measures the
+    re-evaluation that fills that in -- in the frame that raised, inside the
+    child that is already unwinding, so there is no second process and no second
+    run of the suite.
+
+    The interesting half is the silence. A pair that is wrong is worse than no
+    pair, so anything the re-evaluation cannot do exactly must produce nothing:
+    a non-comparison assert, a chained comparison, an assert `ast` cannot parse
+    out of the single line the traceback names, an operand that raises the
+    second time, and a child that has already spent its budget.
+    """
+    verdict, result = harness.verify_output(MEDIAN_WRONG, tests=SUITE)
+    check("a wrong answer is still REVISE", verdict == harness.VERDICT_REVISE,
+          verdict)
+    check("the failing assertion is still quoted",
+          result.failed_assertion == "assert median([1, 2, 3, 4]) == 2.5",
+          repr(result.failed_assertion))
+    check("and now the left side says what it evaluated to",
+          result.failed_assertion_left == "3", repr(result.failed_assertion_left))
+    check("and the right side says what was expected",
+          result.failed_assertion_right == "2.5",
+          repr(result.failed_assertion_right))
+
+    report = harness.format_report(verdict, result)
+    check("the report carries both sides",
+          "left `3`" in report and "right `2.5`" in report,
+          report[:400])
+    fixes = harness.format_fixes(verdict, result)
+    check("the fixes text carries both sides",
+          "left    3" in fixes and "right   2.5" in fixes, fixes[:600])
+    check("and says it is a second evaluation rather than a recording of the "
+          "first, because a side-effecting or random function need not answer "
+          "the same way twice",
+          "second evaluation, not a recording of the first" in fixes,
+          fixes[:600])
+
+    # Neither side is labelled "your code". `assert expected == actual` is legal
+    # and reverses which side the call is on; the assertion's own source text is
+    # quoted directly above the pair, so left/right is already unambiguous and a
+    # guess at authorship can only be wrong. Measured on the reversed spelling:
+    # the constant is the one on the left.
+    _, reversed_result = harness.verify_output(
+        MEDIAN_WRONG,
+        tests="from solution import median\n"
+              "assert 2.5 == median([1, 2, 3, 4])\n")
+    check("a reversed assertion reports the constant on the left, which is why "
+          "neither side claims to be the candidate's own value",
+          (reversed_result.failed_assertion_left == "2.5"
+           and reversed_result.failed_assertion_right == "3"),
+          (reversed_result.failed_assertion_left,
+           reversed_result.failed_assertion_right))
+    reversed_fixes = harness.format_fixes(harness.VERDICT_REVISE,
+                                          reversed_result)
+    labels = [line.split()[0] for line in reversed_fixes.splitlines()
+              if line.startswith("    left") or line.startswith("    right")]
+    check("and the two labels are bare `left` and `right`, with no parenthetical "
+          "telling the model which side its own code is on",
+          [line.strip() for line in reversed_fixes.splitlines()
+           if line.startswith(("    left", "    right"))]
+          == ["left    2.5", "right   3"],
+          [line for line in reversed_fixes.splitlines()
+           if line.startswith(("    left", "    right"))])
+    check("and there are exactly two of them", labels == ["left", "right"],
+          labels)
+
+    for label, suite in (
+            ("a non-comparison assert, where there are no two sides to report",
+             "from solution import median\n"
+             "assert not median([1, 2, 3, 4])\n"),
+            ("a chained comparison",
+             "from solution import median\n"
+             "assert 0 < median([1, 2, 3, 4]) < 1\n"),
+            ("an assert spread over more than one line, which `ast` cannot "
+             "parse out of the single line the traceback names",
+             "from solution import median\n"
+             "assert (\n    median([1, 2, 3, 4])\n    == 2.5\n)\n"),
+            ("an operand that raises on re-evaluation",
+             "from solution import median\n"
+             "seen = []\n"
+             "def once():\n"
+             "    seen.append(1)\n"
+             "    if len(seen) > 1:\n"
+             "        raise RuntimeError('gone')\n"
+             "    return 99\n"
+             "assert once() == median([1, 2, 3, 4])\n")):
+        verdict, result = harness.verify_output(MEDIAN_WRONG, tests=suite)
+        check("%s is still a failed assertion" % label,
+              result.failure_kind == harness.FAIL_ASSERTION,
+              (result.failure_kind, result.stderr[-300:]))
+        check("and reports no pair rather than a misleading one: %s" % label,
+              result.failed_assertion_left == ""
+              and result.failed_assertion_right == "",
+              (result.failed_assertion_left, result.failed_assertion_right))
+        check("and the verdict is unaffected either way: %s" % label,
+              verdict == harness.VERDICT_REVISE, verdict)
+        check("and the assertion's source text is still quoted, so the message "
+              "is no worse than before this existed: %s" % label,
+              result.failed_assertion.startswith("assert"),
+              repr(result.failed_assertion))
+
+    # Not `==`-only. Any comparison with a single right-hand operand qualifies,
+    # because the two reprs explain the failure whatever the operator was.
+    for label, suite, want in (
+            ("an ordering comparison",
+             "assert median([1, 2, 3, 4]) > 100\n", ("3", "100")),
+            ("an identity comparison",
+             "assert median([5]) is None\n", ("5", "None")),
+            ("a membership comparison",
+             "assert median([5]) in (1, 2)\n", ("5", "(1, 2)"))):
+        _, result = harness.verify_output(
+            MEDIAN_WRONG, tests="from solution import median\n" + suite)
+        check("both sides are reported for %s too" % label,
+              (result.failed_assertion_left,
+               result.failed_assertion_right) == want,
+              (result.failed_assertion_left, result.failed_assertion_right))
+
+    # The budget. It is a runner constant, so it lives in `_RUNNER_SOURCE` and
+    # not on the parent module; read it from there rather than restating it, so a
+    # change to the budget cannot leave this sleeping for the wrong length.
+    # It is measured from child start, and the justification for bounding it that
+    # way is that elapsed time is an upper bound on what any single expression
+    # has cost so far. A suite that sleeps past it loses the pair, keeps the rest.
+    import re
+    found = re.search(r"_ASSERT_REEVAL_BUDGET = ([0-9.]+)",
+                      harness._RUNNER_SOURCE)
+    check("the budget is stated once, in the runner that enforces it",
+          found is not None)
+    budget = float(found.group(1)) if found else 1.0
+    slow = ("from solution import median\n"
+            "import time\n"
+            "time.sleep(%.2f)\n"
+            "assert median([1, 2, 3, 4]) == 2.5\n" % (budget + 0.6))
+    verdict, result = harness.verify_output(MEDIAN_WRONG, tests=slow)
+    check("a child that has spent its budget reports no pair",
+          result.failed_assertion_left == "", result.failed_assertion_left)
+    check("and still reports the assertion it failed",
+          result.failed_assertion == "assert median([1, 2, 3, 4]) == 2.5",
+          repr(result.failed_assertion))
+    check("and is still REVISE on the assertion, not a timeout",
+          verdict == harness.VERDICT_REVISE
+          and result.failure_kind == harness.FAIL_ASSERTION,
+          (verdict, result.failure_kind))
+
+    # The parent's side of the marker, driven directly. The file sits in the
+    # workdir, which the child is allowed to write, so a candidate can forge it.
+    # Forging it steers nothing but that candidate's own next attempt -- the
+    # streams it already controls are quoted into the same prompt -- but the size
+    # of anything entering a prompt is the parent's business regardless, so the
+    # clamp is applied on both sides rather than trusted from the child.
+    import tempfile
+    holder = tempfile.mkdtemp(prefix="harness-assert-")
+    try:
+        path = os.path.join(holder, harness.ASSERT_NAME)
+
+        check("a workdir with no marker at all reads as no pair",
+              harness._read_assert_values(holder) == ("", ""),
+              harness._read_assert_values(holder))
+        check("and so does a workdir that does not exist",
+              harness._read_assert_values(holder + "-gone") == ("", ""),
+              harness._read_assert_values(holder + "-gone"))
+
+        for label, text in (("one line", "3\n"),
+                            ("three lines", "3\n2.5\nand another\n"),
+                            ("nothing at all", ""),
+                            ("a lone value with no trailing newline", "3")):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            check("a marker holding %s is discarded whole rather than "
+                  "half-trusted, because a partial pair is a misleading pair"
+                  % label,
+                  harness._read_assert_values(holder) == ("", ""),
+                  harness._read_assert_values(holder))
+
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("%s\n%s\n" % ("x" * 4000, "y" * 4000))
+        left, right = harness._read_assert_values(holder)
+        check("the parent re-clamps a value longer than the limit the child was "
+              "supposed to have applied, which is why its clamp is not merely a "
+              "repeat of the child's",
+              len(left) == harness.MAX_ASSERT_VALUE_CHARS
+              and len(right) == harness.MAX_ASSERT_VALUE_CHARS,
+              (len(left), len(right)))
+
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("'a\\nb'\n'c'\n")
+        left, right = harness._read_assert_values(holder)
+        check("an escaped newline inside a value survives the round trip "
+              "without presenting itself as a third field",
+              (left, right) == ("'a\nb'", "'c'"), (left, right))
+    finally:
+        import shutil
+        shutil.rmtree(holder, ignore_errors=True)
+
+    check("the runner and the parent agree on the marker's name",
+          harness.ASSERT_NAME in harness._RUNNER_SOURCE, harness.ASSERT_NAME)
+    check("and on the length each clamps a value to",
+          str(harness.MAX_ASSERT_VALUE_CHARS) in harness._RUNNER_SOURCE,
+          harness.MAX_ASSERT_VALUE_CHARS)
+
+
 # ------------------------------------------------- resource ceilings & jail
 
 def test_runaway_output_is_killed():
@@ -2413,6 +2617,7 @@ def main():
         test_the_version_advice_names_the_construct_that_failed,
         test_executor_cannot_supply_its_own_tests,
         test_the_suite_is_not_readable_by_the_solution,
+        test_the_two_sides_of_a_failing_assertion_are_reported,
         test_runaway_output_is_killed, test_filesystem_jail,
         test_destructive_calls_cannot_be_spelled_around_the_guard,
         test_guarded_calls_still_work_inside_the_workdir,

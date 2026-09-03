@@ -266,6 +266,20 @@ PHASE_NAME = "_harness_phase"
 # reading the mechanism out of source instead of recording what ran.
 PATHS_NAME = "_harness_paths"
 
+# And the two sides of a failing comparison, re-evaluated in the frame that
+# raised. Only the child can produce these: a bare `assert a == b` carries no
+# values, and by the time the parent sees the traceback the process holding the
+# objects is gone. Written only when a suite assertion fails.
+ASSERT_NAME = "_harness_assert"
+
+# Each side is clamped by the child that writes it and again by the parent that
+# reads it. Not redundant: the marker sits in the workdir, which the child can
+# write to, so a candidate can forge the file. Forging it buys nothing -- the
+# only thing it steers is that candidate's own next attempt, and the streams it
+# already controls are quoted into the same prompt -- but the size of anything
+# going into a prompt is the parent's business either way.
+MAX_ASSERT_VALUE_CHARS = 300
+
 # When the child never got far enough to say. Not a mechanism -- an admission that
 # the dimension went unreported, which is a different fact from any of the answers.
 PATHS_UNREPORTED = "pathlib:unreported"
@@ -485,8 +499,10 @@ _RUNNER_SOURCE = r'''
 import os
 import shutil
 import sys
+import time
 import traceback
 
+_STARTED = time.monotonic()
 _SELF = os.path.abspath(__file__)
 _TARGET = sys.argv[1]
 _CPU_SECONDS = int(sys.argv[2])
@@ -511,6 +527,17 @@ _REAL_OPEN = open
 # `PATHS_NAME`, and a check asserts the two agree, because the runner is written
 # verbatim and cannot interpolate the parent's constant.
 _PATHS_NAME = "_harness_paths"
+# And where it leaves the two sides of a failing comparison. Same reason for the
+# duplicated spelling as `_PATHS_NAME`, and the same check pins the pair.
+_ASSERT_NAME = "_harness_assert"
+# The re-evaluation is skipped once the child has been alive this long. Total
+# elapsed time is an upper bound on what any single expression in the suite has
+# cost so far, so re-evaluating one of them cannot cost more than this -- which
+# keeps a nicety from turning an assertion failure into a timeout.
+_ASSERT_REEVAL_BUDGET = 1.0
+# Each side is a repr going into a prompt, so it is clamped here rather than in
+# the parent: the parent cannot un-print what the child already wrote.
+_ASSERT_VALUE_CHARS = 300
 
 # `-I` implies `-E -s` and, crucially, leaves the script's own directory OFF
 # sys.path -- so `from solution import ...` inside test_solution.py would die
@@ -1010,6 +1037,68 @@ def _user_frames(exc_type, exc_value, exc_tb):
     return "".join(summary.format())
 
 
+def _record_assert_values(exc_type, exc_value, exc_tb):
+    """Write the two sides of a failing comparison, re-evaluated where it failed.
+
+    `assert a == b` raises an AssertionError carrying nothing, so the parent can
+    quote the assertion's source text and its line number and still not say what
+    the code returned. This re-evaluates the two operands in the frame that just
+    raised -- same process, same globals, same guards, same limits, nothing
+    spawned -- and leaves the reprs where the parent reads the phase marker.
+
+    Re-evaluation, not capture. A function with a side effect or a random
+    component need not answer the same way twice, and this runs after the
+    failure, not at it. The parent labels the pair accordingly; that label is the
+    honest part of the feature and must not be dropped.
+
+    Silent on anything it cannot do exactly: a non-comparison assert, a chained
+    comparison, a statement `ast` cannot parse from the one line the traceback
+    names (a multi-line assert), an operand that raises on re-evaluation, or a
+    child that has already spent its re-evaluation budget.
+    """
+    if exc_type is not AssertionError:
+        return
+    if time.monotonic() - _STARTED > _ASSERT_REEVAL_BUDGET:
+        return
+    frame = lineno = None
+    walk = exc_tb
+    while walk is not None:
+        if os.path.abspath(walk.tb_frame.f_code.co_filename or "") != _SELF:
+            frame, lineno = walk.tb_frame, walk.tb_lineno
+        walk = walk.tb_next
+    if frame is None:
+        return
+    try:
+        import ast
+        import linecache
+        # linecache, not open(): the suite is unreadable to this process by the
+        # time an assertion in it can fail. `_arm_suite_lock` pinned its lines
+        # into the cache for exactly this class of reason.
+        text = linecache.getline(frame.f_code.co_filename, lineno)
+        node = ast.parse(text.strip()).body[0]
+        if not isinstance(node, ast.Assert):
+            return
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.comparators) != 1:
+            return
+        sides = []
+        for expr in (test.left, test.comparators[0]):
+            value = eval(compile(ast.Expression(expr), '<assert>', 'eval'),
+                         frame.f_globals, frame.f_locals)
+            sides.append(repr(value)[:_ASSERT_VALUE_CHARS])
+        with _REAL_OPEN(os.path.join(_WORKDIR, _ASSERT_NAME), 'w') as handle:
+            # One side per line, and the reprs are re-encoded so a value whose
+            # repr contains a newline cannot forge a second field.
+            handle.write("%s\n%s\n" % (sides[0].encode('unicode_escape')
+                                       .decode('ascii'),
+                                       sides[1].encode('unicode_escape')
+                                       .decode('ascii')))
+    except BaseException:
+        # A repair aid must never change the verdict. Whatever went wrong here,
+        # the traceback the caller is about to write is the real answer.
+        return
+
+
 _block_network()
 _block_processes()
 _block_filesystem()
@@ -1044,6 +1133,7 @@ except KeyboardInterrupt:
     sys.exit(130)
 except BaseException:
     sys.stderr.write(_user_frames(*sys.exc_info()))
+    _record_assert_values(*sys.exc_info())
     sys.exit(1)
 '''
 
@@ -1213,6 +1303,13 @@ class ExecResult:
     failure_kind: str = FAIL_NONE
     failed_assertion: str = ""
     failed_assertion_line: Optional[int] = None
+    # The two operands of that assertion, re-evaluated in the child after it
+    # raised -- see `_record_assert_values`. Empty whenever the child could not
+    # produce them exactly, which is most non-comparison asserts. Reprs, already
+    # clamped, and never to be presented as "what your code returned": they were
+    # obtained after the failure, not at it.
+    failed_assertion_left: str = ""
+    failed_assertion_right: str = ""
     ignored_test_block: bool = False
     sandbox_layers: List[str] = field(default_factory=list)
     truncated: bool = False
@@ -1462,6 +1559,33 @@ def _read_paths_mechanism(workdir):
     return said if said.startswith("pathlib:") else PATHS_UNREPORTED
 
 
+def _read_assert_values(workdir):
+    """``(left, right)`` reprs the child re-evaluated, or ``("", "")``.
+
+    Two lines, `unicode_escape`d by the writer so a repr containing a newline
+    cannot present itself as a second field. Anything other than exactly two
+    lines is discarded whole rather than half-trusted: a partial pair is a
+    misleading pair, and the message reads fine without either.
+    """
+    try:
+        with open(os.path.join(workdir, ASSERT_NAME), "r",
+                  encoding="utf-8", errors="replace") as handle:
+            said = handle.read()
+    except Exception:
+        return "", ""
+    lines = said.splitlines()
+    if len(lines) != 2:
+        return "", ""
+    out = []
+    for line in lines:
+        try:
+            out.append(line.encode("ascii", "replace")
+                       .decode("unicode_escape")[:MAX_ASSERT_VALUE_CHARS])
+        except Exception:
+            return "", ""
+    return out[0], out[1]
+
+
 # ------------------------------------------------------------------ 3.9, said
 # again with the failure in hand
 #
@@ -1698,6 +1822,8 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         # Read before the workdir goes away in the finally block.
         result.phase = _read_phase(workdir)
         result.sandbox_layers[-1] = _read_paths_mechanism(workdir)
+        (result.failed_assertion_left,
+         result.failed_assertion_right) = _read_assert_values(workdir)
 
         result.ran = True
         result.exit_code = proc.returncode
@@ -2258,6 +2384,10 @@ def format_report(verdict, result):
         lines.append("Failed assertion (%s line %s): `%s`"
                      % (TEST_NAME, result.failed_assertion_line,
                         result.failed_assertion))
+        if result.failed_assertion_left:
+            lines.append("Re-evaluated after the failure: left `%s`, "
+                         "right `%s`" % (result.failed_assertion_left,
+                                         result.failed_assertion_right))
     elif result.failure_kind == FAIL_IMPORT:
         lines.append("The solution could not be imported.")
     elif result.failure_kind == FAIL_TIMEOUT_IMPORT:
@@ -2409,6 +2539,24 @@ def format_fixes(verdict, result):
             parts.append("    %s  (%s line %s)"
                          % (result.failed_assertion, TEST_NAME,
                             result.failed_assertion_line))
+        if result.failed_assertion_left:
+            # Labelled as a re-evaluation, and the caveat is not decoration: the
+            # values were obtained by evaluating the two operands again, after
+            # the failure, in the frame that raised. For a pure function that is
+            # the same answer; for one with a side effect or a random component
+            # it need not be, and claiming otherwise would send a repair after a
+            # number the failure never saw.
+            parts += [
+                "",
+                "Re-evaluating the two sides in the frame that failed gave:",
+                "",
+                "    left    %s" % result.failed_assertion_left,
+                "    right   %s" % result.failed_assertion_right,
+                "",
+                "That is a second evaluation, not a recording of the first, so "
+                "treat it as exact only for a function without side effects or "
+                "randomness.",
+            ]
         parts += [
             "",
             "Do not change the test and do not special-case this input. Fix "

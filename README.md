@@ -120,6 +120,21 @@ They need genuinely different advice, so `format_fixes` distinguishes them:
 - **`assertion`** — "your solution imported and ran fine — it is simply
   computing the wrong answer," followed by the exact failing assert and its line
   number, and an instruction not to change the test or special-case the input.
+  A bare `assert a == b` raises an `AssertionError` carrying nothing, so the
+  quoted source line used to be the whole of it: the message could name the
+  comparison that failed but not what either side came out as. Where it can be
+  done exactly, the two sides are now re-evaluated in the frame that raised —
+  inside the child that is already unwinding, so no second process starts and
+  the suite does not run twice — and both `repr`s are reported. It is a *second*
+  evaluation, which the message says out loud, because a function with side
+  effects or randomness need not answer the same way twice. Anything that cannot
+  be done exactly reports nothing rather than a plausible-looking pair: an assert
+  that is not a comparison, a chained comparison, an assert spread over more than
+  one line, an operand that raises the second time, or a child that has already
+  spent its re-evaluation budget. The pair is a repair aid and can never change a
+  verdict. Neither side is labelled as the candidate's own value — `assert
+  expected == actual` is legal and reverses which side that is, and the
+  assertion's source text sits directly above the pair.
 
 Which of the last two it is comes from the *deepest* traceback frame, not from
 whether `AssertionError` appears anywhere in stderr. A failing module-level
