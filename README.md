@@ -98,26 +98,48 @@ run.tests_trusted else None`); gate that on the step being the last one.
 | Verdict | Meaning |
 | --- | --- |
 | `APPROVED` | The acceptance suite ran against the code and passed. Nothing else earns this. |
-| `REVISE` | It failed the suite, crashed on import, timed out, or contained no code block. The real traceback goes back to the Executor as the fixes, up to `MAX_REVISION_ROUNDS` times. |
+| `REVISE` | It did not compile, failed the suite, crashed on import, timed out, or contained no code block. The real traceback goes back to the Executor as the fixes, up to `MAX_REVISION_ROUNDS` times. |
 | `UNVERIFIED` | Nothing could be *established*: the harness itself could not execute, or there is no trustworthy suite to gate on (mode 2, or the suite was rejected). Not treated as a code defect, and the feed says which. |
 
-### The two failure modes get different guidance
+### The three failure modes get different guidance
 
 They need genuinely different advice, so `format_fixes` distinguishes them:
 
+- **`syntax`** — it does not compile, and the parent proved that by compiling it
+  itself, on the same 3.9 interpreter and the same utf-8 bytes the child would
+  have read. No process is spawned: there is nothing a jail, a timeout and a
+  subprocess can add to what `compile` already said. The Executor gets the
+  interpreter's own message, and the line number is the model's own count rather
+  than the one the inserted prologue shifts it to. `ran` stays `False` — nothing
+  ran — but the verdict is `REVISE` and not `UNVERIFIED`, because the defect was
+  *proved* rather than merely unobserved. This is the one place where `not ran`
+  does not mean "we could not tell".
 - **`import`** — "your solution could not even be imported… fix the module
-  itself first." A syntax error, a missing definition, or module-level code that
-  raises. No test ran at all.
+  itself first." A missing definition, a bad import, or module-level code that
+  raises. It compiled; no test ran.
 - **`assertion`** — "your solution imported and ran fine — it is simply
   computing the wrong answer," followed by the exact failing assert and its line
   number, and an instruction not to change the test or special-case the input.
 
-Which one it is comes from the *deepest* traceback frame, not from whether
-`AssertionError` appears anywhere in stderr. A failing module-level assert
-inside `solution.py` is a broken module, not a wrong answer, and conflating the
-two sends the Executor chasing the wrong problem.
+Which of the last two it is comes from the *deepest* traceback frame, not from
+whether `AssertionError` appears anywhere in stderr. A failing module-level
+assert inside `solution.py` is a broken module, not a wrong answer, and
+conflating the two sends the Executor chasing the wrong problem.
 
 Harness frames (`_harness_runner`, `runpy`) are stripped from every traceback.
+
+Two constructs get a named remedy on top of the traceback, because they are what
+a model reaches for when it forgets the interpreter is 3.9, and they fail in two
+different places: `match`/`case` is a `SyntaxError` (caught above, and detected
+from the *source*, because 3.9 reports only `invalid syntax` with nothing to key
+on), while a PEP 604 union in an evaluated position — `isinstance(x, int | str)`,
+`cast(int | None, v)`, `Num = int | float` — compiles and raises a `TypeError` at
+runtime. Annotations are already neutralised by the inserted `from __future__
+import annotations`, so those three spellings are the whole residue. The union
+advice keys on the operand types the message names, so a model's own `3 | "a"` —
+same message shape, genuine bug — is left as the bug it is. The same two rules
+are stated to the Executor up front in `_RUNTIME_RULE`; a check pins that the
+two halves name the same constructs.
 
 ## The vacuous-test guard
 

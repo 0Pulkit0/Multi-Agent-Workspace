@@ -46,6 +46,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -1174,6 +1175,7 @@ FAIL_TIMEOUT_TESTS = "timeout-tests"        # imported, then hung under test
 FAIL_TIMEOUT_TEARDOWN = "timeout-teardown"  # tests done, process never exited
 FAIL_OUTPUT = "runaway-output"  # wrote more than the harness will read
 FAIL_PATH = "harness-path"      # `import solution` broke -- a harness bug
+FAIL_SYNTAX = "syntax"          # it does not compile; proved without running it
 
 # One timeout used to cover three situations that need opposite advice, so they
 # are separate kinds. Anything that needs "was this a timeout at all" uses this.
@@ -1460,6 +1462,105 @@ def _read_paths_mechanism(workdir):
     return said if said.startswith("pathlib:") else PATHS_UNREPORTED
 
 
+# ------------------------------------------------------------------ 3.9, said
+# again with the failure in hand
+#
+# The interpreter is 3.9, and the two constructs a model reaches for anyway fail
+# in two different places. `match`/`case` is a SyntaxError, which the parent can
+# prove without spawning anything. A PEP 604 union in an *evaluated* position is
+# a TypeError at runtime -- `isinstance(x, int | str)`, `cast(int | None, v)`,
+# `Num = int | float` -- and annotations are already neutralised by
+# `_SOURCE_PROLOGUE`, so those three spellings are the whole residue.
+#
+# The prompt-side twin is `agents_core._RUNTIME_RULE`, which states both rules
+# before the Executor writes anything. This half states them again with the
+# failure in hand, which is the form that has some chance of landing. Both halves
+# name the same two constructs and a check in test_pipeline.py pins that they
+# still do: the pairing is the mechanism, as it is for the test rules.
+_MATCH_STMT = re.compile(r"(?m)^[ \t]*(?:match|case)\b[^\n]*:[ \t]*$")
+
+# Measured on 3.9.6 rather than guessed: the residue forms report 'type' and
+# 'type', 'type' and 'NoneType', '_UnionGenericAlias' and 'type', or
+# 'types.GenericAlias' and 'NoneType'. A model's own `3 | "a"` reports 'int' and
+# 'str' and is a plain bug, so at least one side has to name a type object before
+# this claims a version cause.
+_PIPE_TYPEERROR = re.compile(
+    r"unsupported operand type\(s\) for \|: '([^']+)' and '([^']+)'")
+_TYPE_OBJECT = re.compile(
+    r"\A(?:type|NoneType|_SpecialForm|.*GenericAlias|.*Meta)\Z")
+
+_MATCH_ADVICE = (
+    "`match`/`case` is 3.10 syntax and this interpreter is %d.%d, so it is a "
+    "SyntaxError here rather than a style question. Rewrite it as `if`/`elif` "
+    "over the same conditions." % sys.version_info[:2])
+_UNION_ADVICE = (
+    "`X | Y` between two types is PEP 604, which is 3.10+. Annotations survive "
+    "here because the harness inserts `from __future__ import annotations`, but "
+    "an evaluated union does not: `isinstance(x, int | str)`, "
+    "`cast(int | None, v)` and `Num = int | float` all raise this TypeError. Use "
+    "`typing.Union[int, str]` or `typing.Optional[int]`, or a tuple in "
+    "`isinstance`.")
+
+
+def _version_hint(source="", stderr=""):
+    """One line naming the 3.10 construct behind a failure, or ``""``.
+
+    Both inputs are optional because the two constructs surface in different
+    places: the match statement is in the source the parent has just failed to
+    compile, and the union is only in the TypeError the child raised.
+    """
+    if source and _MATCH_STMT.search(source):
+        return _MATCH_ADVICE
+    found = _PIPE_TYPEERROR.search(stderr or "")
+    if found and any(_TYPE_OBJECT.match(side) for side in found.groups()):
+        return _UNION_ADVICE
+    return ""
+
+
+def _compile_problem(source):
+    """``(reason, stderr)`` when the parent cannot compile ``source``, else None.
+
+    `compile` rather than `ast.parse`, deliberately: it also refuses `return`
+    outside a function and a duplicate argument name, both of which parse
+    cleanly and then die at import. The source compiled is the model's own, not
+    `executed_source(source)`, so the line number reported is the one the model
+    counted -- the prologue's line shift is a standing cost of running the
+    prologue, and there is no reason to pay it on the one path that never gets
+    that far. Nothing is legal only *with* the prologue: a future statement
+    changes when annotations are evaluated, never what parses, so refusing the
+    raw source cannot condemn a file the child would have accepted.
+
+    Compiled as **utf-8 bytes**, which is what `run_python_sandboxed` writes and
+    what the child's tokenizer therefore reads. A str is a different language in
+    one measured place, and it is legal Python that this gate would otherwise
+    have condemned: a leading byte-order mark is prelude to a file and `invalid
+    non-printable character U+FEFF` to a str. See `_BOM` and
+    `test_a_byte_order_mark_is_prelude_and_not_a_statement`, which measured
+    exactly that and says a str-level check cannot see the shape at all. An
+    encoding declaration was measured too and is *not* such a place -- 3.9.6
+    accepts a cookie in either input -- but bytes is still the faithful reading,
+    because the cookie is then resolved against the same bytes the child gets.
+
+    Encoding here also catches a source that cannot be written as utf-8 at all
+    (a lone surrogate): `UnicodeEncodeError` is a `ValueError`, so it arrives as
+    a compile problem instead of as an exception out of the file write.
+    """
+    try:
+        compile(source.encode("utf-8"), SCRIPT_NAME, "exec")
+        return None
+    except SyntaxError as exc:
+        return ("%s does not compile: %s (line %s)"
+                % (SCRIPT_NAME, exc.msg, exc.lineno),
+                "".join(traceback.format_exception_only(type(exc), exc)))
+    except ValueError as exc:
+        # Null bytes in the source, or a lone surrogate that will not encode.
+        # Neither is a SyntaxError, and neither is something to let escape into
+        # the caller: the child would die on both just as certainly, so this is
+        # the same answer arrived at one process earlier.
+        return ("%s cannot be compiled: %s" % (SCRIPT_NAME, exc),
+                "".join(traceback.format_exception_only(type(exc), exc)))
+
+
 def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
     """Run ``source`` in an isolated subprocess and capture what it did.
 
@@ -1478,6 +1579,18 @@ def run_python_sandboxed(source, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
         return result
     if not sys.executable:
         result.reason = "no Python interpreter available to the harness"
+        return result
+
+    # Compiled here, in the parent, before anything is spawned. The child would
+    # report the same SyntaxError, but it would cost a temp directory, a jail
+    # probe and a process to learn what this interpreter -- the same 3.9 that
+    # would have run it -- proves for free. `ran` stays False, because nothing
+    # ran; `FAIL_SYNTAX` is what stops `verify_output` reading that as a harness
+    # failure, since a defect the parent can prove is still the candidate's.
+    problem = _compile_problem(source)
+    if problem:
+        result.failure_kind = FAIL_SYNTAX
+        result.reason, result.stderr = problem
         return result
 
     # Two directories under one root, and the split is the whole point. The
@@ -2100,6 +2213,11 @@ def verify_output(model_output, tests=None, timeout=EXEC_TIMEOUT_SECONDS):
 
     if result.ok:
         return VERDICT_APPROVED, result
+    if result.failure_kind == FAIL_SYNTAX:
+        # Nothing ran, and it is still the candidate's defect: the parent proved
+        # the source does not compile on the interpreter that would have run it.
+        # The one place `not result.ran` does not mean "we could not tell".
+        return VERDICT_REVISE, result
     if not result.ran or result.failure_kind == FAIL_PATH:
         # We could not execute at all; don't pretend that is a code defect.
         if result.failure_kind == FAIL_PATH:
@@ -2114,6 +2232,11 @@ def format_report(verdict, result):
     lines = ["VERDICT: %s" % verdict]
     if not result.ran:
         lines.append("Not executed: %s" % (result.reason or "unknown reason"))
+        # Empty on every other not-ran path, because nothing ran to write it.
+        # On FAIL_SYNTAX it holds the interpreter's own caret block, which is the
+        # entire finding and belongs in the feed rather than only in the repair.
+        if result.stderr.strip():
+            lines += _stream_splice("compile error:", result.stderr)
         if result.ignored_test_block:
             lines.append("Note: a test file in the Executor's output was ignored.")
         if result.sandbox_layers:
@@ -2221,6 +2344,21 @@ def format_fixes(verdict, result):
         return ""
 
     if not result.ran:
+        if result.failure_kind == FAIL_SYNTAX:
+            parts = [
+                "Your code is not valid Python %d.%d, so it was never run. This "
+                "is the interpreter's own message, from compiling exactly the "
+                "source you returned:" % sys.version_info[:2],
+            ]
+            parts += _stream_splice("compile error:", result.stderr)
+            hint = _version_hint(source=result.source, stderr=result.stderr)
+            if hint:
+                parts += ["", hint]
+            parts += ["",
+                      "Return the complete corrected program in one ```python "
+                      "block.",
+                      "", _SANDBOX_RULES]
+            return "\n".join(parts)
         if result.ignored_test_block:
             return (
                 "Your output contained a test file but no solution, so there "
@@ -2327,6 +2465,12 @@ def format_fixes(verdict, result):
 
     if result.stderr.strip():
         parts += _stream_splice("stderr / traceback:", result.stderr)
+        # stderr only, never the source: a `match` statement never reaches this
+        # branch, because it never compiled. An evaluated PEP 604 union does, and
+        # its TypeError says nothing about versions on its own.
+        hint = _version_hint(stderr=result.stderr)
+        if hint:
+            parts += ["", hint]
     # Not spliced on FAIL_OUTPUT. The branch above exists to tell a printing loop
     # that it printed too much; quoting a sample of the printing back is the
     # branch that punishes the behaviour feeding it, and a repair can do nothing

@@ -838,6 +838,44 @@ def test_executor_prompt_states_the_sandbox_contract():
           prompt.count("finish within") == 1, prompt.count("finish within"))
 
 
+def test_the_version_rules_are_stated_twice_and_agree():
+    """The prompt half and the repair half name the same 3.9 constructs.
+
+    Two halves by design, not by accident: `agents_core._RUNTIME_RULE` states
+    the rules before a line is written, and `harness`'s advice strings state
+    them again with the failure in hand, which is the form that has some chance
+    of landing. They live in different modules because the dependency runs one
+    way -- harness must not import agents_core -- so nothing but this check
+    stops one half from learning a construct the other has not heard of.
+
+    Pairing, not equality: the wordings differ on purpose (one is a rule, the
+    other is a diagnosis), so what is pinned is that each construct and each
+    remedy is named on both sides.
+    """
+    rule = agents_core._RUNTIME_RULE
+    advice = harness._MATCH_ADVICE + "\n" + harness._UNION_ADVICE
+    for construct in ("match", "case", "PEP 604", "isinstance"):
+        check("both halves name %s" % construct,
+              construct in rule and construct in advice,
+              (construct in rule, construct in advice))
+    for remedy in ("typing.Union", "typing.Optional"):
+        check("both halves offer %s" % remedy,
+              remedy in rule and remedy in advice,
+              (remedy in rule, remedy in advice))
+    check("both halves state the running interpreter's version",
+          "3.9" in rule and "%d.%d" % sys.version_info[:2] in advice,
+          (rule[:60], harness._MATCH_ADVICE[:80]))
+    check("the repair half is reachable from the failure kinds it explains",
+          harness._version_hint(source="match x:\n") == harness._MATCH_ADVICE
+          and harness._version_hint(
+              stderr="TypeError: unsupported operand type(s) for |: "
+                     "'type' and 'NoneType'") == harness._UNION_ADVICE)
+    check("and it stays silent on a failure that is not about the version",
+          harness._version_hint(source="def f():\n    return 1\n",
+                                stderr="ZeroDivisionError: division by zero")
+          == "")
+
+
 # ------------------------------------------------------------ memory isolation
 
 
@@ -9537,6 +9575,7 @@ def main():
         test_escalation_ladder_is_climbed_in_order,
         test_giving_up_is_explicit, test_escalation_degrades_with_one_key,
         test_executor_prompt_states_the_sandbox_contract,
+        test_the_version_rules_are_stated_twice_and_agree,
         test_memory_does_not_bleed,
         test_memory_never_reads_prior_state, test_context_is_bounded,
         test_context_stays_bounded_across_many_steps, test_step_cap,

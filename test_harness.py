@@ -633,7 +633,25 @@ def test_import_failure_is_distinguished():
     verdict, result = harness.verify_output(broken, tests=SUITE)
     check("a syntax error under a suite is REVISE",
           verdict == harness.VERDICT_REVISE, verdict)
-    check("classified as an import failure",
+    # Renamed, and split from the import checks below. This probe never reaches
+    # an import now: the parent compiles the source first and proves the defect
+    # without spawning anything, so `syntax` is the honest kind and `import` --
+    # which used to be reported because a syntax error surfaces at the child's
+    # `import solution` -- would now be a lie about where it was caught. The
+    # FAIL_IMPORT message keeps its coverage on the two probes that do reach an
+    # import, one added here for exactly that reason.
+    check("classified as a syntax failure, caught before any subprocess",
+          result.failure_kind == harness.FAIL_SYNTAX, result.failure_kind)
+    fixes = harness.format_fixes(verdict, result)
+    check("fixes say it never ran, and quote the compiler",
+          "never run" in fixes and "SyntaxError" in fixes, fixes[:300])
+    check("syntax fixes do not talk about wrong answers",
+          "simply computing the wrong answer" not in fixes)
+
+    raiser = ("```python\ndef median(values):\n    return 1\n\n"
+              "raise RuntimeError('boom at import')\n```")
+    verdict, result = harness.verify_output(raiser, tests=SUITE)
+    check("a module that raises while importing is an import failure",
           result.failure_kind == harness.FAIL_IMPORT, result.failure_kind)
     fixes = harness.format_fixes(verdict, result)
     check("fixes say it could not be imported",
@@ -726,8 +744,12 @@ def test_the_source_prologue_neutralises_annotations():
     result = harness.run_python_sandboxed(matcher, tests=SUITE)
     check("a match statement still fails", not result.ok,
           (result.exit_code, result.stderr[-200:]))
-    check("a match statement is still an import/syntax failure",
-          result.failure_kind == harness.FAIL_IMPORT,
+    # Renamed from "is still an import/syntax failure", which was either-or
+    # because the kind depended on where the SyntaxError surfaced. It is now
+    # exactly one of them: the parent compiles first, so the failure is proved
+    # before a child exists to fail at importing it.
+    check("a match statement is a syntax failure, caught before the spawn",
+          result.failure_kind == harness.FAIL_SYNTAX,
           (result.failure_kind, result.stderr[-200:]))
     check("the match failure is reported as a SyntaxError",
           "SyntaxError" in result.stderr, result.stderr[-200:])
@@ -1026,6 +1048,187 @@ def test_a_byte_order_mark_is_prelude_and_not_a_statement():
             == source)
     check("deleting the inserted line gives the marked bytes back exactly, "
           "mark included", all(rebuilt), rebuilt)
+
+
+def test_a_program_that_cannot_compile_is_never_spawned():
+    """The parent compiles first, on the interpreter that would have run it.
+
+    Same version, same bytes, so a `SyntaxError` here is not a prediction about
+    the child -- it is the child's own answer, obtained without paying for a
+    process, a jail and a timeout to be told what compiling already said.
+    """
+    import tempfile
+    docstring_first = ('"""Median of a list."""\n\n'
+                       "def median(values)\n    return 1\n")
+    spawned = []
+    real_popen = harness.subprocess.Popen
+
+    def _refuse(*args, **kwargs):
+        spawned.append(args)
+        raise AssertionError("a subprocess was spawned for a source that "
+                             "does not compile")
+
+    before = set(name for name in os.listdir(tempfile.gettempdir())
+                 if name.startswith("harness-"))
+    harness.subprocess.Popen = _refuse
+    try:
+        result = harness.run_python_sandboxed(docstring_first, tests=SUITE)
+    finally:
+        harness.subprocess.Popen = real_popen
+    after = set(name for name in os.listdir(tempfile.gettempdir())
+                if name.startswith("harness-"))
+
+    check("no subprocess is spawned for a source that cannot compile",
+          not spawned, spawned)
+    check("and no working directory is created for one either",
+          after == before, sorted(after - before))
+    check("the kind is FAIL_SYNTAX, not FAIL_IMPORT",
+          result.failure_kind == harness.FAIL_SYNTAX, result.failure_kind)
+    check("`ran` stays False, because nothing ran",
+          result.ran is False, result.ran)
+    check("and the verdict is REVISE rather than UNVERIFIED: the defect was "
+          "proved, not merely unobserved",
+          harness.verify_output("```python\n%s```" % docstring_first,
+                                tests=SUITE)[0] == harness.VERDICT_REVISE)
+    check("the reason names the file and the compiler's own message",
+          result.reason.startswith("solution.py does not compile: ")
+          and "invalid syntax" in result.reason, result.reason)
+    check("the line number is the model's own, not the prologue-shifted one",
+          "(line 3)" in result.reason, result.reason)
+    check("stderr carries the caret block the compiler printed",
+          "SyntaxError" in result.stderr and "^" in result.stderr,
+          result.stderr)
+    report = harness.format_report(harness.VERDICT_REVISE, result)
+    check("the report splices that block under a heading that says compile",
+          "compile error:" in report and "SyntaxError" in report, report[:400])
+    # The splice sits on the shared not-ran branch, so the guard that keeps it
+    # off every other not-ran path is worth pinning. Built from ExecResult
+    # rather than by running code: the branch is a pure function of the record,
+    # and the real paths that reach it are a 15s timeout and a SIGKILL.
+    quiet = harness.format_report(
+        harness.VERDICT_UNVERIFIED,
+        harness.ExecResult(ran=False, failure_kind=harness.FAIL_TIMEOUT,
+                           reason="timed out after 15s"))
+    check("and no other not-ran path grows a compile-error section",
+          "compile error:" not in quiet, quiet[:300])
+
+    # `compile` and not `ast.parse`: these two parse cleanly and die at import,
+    # so a parse-only gate would spawn a process to be told what it could have
+    # known. Both halves measured here rather than asserted from the docstring.
+    for label, source, message in (
+            ("`return` outside a function", "return 5\n",
+             "'return' outside function"),
+            ("a duplicate argument name", "def f(a, a):\n    return a\n",
+             "duplicate argument 'a' in function definition")):
+        parsed = True
+        try:
+            ast.parse(source)
+        except SyntaxError:
+            parsed = False
+        result = harness.run_python_sandboxed(source)
+        check("%s parses cleanly, which is why the gate compiles" % label,
+              parsed, parsed)
+        check("%s is caught anyway, quoted verbatim" % label,
+              result.failure_kind == harness.FAIL_SYNTAX
+              and message in result.reason, (result.failure_kind, result.reason))
+
+
+def test_the_compile_gate_condemns_no_program_the_child_would_run():
+    """Bytes, not a str: the divergence is measured, not assumed.
+
+    A gate that reports working code as broken is worse than no gate, because
+    the repair round it opens is spent on a defect that is not there.
+    """
+    marked = _BOM + '"""Merge spans."""\n' + "def f(x):\n    return x\n"
+    strc, bytesc = [], []
+    for sink, payload in ((strc, marked), (bytesc, marked.encode("utf-8"))):
+        try:
+            compile(payload, "<check>", "exec")
+            sink.append("ok")
+        except SyntaxError as exc:
+            sink.append(exc.msg)
+    check("a byte-order mark is a SyntaxError to a str compile",
+          strc == ["invalid non-printable character U+FEFF"], strc)
+    check("and prelude to a bytes compile, which is what the child reads",
+          bytesc == ["ok"], bytesc)
+    check("so the gate lets a marked program through to actually run",
+          harness._compile_problem(marked) is None,
+          harness._compile_problem(marked))
+
+    cookie = "# -*- coding: utf-8 -*-\ndef f(x):\n    return x\n"
+    check("an encoding declaration is not condemned either",
+          harness._compile_problem(cookie) is None,
+          harness._compile_problem(cookie))
+    check("nor is a solution using 3.9's own PEP 585 generics",
+          harness._compile_problem("def f(x: list[int]) -> dict[str, int]:\n"
+                                   "    return {}\n") is None)
+    check("nor is a PEP 604 annotation, which compiles here and is "
+          "neutralised by the prologue rather than by this gate",
+          harness._compile_problem("def f(x: int | None) -> int | None:\n"
+                                   "    return x\n") is None)
+
+    # Not SyntaxError, and so not caught by the clause that catches it. Left to
+    # escape, each of these is an exception out of `run_python_sandboxed` --
+    # a crashed pipeline where the honest answer is a repair round.
+    for label, source, fragment in (
+            ("a null byte", "def f(x):\n    return x\n\x00\n",
+             "null bytes"),
+            ("a lone surrogate", "def f(x):\n    return '\ud800'\n",
+             "surrogates not allowed")):
+        result = harness.run_python_sandboxed(source)
+        check("%s is refused without taking the parent down with it" % label,
+              result.failure_kind == harness.FAIL_SYNTAX, result.failure_kind)
+        check("%s is reported as uncompilable, not as invalid syntax" % label,
+              result.reason.startswith("solution.py cannot be compiled: ")
+              and fragment in result.reason, result.reason)
+
+
+def test_the_version_advice_names_the_construct_that_failed():
+    """One advice line per failure, and only when the failure supports it.
+
+    The `match` half is decided from the source, because 3.9 reports a bare
+    `invalid syntax` and there is nothing in the message to key on. The union
+    half is decided from stderr, because a union in an evaluated position
+    compiles and the message names the operand types exactly.
+    """
+    matcher = ("def classify(n):\n"
+               "    match n:\n"
+               "        case 0:\n"
+               "            return 'zero'\n"
+               "    return 'more'\n")
+    result = harness.run_python_sandboxed(matcher)
+    fixes = harness.format_fixes(harness.VERDICT_REVISE, result)
+    check("a match statement gets the match advice",
+          "3.10 syntax" in fixes and "if`/`elif" in fixes, fixes[:600])
+    check("and the advice names this interpreter's own version",
+          "%d.%d" % sys.version_info[:2] in fixes, fixes[:600])
+    check("and not the union advice, which is about a different failure",
+          "PEP 604" not in fixes, fixes[:600])
+
+    for label, body in (
+            ("isinstance", "def f(x):\n"
+                           "    return isinstance(x, int | str)\n"),
+            ("a module-level alias", "Num = int | float\n"
+                                     "def f(x):\n    return x\n"),
+            ("typing.cast", "from typing import cast\n"
+                            "def f(x):\n    return cast(int | None, x)\n")):
+        result = harness.run_python_sandboxed(body + "print(f(1))\n")
+        fixes = harness.format_fixes(harness.VERDICT_REVISE, result)
+        check("an evaluated union via %s gets the union advice" % label,
+              "PEP 604" in fixes and "typing.Union" in fixes,
+              (result.failure_kind, fixes[:600]))
+        check("...and it is a runtime failure, so no compile gate could have "
+              "caught %s" % label, result.ran, result.failure_kind)
+
+    # The guard against advice-by-coincidence: this is the model's own bug and
+    # the message has the same shape. 'int' and 'str' name no type object, so
+    # nothing claims a version cause for it.
+    result = harness.run_python_sandboxed("def f(x):\n    return 3 | 'a'\n"
+                                          "print(f(1))\n")
+    fixes = harness.format_fixes(harness.VERDICT_REVISE, result)
+    check("a genuine `3 | 'a'` TypeError is left as the bug it is",
+          "unsupported operand" in result.stderr and "PEP 604" not in fixes,
+          (result.stderr[-160:], fixes[:400]))
 
 
 def test_vacuous_tests_are_caught():
@@ -2205,6 +2408,9 @@ def main():
         test_the_prologue_never_makes_a_legal_file_illegal,
         test_the_prologue_survives_a_docstring_the_scan_cannot_parse,
         test_a_byte_order_mark_is_prelude_and_not_a_statement,
+        test_a_program_that_cannot_compile_is_never_spawned,
+        test_the_compile_gate_condemns_no_program_the_child_would_run,
+        test_the_version_advice_names_the_construct_that_failed,
         test_executor_cannot_supply_its_own_tests,
         test_the_suite_is_not_readable_by_the_solution,
         test_runaway_output_is_killed, test_filesystem_jail,
