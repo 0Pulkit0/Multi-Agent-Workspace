@@ -2549,10 +2549,10 @@ def test_the_os_jail_permits_the_writes_the_in_process_guard_permits():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_the_readme_names_only_layers_the_code_emits():
+def test_the_pipeline_guide_names_only_layers_the_code_emits():
     """A doc that describes a label nothing emits is worse than no doc.
 
-    The README is where a reader learns what the feed's isolation strings mean, so
+    The pipeline guide explains what the feed's isolation strings mean, so
     every layer-shaped string in it has to be one this tree can produce -- and the
     families have to be complete in the other direction too, because the failure
     that prompted this check was a README naming one macOS rung when the code has
@@ -2563,7 +2563,7 @@ def test_the_readme_names_only_layers_the_code_emits():
     import re
 
     root = os.path.dirname(os.path.abspath(harness.__file__))
-    with open(os.path.join(root, "README.md"), "r", encoding="utf-8") as handle:
+    with open(os.path.join(root, "docs", "PIPELINE.md"), "r", encoding="utf-8") as handle:
         readme = handle.read()
     with open(harness.__file__, "r", encoding="utf-8") as handle:
         source = handle.read()
@@ -2577,7 +2577,7 @@ def test_the_readme_names_only_layers_the_code_emits():
         name for name in claimed
         if name not in emitted
         and not any(name.startswith(stem) for stem in stems))
-    check("every layer string the README names is one the code can emit",
+    check("every layer string the pipeline guide names is one the code can emit",
           unemittable == [], unemittable)
 
     # And the two OS families the README documents rung by rung, in full: a rung
@@ -2628,7 +2628,7 @@ def main():
         test_timeout_phase_attribution, test_sandbox_layers_are_honest,
         test_sandbox_rules_are_complete,
         test_the_os_jail_permits_the_writes_the_in_process_guard_permits,
-        test_the_readme_names_only_layers_the_code_emits,
+        test_the_pipeline_guide_names_only_layers_the_code_emits,
     ):
         print("\n-- %s" % fn.__name__)
         try:
